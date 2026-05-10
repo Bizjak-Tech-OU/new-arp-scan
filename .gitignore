@@ -1,0 +1,11 @@
+# IDEs
+.idea
+.vscode
+.cursor
+.zed
+
+# Cargo
+/target
+
+# Miscellaneous
+.DS_Store
