@@ -2,6 +2,13 @@
 name = "new-arp-scan"
 version = "0.0.1"
 edition = "2024"
+license = "AGPL-3.0-only"
 
 [dependencies]
-libc = "0.2.186"
+
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+pedantic = "warn"
