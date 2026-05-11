@@ -5,6 +5,8 @@ edition = "2024"
 license = "AGPL-3.0-only"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive", "std"] }
+libc = "0.2"
 
 [lints.rust]
 warnings = "deny"
