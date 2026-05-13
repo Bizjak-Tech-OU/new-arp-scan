@@ -2,8 +2,6 @@
 
 use std::ffi::CString;
 use std::mem::zeroed;
-use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 
 use crate::error::AppError;
@@ -12,15 +10,10 @@ use crate::linux_packet::{
     ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK,
     INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SockAddressLinkLayer,
 };
+use crate::linux_system_call;
 
-/// `ioctl(2)` request for reading interface flags (`SIOCGIFFLAGS`).
-///
-/// This matches the value used by the Linux kernel user-space application binary interface on
-/// common architectures (see `linux/sockios.h`).
-const SIOCGIFFLAGS_REQUEST: libc::Ioctl = 0x8913;
-
-/// Opens a raw `AF_PACKET` socket, binds it to `interface_name`, and prepares for future ARP
-/// scanning work.
+/// Opens a raw `AF_PACKET` socket, binds it to `interface_name`, and returns the socket for ARP
+/// scanning.
 ///
 /// # Errors
 ///
@@ -33,20 +26,21 @@ const SIOCGIFFLAGS_REQUEST: libc::Ioctl = 0x8913;
 /// Returns [`AppError::InterfaceRejectedForScanning`] when the interface is loopback,
 /// administratively down, or has `NOARP` set.
 ///
-/// Returns [`AppError::RawSocketOpenFailed`] or [`AppError::SocketBindFailed`] when the
-/// underlying syscalls fail (for example missing `CAP_NET_RAW`).
+/// Returns [`AppError::RawSocketOpenFailed`], [`AppError::RawSocketCapabilityRequired`], or
+/// [`AppError::SocketBindFailed`] when the underlying syscalls fail (for example missing
+/// `CAP_NET_RAW`).
 ///
 /// # Panics
 ///
 /// This function does not panic.
-pub fn initialize_raw_arp_socket_for_scanning(interface_name: &str) -> Result<(), AppError> {
+pub fn open_bound_raw_arp_packet_socket(interface_name: &str) -> Result<OwnedFd, AppError> {
     interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
     let interface_index = interface_index_from_name(interface_name)?;
     let flags = read_interface_flags(interface_name)?;
     validate_interface_flags_for_arp_scanning(interface_name, flags)?;
     let packet_socket = open_raw_packet_socket()?;
     bind_packet_socket_to_interface(&packet_socket, interface_index)?;
-    Ok(())
+    Ok(packet_socket)
 }
 
 fn interface_index_from_name(interface_name: &str) -> Result<libc::c_uint, AppError> {
@@ -54,31 +48,12 @@ fn interface_index_from_name(interface_name: &str) -> Result<libc::c_uint, AppEr
         message: "interface name contains an interior NUL byte".to_string(),
     })?;
 
-    // SAFETY: `terminated` is a valid NUL-terminated C string pointer accepted by `if_nametoindex`.
-    let index = unsafe { libc::if_nametoindex(terminated.as_ptr()) };
-    if index == 0 {
-        return Err(AppError::InterfaceLookupFailed {
+    linux_system_call::interface_index_from_name(&terminated).map_err(|source| {
+        AppError::InterfaceLookupFailed {
             interface_name: interface_name.to_string(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-
-    Ok(index)
-}
-
-fn open_inet_datagram_control_socket() -> Result<OwnedFd, AppError> {
-    // SAFETY: `socket(2)` with `AF_INET`/`SOCK_DGRAM` is the standard portable approach for
-    // issuing interface `ioctl`s.
-    let file_descriptor =
-        unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-
-    if file_descriptor < 0 {
-        return Err(AppError::Io(std::io::Error::last_os_error()));
-    }
-
-    // SAFETY: `file_descriptor` is a freshly created valid socket file descriptor returned by
-    // `socket(2)`.
-    Ok(unsafe { OwnedFd::from_raw_fd(file_descriptor) })
+            source,
+        }
+    })
 }
 
 fn copy_interface_name_to_ifreq(
@@ -103,26 +78,19 @@ fn copy_interface_name_to_ifreq(
 }
 
 fn read_interface_flags(interface_name: &str) -> Result<i32, AppError> {
-    let control_socket = open_inet_datagram_control_socket()?;
+    let control_socket = linux_system_call::open_inet_datagram_socket().map_err(AppError::Io)?;
     let mut request: libc::ifreq = unsafe { zeroed() };
     copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
-    // SAFETY: `control_socket` is a valid socket file descriptor and `request` is a valid
-    // `ifreq` pointer for `SIOCGIFFLAGS`.
-    let ioctl_result = unsafe {
-        libc::ioctl(
-            control_socket.as_raw_fd(),
-            SIOCGIFFLAGS_REQUEST,
-            std::ptr::addr_of_mut!(request),
-        )
-    };
-
-    if ioctl_result < 0 {
-        return Err(AppError::InterfaceFlagsQueryFailed {
-            interface_name: interface_name.to_string(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
+    linux_system_call::ioctl_ifreq(
+        &control_socket,
+        linux_system_call::SIOCGIFFLAGS_REQUEST,
+        &mut request,
+    )
+    .map_err(|source| AppError::InterfaceFlagsQueryFailed {
+        interface_name: interface_name.to_string(),
+        source,
+    })?;
 
     let flags = i32::from(unsafe { request.ifr_ifru.ifru_flags });
     Ok(flags)
@@ -157,27 +125,16 @@ fn validate_interface_flags_for_arp_scanning(
 }
 
 fn open_raw_packet_socket() -> Result<OwnedFd, AppError> {
-    let protocol = u32::from(ETHERNET_PROTOCOL_ARP).to_be() as libc::c_int;
-
-    // SAFETY: `socket(2)` with `AF_PACKET`/`SOCK_RAW` is the documented Linux mechanism for raw
-    // link-layer access (see `packet(7)`).
-    let file_descriptor = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            protocol,
-        )
-    };
-
-    if file_descriptor < 0 {
-        return Err(AppError::RawSocketOpenFailed {
-            source: std::io::Error::last_os_error(),
-        });
+    match linux_system_call::open_packet_raw_socket(ETHERNET_PROTOCOL_ARP) {
+        Ok(socket) => Ok(socket),
+        Err(source) => {
+            if source.kind() == std::io::ErrorKind::PermissionDenied {
+                Err(AppError::RawSocketCapabilityRequired { source })
+            } else {
+                Err(AppError::RawSocketOpenFailed { source })
+            }
+        }
     }
-
-    // SAFETY: `file_descriptor` is a freshly created valid socket file descriptor returned by
-    // `socket(2)`.
-    Ok(unsafe { OwnedFd::from_raw_fd(file_descriptor) })
 }
 
 fn bind_packet_socket_to_interface(
@@ -190,23 +147,11 @@ fn bind_packet_socket_to_interface(
     address.interface_index = interface_index as libc::c_int;
     address.hardware_type = ARP_HARDWARE_TYPE_ETHERNET as libc::c_ushort;
 
-    // SAFETY: `address` matches `struct sockaddr_ll` layout and `bind(2)` expects a `sockaddr`
-    // pointer with the correct length for this address family.
-    let bind_result = unsafe {
-        libc::bind(
-            packet_socket.as_raw_fd(),
-            std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
-            std::mem::size_of::<SockAddressLinkLayer>() as libc::socklen_t,
-        )
-    };
-
-    if bind_result < 0 {
-        return Err(AppError::SocketBindFailed {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-
-    Ok(())
+    linux_system_call::bind_sockaddr_link_layer(
+        packet_socket,
+        address.as_libc_sockaddr_link_layer(),
+    )
+    .map_err(|source| AppError::SocketBindFailed { source })
 }
 
 #[cfg(test)]

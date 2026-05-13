@@ -41,58 +41,204 @@ pub enum AppError {
         /// Underlying operating system error (typically `errno`).
         source: std::io::Error,
     },
+    /// Opening a raw packet socket was denied because the process lacks `CAP_NET_RAW`.
+    RawSocketCapabilityRequired {
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
     /// Binding the raw `AF_PACKET` socket to the interface failed.
     SocketBindFailed {
         /// Underlying operating system error (typically `errno`).
         source: std::io::Error,
     },
-    /// ARP scanning is not implemented yet (socket initialization succeeded).
-    ScanningNotImplemented,
+    /// Reading the interface IPv4 address through `ioctl` failed.
+    InterfaceIpv4AddressQueryFailed {
+        /// Interface name supplied by the caller.
+        interface_name: String,
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
+    /// Reading the interface IPv4 netmask through `ioctl` failed.
+    InterfaceIpv4NetmaskQueryFailed {
+        /// Interface name supplied by the caller.
+        interface_name: String,
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
+    /// Reading the interface hardware address through `ioctl` failed.
+    InterfaceHardwareAddressQueryFailed {
+        /// Interface name supplied by the caller.
+        interface_name: String,
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
+    /// The interface hardware address is not Ethernet or is otherwise unsupported.
+    InterfaceHardwareAddressUnsupported {
+        /// Interface name supplied by the caller.
+        interface_name: String,
+        /// Human-readable explanation for operators.
+        reason: String,
+    },
+    /// The socket address family for an interface IPv4 address was not `AF_INET`.
+    InterfaceIpv4AddressInvalidFamily {
+        /// Address family value returned by the kernel.
+        address_family: libc::sa_family_t,
+    },
+    /// The socket address family for an interface IPv4 netmask was not `AF_INET`.
+    InterfaceIpv4NetmaskInvalidFamily {
+        /// Interface name supplied by the caller.
+        interface_name: String,
+        /// Address family value returned by the kernel.
+        address_family: libc::sa_family_t,
+    },
+    /// The IPv4 netmask is not a valid contiguous classless inter-domain routing mask.
+    Ipv4NetmaskInvalid {
+        /// Netmask that was rejected.
+        netmask: String,
+    },
+    /// The IPv4 subnet cannot be scanned with the current rules (for example `/31` or `/32`).
+    Ipv4SubnetUnsupported {
+        /// Human-readable explanation for operators.
+        message: String,
+    },
+    /// Waiting for packet socket readiness with `poll(2)` failed.
+    PollWaitFailed {
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
+    /// Receiving a raw Ethernet frame failed.
+    RawPacketReceiveFailed {
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
+}
+
+fn try_write_early_app_error_variants(
+    application_error: &AppError,
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> Option<std::fmt::Result> {
+    Some(match application_error {
+        AppError::Io(error) => write!(formatter, "input/output error: {error}"),
+        AppError::UnsupportedPlatform { operating_system } => write!(
+            formatter,
+            "this command requires Linux packet sockets; host operating system is {operating_system}"
+        ),
+        AppError::InvalidInterfaceName { message } => {
+            write!(formatter, "invalid interface name: {message}")
+        }
+        AppError::InterfaceLookupFailed {
+            interface_name,
+            source,
+        } => write!(
+            formatter,
+            "failed to look up interface index for `{interface_name}`: {source}"
+        ),
+        AppError::InterfaceFlagsQueryFailed {
+            interface_name,
+            source,
+        } => write!(
+            formatter,
+            "failed to read interface flags for `{interface_name}`: {source}"
+        ),
+        AppError::InterfaceRejectedForScanning {
+            interface_name,
+            reason,
+        } => write!(
+            formatter,
+            "interface `{interface_name}` is not suitable for ARP scanning: {reason}"
+        ),
+        AppError::RawSocketOpenFailed { source } => {
+            write!(formatter, "failed to open raw packet socket: {source}")
+        }
+        AppError::RawSocketCapabilityRequired { source } => write!(
+            formatter,
+            "opening a raw packet socket requires the Linux capability CAP_NET_RAW (or equivalent privileges); permission denied: {source}"
+        ),
+        AppError::SocketBindFailed { source } => {
+            write!(formatter, "failed to bind raw packet socket: {source}")
+        }
+        _ => return None,
+    })
+}
+
+fn write_late_app_error_variants(
+    application_error: &AppError,
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match application_error {
+        AppError::InterfaceIpv4AddressQueryFailed {
+            interface_name,
+            source,
+        } => write!(
+            formatter,
+            "failed to read IPv4 address for `{interface_name}`: {source}"
+        ),
+        AppError::InterfaceIpv4NetmaskQueryFailed {
+            interface_name,
+            source,
+        } => write!(
+            formatter,
+            "failed to read IPv4 netmask for `{interface_name}`: {source}"
+        ),
+        AppError::InterfaceHardwareAddressQueryFailed {
+            interface_name,
+            source,
+        } => write!(
+            formatter,
+            "failed to read hardware address for `{interface_name}`: {source}"
+        ),
+        AppError::InterfaceHardwareAddressUnsupported {
+            interface_name,
+            reason,
+        } => write!(
+            formatter,
+            "hardware address for `{interface_name}` is not supported for ARP scanning: {reason}"
+        ),
+        AppError::InterfaceIpv4AddressInvalidFamily { address_family } => write!(
+            formatter,
+            "interface IPv4 address query returned an unexpected address family: {address_family}"
+        ),
+        AppError::InterfaceIpv4NetmaskInvalidFamily {
+            interface_name,
+            address_family,
+        } => write!(
+            formatter,
+            "interface IPv4 netmask query for `{interface_name}` returned an unexpected address family: {address_family}"
+        ),
+        AppError::Ipv4NetmaskInvalid { netmask } => {
+            write!(
+                formatter,
+                "IPv4 netmask `{netmask}` is not a valid contiguous netmask"
+            )
+        }
+        AppError::Ipv4SubnetUnsupported { message } => {
+            write!(
+                formatter,
+                "IPv4 subnet is not supported for scanning: {message}"
+            )
+        }
+        AppError::PollWaitFailed { source } => {
+            write!(
+                formatter,
+                "failed while waiting for raw packet socket readiness: {source}"
+            )
+        }
+        AppError::RawPacketReceiveFailed { source } => {
+            write!(formatter, "failed to receive raw Ethernet frame: {source}")
+        }
+        _ => write!(
+            formatter,
+            "unexpected application error variant during display formatting"
+        ),
+    }
 }
 
 impl std::fmt::Display for AppError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AppError::Io(error) => write!(formatter, "input/output error: {error}"),
-            AppError::UnsupportedPlatform { operating_system } => write!(
-                formatter,
-                "this command requires Linux packet sockets; host operating system is {operating_system}"
-            ),
-            AppError::InvalidInterfaceName { message } => {
-                write!(formatter, "invalid interface name: {message}")
-            }
-            AppError::InterfaceLookupFailed {
-                interface_name,
-                source,
-            } => write!(
-                formatter,
-                "failed to look up interface index for `{interface_name}`: {source}"
-            ),
-            AppError::InterfaceFlagsQueryFailed {
-                interface_name,
-                source,
-            } => write!(
-                formatter,
-                "failed to read interface flags for `{interface_name}`: {source}"
-            ),
-            AppError::InterfaceRejectedForScanning {
-                interface_name,
-                reason,
-            } => write!(
-                formatter,
-                "interface `{interface_name}` is not suitable for ARP scanning: {reason}"
-            ),
-            AppError::RawSocketOpenFailed { source } => {
-                write!(formatter, "failed to open raw packet socket: {source}")
-            }
-            AppError::SocketBindFailed { source } => {
-                write!(formatter, "failed to bind raw packet socket: {source}")
-            }
-            AppError::ScanningNotImplemented => write!(
-                formatter,
-                "ARP scanning is not implemented yet (socket initialization succeeded)"
-            ),
+        if let Some(outcome) = try_write_early_app_error_variants(self, formatter) {
+            return outcome;
         }
+        write_late_app_error_variants(self, formatter)
     }
 }
 
@@ -103,7 +249,13 @@ impl std::error::Error for AppError {
             AppError::InterfaceLookupFailed { source, .. }
             | AppError::InterfaceFlagsQueryFailed { source, .. }
             | AppError::RawSocketOpenFailed { source }
-            | AppError::SocketBindFailed { source } => Some(source),
+            | AppError::RawSocketCapabilityRequired { source }
+            | AppError::SocketBindFailed { source }
+            | AppError::InterfaceIpv4AddressQueryFailed { source, .. }
+            | AppError::InterfaceIpv4NetmaskQueryFailed { source, .. }
+            | AppError::InterfaceHardwareAddressQueryFailed { source, .. }
+            | AppError::PollWaitFailed { source }
+            | AppError::RawPacketReceiveFailed { source } => Some(source),
             _ => None,
         }
     }
@@ -373,6 +525,40 @@ mod tests {
     }
 
     #[test]
+    fn display_mentions_capability_for_raw_socket_capability_required() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(13);
+        let application_error = AppError::RawSocketCapabilityRequired { source: inner };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("CAP_NET_RAW"),
+            "display should mention CAP_NET_RAW, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_raw_socket_capability_required() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(13);
+        let application_error = AppError::RawSocketCapabilityRequired { source: inner };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("capability denial should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
     fn display_includes_context_for_socket_bind_failed() {
         // Arrange
         let inner = std::io::Error::from_raw_os_error(99);
@@ -407,32 +593,149 @@ mod tests {
     }
 
     #[test]
-    fn display_mentions_scanning_not_implemented() {
+    fn display_includes_interface_name_for_interface_ipv4_address_query_failed() {
         // Arrange
-        let application_error = AppError::ScanningNotImplemented;
+        let inner = std::io::Error::from_raw_os_error(19);
+        let application_error = AppError::InterfaceIpv4AddressQueryFailed {
+            interface_name: "eth9".to_string(),
+            source: inner,
+        };
 
         // Act
         let displayed = application_error.to_string();
 
         // Assert
         assert!(
-            displayed.contains("not implemented"),
-            "display should mention missing implementation, got: {displayed}"
+            displayed.contains("eth9"),
+            "display should include interface name, got: {displayed}"
         );
     }
 
     #[test]
-    fn source_returns_none_for_scanning_not_implemented() {
+    fn source_returns_underlying_error_for_interface_ipv4_address_query_failed() {
         // Arrange
-        let application_error = AppError::ScanningNotImplemented;
+        let inner = std::io::Error::from_raw_os_error(19);
+        let application_error = AppError::InterfaceIpv4AddressQueryFailed {
+            interface_name: "eth9".to_string(),
+            source: inner,
+        };
 
         // Act
-        let source = application_error.source();
+        let source = application_error
+            .source()
+            .expect("IPv4 address query failure should expose source");
 
         // Assert
         assert!(
-            source.is_none(),
-            "scanning not implemented should not chain a source error"
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
+    fn display_includes_interface_name_for_interface_ipv4_netmask_query_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(22);
+        let application_error = AppError::InterfaceIpv4NetmaskQueryFailed {
+            interface_name: "eth9".to_string(),
+            source: inner,
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("eth9"),
+            "display should include interface name, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_reason_for_interface_hardware_address_unsupported() {
+        // Arrange
+        let application_error = AppError::InterfaceHardwareAddressUnsupported {
+            interface_name: "eth0".to_string(),
+            reason: "not Ethernet".to_string(),
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("not Ethernet"),
+            "display should include reason, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_netmask_for_ipv4_netmask_invalid() {
+        // Arrange
+        let application_error = AppError::Ipv4NetmaskInvalid {
+            netmask: "255.0.255.0".to_string(),
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("255.0.255.0"),
+            "display should include netmask, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_message_for_ipv4_subnet_unsupported() {
+        // Arrange
+        let application_error = AppError::Ipv4SubnetUnsupported {
+            message: "no usable hosts".to_string(),
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("no usable hosts"),
+            "display should include message, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_poll_wait_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(4);
+        let application_error = AppError::PollWaitFailed { source: inner };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("poll failure should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_raw_packet_receive_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(5);
+        let application_error = AppError::RawPacketReceiveFailed { source: inner };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("receive failure should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
         );
     }
 }
