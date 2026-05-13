@@ -4,6 +4,7 @@ use clap::CommandFactory;
 use clap::Parser;
 
 use new_arp_scan::application_command::ApplicationCommand;
+use new_arp_scan::application_outcome::ApplicationOutcome;
 use new_arp_scan::cli::{CliRoot, CliSubcommand};
 
 fn main() {
@@ -19,11 +20,16 @@ fn main() {
     match CliRoot::try_parse_from(arguments.as_slice()) {
         Ok(parsed) => match parsed.subcommand {
             Some(CliSubcommand::Scan(scan)) => {
-                if let Err(error) = new_arp_scan::run(ApplicationCommand::Scan {
+                match new_arp_scan::run(ApplicationCommand::Scan {
                     interface_name: scan.interface_name,
                 }) {
-                    eprintln!("{error}");
-                    std::process::exit(1);
+                    Ok(outcome) => {
+                        print_application_outcome(outcome);
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
                 }
             }
             None => {
@@ -35,4 +41,39 @@ fn main() {
         },
         Err(error) => error.exit(),
     }
+}
+
+fn print_application_outcome(outcome: ApplicationOutcome) {
+    match outcome {
+        ApplicationOutcome::Scan(scan_outcome) => {
+            for warning in &scan_outcome.warnings {
+                eprintln!("warning: {warning}");
+            }
+
+            if scan_outcome.discovered_hosts.is_empty() {
+                println!("no hosts found");
+                return;
+            }
+
+            for host in &scan_outcome.discovered_hosts {
+                println!(
+                    "{} {}",
+                    host.ipv4_address,
+                    format_media_access_control_address_colon_separated(host.mac_address)
+                );
+            }
+        }
+    }
+}
+
+fn format_media_access_control_address_colon_separated(mac_address: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac_address[0],
+        mac_address[1],
+        mac_address[2],
+        mac_address[3],
+        mac_address[4],
+        mac_address[5],
+    )
 }

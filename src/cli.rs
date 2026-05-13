@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 /// Help footer examples appended to `--help` output.
 const EXAMPLES: &str = "\
 EXAMPLES:
-  Initialize a raw ARP packet socket on Linux (requires CAP_NET_RAW or equivalent):
+  Scan the local IPv4 subnet on Linux (requires CAP_NET_RAW or equivalent):
     new-arp-scan scan --interface eth0
 ";
 
@@ -26,7 +26,7 @@ pub struct CliRoot {
 /// Supported subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CliSubcommand {
-    /// Initialize a raw ARP packet socket on an interface (scanning not implemented yet).
+    /// Scan the interface's local IPv4 subnet using address resolution protocol requests.
     Scan(ScanArguments),
 }
 

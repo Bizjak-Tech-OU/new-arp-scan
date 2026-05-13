@@ -46,6 +46,19 @@ pub struct SockAddressLinkLayer {
     pub hardware_address: [libc::c_uchar; 8],
 }
 
+impl SockAddressLinkLayer {
+    /// Borrows this structure as a [`libc::sockaddr_ll`].
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    pub fn as_libc_sockaddr_link_layer(&self) -> &libc::sockaddr_ll {
+        // SAFETY: `SockAddressLinkLayer` is `repr(C)` and matches `libc::sockaddr_ll` layout on
+        // Linux targets where unit tests assert size, alignment, and field offsets.
+        unsafe { &*std::ptr::from_ref(self).cast::<libc::sockaddr_ll>() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SockAddressLinkLayer;
