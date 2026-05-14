@@ -4,13 +4,16 @@ pub mod application_command;
 pub mod application_outcome;
 pub mod cli;
 pub mod error;
+pub mod mac_address;
 
 #[cfg(target_os = "linux")]
-mod ethernet_arp;
+mod ethernet_frame;
 mod interface_validation;
 #[cfg(target_os = "linux")]
 mod ipv4_subnet;
 
+#[cfg(target_os = "linux")]
+mod address_resolution_protocol;
 #[cfg(target_os = "linux")]
 mod linux_interface_discovery;
 #[cfg(target_os = "linux")]
@@ -25,6 +28,7 @@ mod linux_system_call;
 pub use application_command::ApplicationCommand;
 pub use application_outcome::ApplicationOutcome;
 pub use error::AppError;
+pub use mac_address::{MacAddress, MacAddressParseError};
 
 /// Runs the application logic for a parsed [`ApplicationCommand`].
 ///
@@ -145,7 +149,7 @@ mod tests {
 
         let host = super::application_outcome::DiscoveredHost {
             ipv4_address: Ipv4Addr::new(10, 0, 0, 1),
-            mac_address: [1, 2, 3, 4, 5, 6],
+            media_access_control_address: super::MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
         };
         let scan = super::application_outcome::ScanOutcome {
             discovered_hosts: vec![host],

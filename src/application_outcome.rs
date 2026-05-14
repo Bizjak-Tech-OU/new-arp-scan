@@ -5,13 +5,15 @@
 
 use std::net::Ipv4Addr;
 
+use crate::mac_address::MacAddress;
+
 /// A host observed on the local data-link segment during an address resolution scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiscoveredHost {
     /// IPv4 address reported in the address resolution reply.
     pub ipv4_address: Ipv4Addr,
     /// Ethernet media access control address reported in the address resolution reply.
-    pub mac_address: [u8; 6],
+    pub media_access_control_address: MacAddress,
 }
 
 /// Outcome of an address resolution scan (discovered hosts and non-fatal warnings).

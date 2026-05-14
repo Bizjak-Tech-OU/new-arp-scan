@@ -36,11 +36,19 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 
 ## 2026-05-13 — Isolated Linux syscall module and raw ARP scan path
 
-**Decision:** Route Linux system calls through [`src/linux_system_call.rs`](src/linux_system_call.rs); keep descriptor lifetime management on `std::os::fd::OwnedFd` (drop closes the socket); implement manual Ethernet and ARP frame bytes in [`src/ethernet_arp.rs`](src/ethernet_arp.rs); orchestrate subnet scanning in [`src/linux_scanner.rs`](src/linux_scanner.rs); return [`ApplicationOutcome`](src/application_outcome.rs) from [`run`](src/lib.rs) with warnings carried in [`ScanOutcome`](src/application_outcome.rs) for the binary to print to standard error.
+**Decision:** Route Linux system calls through [`src/linux_system_call.rs`](src/linux_system_call.rs); keep descriptor lifetime management on `std::os::fd::OwnedFd` (drop closes the socket); implement Ethernet II framing in [`src/ethernet_frame.rs`](src/ethernet_frame.rs), IPv4 ARP over Ethernet in [`src/address_resolution_protocol.rs`](src/address_resolution_protocol.rs), and media access control addresses in [`src/mac_address.rs`](src/mac_address.rs); orchestrate subnet scanning in [`src/linux_scanner.rs`](src/linux_scanner.rs); return [`ApplicationOutcome`](src/application_outcome.rs) from [`run`](src/lib.rs) with warnings carried in [`ScanOutcome`](src/application_outcome.rs) for the binary to print to standard error.
 
 **Reason:** GitHub issues #21 (syscall surface), #6 (transmit), and #7 (receive/parse) require a single audited foreign-function-interface boundary, wire-visible frames without unsafe serialization tricks, and testable pure parsing logic. Automated tests avoid requiring `CAP_NET_RAW`; live tcpdump or Wireshark checks stay manual.
 
 **Consequences:** Linux-only unit tests cover frame layout and non-privileged syscall smoke checks; full scan behaviour is validated on Linux hosts with appropriate privileges outside `cargo test` unless CI is later equipped for it.
+
+## 2026-05-14 — Packet layer modules (`MacAddress`, Ethernet II, ARP)
+
+**Decision:** Split former `ethernet_arp.rs` into `src/mac_address.rs` (public `MacAddress`), `src/ethernet_frame.rs` (Ethernet II encode/decode), and `src/address_resolution_protocol.rs` (IPv4 ARP over Ethernet); keep 60-octet minimum transmit frames for ARP requests; reject outer VLAN-tagged Ethernet before ARP interpretation.
+
+**Reason:** Milestone issues #8–#11 and #22 call for explicit boundaries, defensive parsing, and a typed MAC address on public scan results without changing on-wire scan behaviour.
+
+**Consequences:** Library consumers use `MacAddress` and `DiscoveredHost::media_access_control_address`; future link-layer features extend the frame module first.
 
 ## 2026-05-11 — `clap` with derive for the `scan` subcommand
 
