@@ -34,7 +34,7 @@ fn copy_interface_name_to_ifreq(
     }
 
     for (index, byte) in bytes.iter().enumerate() {
-        request.ifr_name[index] = *byte as libc::c_char;
+        request.ifr_name[index] = byte.cast_signed();
     }
 
     Ok(())
@@ -44,7 +44,7 @@ fn read_ipv4_from_sockaddr(
     sockaddr: &libc::sockaddr,
     wrong_family_error: impl FnOnce(libc::sa_family_t) -> AppError,
 ) -> Result<Ipv4Addr, AppError> {
-    if sockaddr.sa_family as libc::c_int != libc::AF_INET {
+    if libc::c_int::from(sockaddr.sa_family) != libc::AF_INET {
         return Err(wrong_family_error(sockaddr.sa_family));
     }
 
@@ -63,7 +63,7 @@ fn read_hardware_address_from_sockaddr(
     interface_name: &str,
     sockaddr: &libc::sockaddr,
 ) -> Result<[u8; 6], AppError> {
-    if sockaddr.sa_family as libc::c_uint != libc::ARPHRD_ETHER as libc::c_uint {
+    if sockaddr.sa_family != libc::ARPHRD_ETHER {
         return Err(AppError::InterfaceHardwareAddressUnsupported {
             interface_name: interface_name.to_string(),
             reason: format!(
@@ -75,8 +75,8 @@ fn read_hardware_address_from_sockaddr(
     }
 
     let mut mac_address = [0u8; 6];
-    for index in 0..6 {
-        mac_address[index] = sockaddr.sa_data[index] as u8;
+    for (index, octet) in mac_address.iter_mut().enumerate() {
+        *octet = sockaddr.sa_data[index].cast_unsigned();
     }
     Ok(mac_address)
 }
@@ -194,7 +194,8 @@ mod tests {
         // Arrange
         let expected = Ipv4Addr::new(198, 51, 100, 7);
         let mut socket_address_internet: libc::sockaddr_in = unsafe { zeroed() };
-        socket_address_internet.sin_family = libc::AF_INET as libc::sa_family_t;
+        socket_address_internet.sin_family =
+            libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET should fit sa_family_t");
         socket_address_internet.sin_addr.s_addr = u32::from_be_bytes(expected.octets());
 
         let sockaddr = std::ptr::from_ref(&socket_address_internet).cast::<libc::sockaddr>();

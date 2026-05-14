@@ -8,7 +8,8 @@ use crate::error::AppError;
 use crate::interface_validation;
 use crate::linux_packet::{
     ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK,
-    INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SockAddressLinkLayer,
+    INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SOCKET_ADDRESS_FAMILY_PACKET, SockAddressLinkLayer,
+    ethernet_protocol_host_to_network_order,
 };
 use crate::linux_system_call;
 
@@ -34,13 +35,31 @@ use crate::linux_system_call;
 ///
 /// This function does not panic.
 pub fn open_bound_raw_arp_packet_socket(interface_name: &str) -> Result<OwnedFd, AppError> {
+    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
+    let packet_socket = open_raw_packet_socket()?;
+    bind_packet_socket_to_interface(&packet_socket, interface_name, interface_index)?;
+    Ok(packet_socket)
+}
+
+/// Validates that `interface_name` is usable for ARP scanning and returns its Linux interface
+/// index.
+///
+/// # Errors
+///
+/// Returns [`AppError`] when the interface name is invalid, cannot be resolved, its flags cannot
+/// be read, or its flags indicate that it is loopback, down, or `NOARP`.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn validated_interface_index_for_arp_scanning(
+    interface_name: &str,
+) -> Result<libc::c_uint, AppError> {
     interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
     let interface_index = interface_index_from_name(interface_name)?;
     let flags = read_interface_flags(interface_name)?;
     validate_interface_flags_for_arp_scanning(interface_name, flags)?;
-    let packet_socket = open_raw_packet_socket()?;
-    bind_packet_socket_to_interface(&packet_socket, interface_index)?;
-    Ok(packet_socket)
+    Ok(interface_index)
 }
 
 fn interface_index_from_name(interface_name: &str) -> Result<libc::c_uint, AppError> {
@@ -71,7 +90,7 @@ fn copy_interface_name_to_ifreq(
     }
 
     for (index, byte) in bytes.iter().enumerate() {
-        request.ifr_name[index] = *byte as libc::c_char;
+        request.ifr_name[index] = byte.cast_signed();
     }
 
     Ok(())
@@ -139,13 +158,21 @@ fn open_raw_packet_socket() -> Result<OwnedFd, AppError> {
 
 fn bind_packet_socket_to_interface(
     packet_socket: &OwnedFd,
+    interface_name: &str,
     interface_index: libc::c_uint,
 ) -> Result<(), AppError> {
     let mut address: SockAddressLinkLayer = unsafe { zeroed() };
-    address.socket_address_family = libc::AF_PACKET as libc::c_ushort;
-    address.link_layer_protocol = u32::from(ETHERNET_PROTOCOL_ARP).to_be() as libc::c_ushort;
-    address.interface_index = interface_index as libc::c_int;
-    address.hardware_type = ARP_HARDWARE_TYPE_ETHERNET as libc::c_ushort;
+    address.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
+    address.link_layer_protocol = ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+    address.interface_index =
+        libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
+            interface_name: interface_name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("interface index {interface_index} does not fit sockaddr_ll"),
+            ),
+        })?;
+    address.hardware_type = ARP_HARDWARE_TYPE_ETHERNET;
 
     linux_system_call::bind_sockaddr_link_layer(
         packet_socket,

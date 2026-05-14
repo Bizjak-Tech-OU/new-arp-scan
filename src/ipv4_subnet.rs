@@ -29,7 +29,7 @@ pub fn prefix_length_from_contiguous_netmask(netmask: Ipv4Addr) -> Result<u8, Ap
         });
     }
 
-    let prefix_bits = inverted.trailing_zeros();
+    let prefix_bits = mask_bits.leading_ones();
     u8::try_from(prefix_bits).map_err(|_| AppError::Ipv4NetmaskInvalid {
         netmask: netmask.to_string(),
     })
