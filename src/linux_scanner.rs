@@ -1,7 +1,6 @@
 //! Linux address resolution scanning orchestration.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
 use std::mem::zeroed;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -15,9 +14,12 @@ use crate::ipv4_subnet::{
 };
 use crate::linux_interface_discovery::discover_interface_scan_addresses;
 use crate::linux_packet::{
-    ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, SockAddressLinkLayer,
+    ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, SOCKET_ADDRESS_FAMILY_PACKET,
+    SockAddressLinkLayer, ethernet_protocol_host_to_network_order,
 };
-use crate::linux_socket::open_bound_raw_arp_packet_socket;
+use crate::linux_socket::{
+    open_bound_raw_arp_packet_socket, validated_interface_index_for_arp_scanning,
+};
 use crate::linux_system_call;
 
 /// Duration after the last request transmission during which replies are collected.
@@ -34,6 +36,7 @@ const RECEIVE_WINDOW_AFTER_LAST_REQUEST: Duration = Duration::from_secs(3);
 ///
 /// This function does not panic.
 pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
+    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
     let addresses = discover_interface_scan_addresses(interface_name)?;
     let (first_host_bits, last_host_bits) = inclusive_host_address_range_excluding_edges(
         addresses.source_ipv4_address,
@@ -44,25 +47,21 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
     let network_bits = addresses.source_ipv4_address.to_bits() & mask_bits;
     let broadcast_bits = network_bits | !mask_bits;
 
-    let terminated = CString::new(interface_name).map_err(|_| AppError::InvalidInterfaceName {
-        message: "interface name contains an interior NUL byte".to_string(),
-    })?;
-    let interface_index =
-        linux_system_call::interface_index_from_name(&terminated).map_err(|source| {
-            AppError::InterfaceLookupFailed {
-                interface_name: interface_name.to_string(),
-                source,
-            }
-        })?;
-
     let packet_socket = open_bound_raw_arp_packet_socket(interface_name)?;
 
     let mut link_layer_destination: SockAddressLinkLayer = unsafe { zeroed() };
-    link_layer_destination.socket_address_family = libc::AF_PACKET as libc::c_ushort;
+    link_layer_destination.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
     link_layer_destination.link_layer_protocol =
-        u32::from(ETHERNET_PROTOCOL_ARP).to_be() as libc::c_ushort;
-    link_layer_destination.interface_index = interface_index as libc::c_int;
-    link_layer_destination.hardware_type = ARP_HARDWARE_TYPE_ETHERNET as libc::c_ushort;
+        ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+    link_layer_destination.interface_index =
+        libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
+            interface_name: interface_name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("interface index {interface_index} does not fit sockaddr_ll"),
+            ),
+        })?;
+    link_layer_destination.hardware_type = ARP_HARDWARE_TYPE_ETHERNET;
     link_layer_destination.hardware_address_length = 6;
     link_layer_destination.hardware_address[0..6].fill(0xFF);
 
@@ -101,10 +100,8 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout_milliseconds: libc::c_int = remaining
-            .as_millis()
-            .min(u128::from(libc::c_int::MAX as u32))
-            as libc::c_int;
+        let timeout_milliseconds =
+            libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
 
         match linux_system_call::poll_socket_readiness(
             &packet_socket,

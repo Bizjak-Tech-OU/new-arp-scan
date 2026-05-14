@@ -1,4 +1,7 @@
 //! Linux packet socket constants and the `sockaddr_ll` layout used with `bind(2)`.
+/// Linux packet socket address family (`AF_PACKET`).
+pub const SOCKET_ADDRESS_FAMILY_PACKET: libc::c_ushort = 17;
+
 /// Ethernet protocol identifier for ARP (`ETH_P_ARP` in `linux/if_ether.h`).
 pub const ETHERNET_PROTOCOL_ARP: u16 = 0x0806;
 
@@ -59,12 +62,25 @@ impl SockAddressLinkLayer {
     }
 }
 
+/// Converts an Ethernet protocol identifier from host byte order to network byte order for
+/// `packet(7)` APIs.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn ethernet_protocol_host_to_network_order(
+    ethernet_protocol_host_order: u16,
+) -> libc::c_ushort {
+    ethernet_protocol_host_order.to_be()
+}
+
 #[cfg(test)]
 mod tests {
     use super::SockAddressLinkLayer;
     use super::{
         ARP_HARDWARE_TYPE_ETHERNET, ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST,
         ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
+        SOCKET_ADDRESS_FAMILY_PACKET, ethernet_protocol_host_to_network_order,
     };
     use std::mem::offset_of;
 
@@ -145,9 +161,35 @@ mod tests {
         // Act
         // Assert
         assert_eq!(
-            ETHERNET_PROTOCOL_ARP as libc::c_int,
+            libc::c_int::from(ETHERNET_PROTOCOL_ARP),
             libc::ETH_P_ARP,
             "ETHERNET_PROTOCOL_ARP should match libc::ETH_P_ARP"
+        );
+    }
+
+    #[test]
+    fn socket_address_family_packet_matches_libc() {
+        // Arrange
+        // Act
+        // Assert
+        assert_eq!(
+            libc::c_int::from(SOCKET_ADDRESS_FAMILY_PACKET),
+            libc::AF_PACKET,
+            "SOCKET_ADDRESS_FAMILY_PACKET should match libc::AF_PACKET"
+        );
+    }
+
+    #[test]
+    fn ethernet_protocol_network_order_matches_native_to_be() {
+        // Arrange
+        // Act
+        let protocol = ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+
+        // Assert
+        assert_eq!(
+            protocol,
+            ETHERNET_PROTOCOL_ARP.to_be(),
+            "packet socket protocol should be stored as network byte order u16"
         );
     }
 
@@ -186,7 +228,7 @@ mod tests {
         use crate::interface_validation;
 
         // Act
-        let libc_value = libc::IFNAMSIZ as usize;
+        let libc_value = libc::IFNAMSIZ;
 
         // Assert
         assert_eq!(

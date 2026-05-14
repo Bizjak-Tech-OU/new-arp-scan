@@ -5,6 +5,8 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+use crate::linux_packet::ethernet_protocol_host_to_network_order;
+
 /// `ioctl(2)` request for reading interface flags (`SIOCGIFFLAGS`).
 pub const SIOCGIFFLAGS_REQUEST: libc::Ioctl = 0x8913;
 
@@ -16,6 +18,15 @@ pub const SIOCGIFNETMASK_REQUEST: libc::Ioctl = 0x891b;
 
 /// `ioctl(2)` request for reading an interface hardware address (`SIOCGIFHWADDR`).
 pub const SIOCGIFHWADDR_REQUEST: libc::Ioctl = 0x8927;
+
+fn sockaddr_link_layer_length() -> std::io::Result<libc::socklen_t> {
+    libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_ll>()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sockaddr_ll length does not fit socklen_t",
+        )
+    })
+}
 
 /// Opens an `AF_INET` datagram socket for interface `ioctl` operations.
 ///
@@ -104,7 +115,9 @@ pub fn interface_index_from_name(interface_name: &std::ffi::CStr) -> std::io::Re
 ///
 /// This function does not panic.
 pub fn open_packet_raw_socket(ethernet_protocol_host_order: u16) -> std::io::Result<OwnedFd> {
-    let protocol = u32::from(ethernet_protocol_host_order).to_be() as libc::c_int;
+    let protocol = libc::c_int::from(ethernet_protocol_host_to_network_order(
+        ethernet_protocol_host_order,
+    ));
 
     // SAFETY: `socket(2)` with `AF_PACKET`/`SOCK_RAW` is the documented Linux mechanism for raw
     // link-layer access (see `packet(7)`).
@@ -138,13 +151,15 @@ pub fn bind_sockaddr_link_layer(
     socket: &OwnedFd,
     address: &libc::sockaddr_ll,
 ) -> std::io::Result<()> {
+    let address_length = sockaddr_link_layer_length()?;
+
     // SAFETY: `address` matches `struct sockaddr_ll` and `bind(2)` expects a `sockaddr` pointer
     // with the correct length for this address family (see `packet(7)`).
     let bind_result = unsafe {
         libc::bind(
             socket.as_raw_fd(),
             std::ptr::from_ref::<libc::sockaddr_ll>(address).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            address_length,
         )
     };
 
@@ -169,6 +184,8 @@ pub fn send_to_link_layer(
     message: &[u8],
     destination: &libc::sockaddr_ll,
 ) -> std::io::Result<usize> {
+    let destination_length = sockaddr_link_layer_length()?;
+
     // SAFETY: `message` is a valid byte slice and `destination` points to a valid `sockaddr_ll`
     // for the packet socket (see `sendto(2)` and `packet(7)`).
     let sent = unsafe {
@@ -178,7 +195,7 @@ pub fn send_to_link_layer(
             message.len(),
             0,
             std::ptr::from_ref::<libc::sockaddr_ll>(destination).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            destination_length,
         )
     };
 
@@ -186,7 +203,8 @@ pub fn send_to_link_layer(
         return Err(std::io::Error::last_os_error());
     }
 
-    Ok(sent as usize)
+    usize::try_from(sent)
+        .map_err(|_| std::io::Error::other("sendto returned a negative byte count"))
 }
 
 /// Receives a datagram from a packet socket using `recvfrom(2)`.
@@ -204,8 +222,7 @@ pub fn receive_from_link_layer(
     flags: libc::c_int,
     source_out: Option<&mut libc::sockaddr_ll>,
 ) -> std::io::Result<usize> {
-    let mut address_length: libc::socklen_t =
-        std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+    let mut address_length = sockaddr_link_layer_length()?;
     let (source_pointer, source_length_pointer) = match source_out {
         Some(out) => (
             std::ptr::from_mut(out).cast::<libc::sockaddr>(),
@@ -232,7 +249,8 @@ pub fn receive_from_link_layer(
         return Err(std::io::Error::last_os_error());
     }
 
-    Ok(received as usize)
+    usize::try_from(received)
+        .map_err(|_| std::io::Error::other("recvfrom returned a negative byte count"))
 }
 
 /// Waits for readiness on `socket` using `poll(2)`.
