@@ -128,4 +128,19 @@ mod tests {
             "valid interface name should be accepted, got: {outcome:?}"
         );
     }
+
+    #[test]
+    fn accepts_interface_name_at_maximum_byte_length() {
+        // Arrange
+        let interface_name = "a".repeat(INTERFACE_NAME_MAXIMUM_BYTES);
+
+        // Act
+        let outcome = validate_interface_name_for_linux_packet_socket(&interface_name);
+
+        // Assert
+        assert!(
+            matches!(outcome, Ok(())),
+            "IFNAMSIZ-1 byte names are valid on Linux, got: {outcome:?}"
+        );
+    }
 }

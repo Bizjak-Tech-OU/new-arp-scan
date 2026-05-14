@@ -12,6 +12,7 @@
 - The `Makefile` `lint` target runs `cargo fmt --all` and then `cargo clippy --all-targets -- -D warnings`.
 - The `Makefile` `test` target runs `cargo test` and then `cargo test --tests`.
 - The `Makefile` `build` target depends on `clean`, so `cargo clean` runs before `cargo build`.
+- The `Makefile` `coverage` target runs `cargo llvm-cov --all-targets --summary-only` (requires `cargo install cargo-llvm-cov` once on the machine).
 
 ## Cursor Cloud specific instructions
 

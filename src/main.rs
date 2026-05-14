@@ -77,3 +77,23 @@ fn format_media_access_control_address_colon_separated(mac_address: [u8; 6]) -> 
         mac_address[5],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::format_media_access_control_address_colon_separated;
+
+    #[test]
+    fn formats_mac_address_with_lowercase_hex_and_colons() {
+        // Arrange
+        let mac = [0x00u8, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E];
+
+        // Act
+        let formatted = format_media_access_control_address_colon_separated(mac);
+
+        // Assert
+        assert_eq!(
+            formatted, "00:1a:2b:3c:4d:5e",
+            "output should be stable lowercase colon-separated Ethernet notation"
+        );
+    }
+}

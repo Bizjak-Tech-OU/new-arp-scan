@@ -33,6 +33,7 @@ Run `new-arp-scan --help` or `new-arp-scan scan --help` for built-in examples.
 | `make build` | `cargo clean` then `cargo build` |
 | `make test` | `cargo test` then `cargo test --tests` |
 | `make lint` | `cargo fmt --all` then `cargo clippy --all-targets -- -D warnings` |
+| `make coverage` | `cargo llvm-cov --all-targets --summary-only` (install once: `cargo install cargo-llvm-cov`; first run may need `rustup component add llvm-tools-preview`) |
 | `make clean` | `cargo clean` |
 
 Run the same commands manually if you prefer not to use Make.

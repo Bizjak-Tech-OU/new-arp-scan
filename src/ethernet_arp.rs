@@ -211,4 +211,115 @@ mod tests {
         // Assert
         assert!(outcome.is_err(), "request opcode should not parse as reply");
     }
+
+    fn reply_fixture(source_mac: [u8; 6], source_ip: Ipv4Addr) -> Vec<u8> {
+        let mut frame = vec![0u8; 128];
+        frame[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        frame[6..12].copy_from_slice(&source_mac);
+        frame[12] = 0x08;
+        frame[13] = 0x06;
+        let arp_start = ETHERNET_HEADER_LENGTH;
+        let arp =
+            &mut frame[arp_start..arp_start + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
+        arp[0..2].copy_from_slice(&1u16.to_be_bytes());
+        arp[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
+        arp[4] = 6;
+        arp[5] = 4;
+        arp[6..8].copy_from_slice(&2u16.to_be_bytes());
+        arp[8..14].copy_from_slice(&source_mac);
+        arp[14..18].copy_from_slice(&source_ip.octets());
+        arp[18..24].fill(0);
+        arp[24..28].copy_from_slice(&[10, 0, 0, 1]);
+        frame
+    }
+
+    #[test]
+    fn built_request_places_target_ipv4_and_zero_target_hardware_in_payload() {
+        // Arrange
+        let source_mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let source_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let target_ip = Ipv4Addr::new(10, 0, 0, 99);
+
+        // Act
+        let frame =
+            build_address_resolution_request_ethernet_frame(source_mac, source_ip, target_ip);
+
+        // Assert
+        let arp = &frame[ETHERNET_HEADER_LENGTH..];
+        assert_eq!(&arp[14..18], &source_ip.octets());
+        assert_eq!(
+            &arp[18..24],
+            &[0u8; 6],
+            "target hardware should be zero in requests"
+        );
+        assert_eq!(&arp[24..28], &target_ip.octets());
+    }
+
+    #[test]
+    fn rejects_reply_when_ether_type_is_not_arp() {
+        // Arrange
+        let mut frame = reply_fixture([9; 6], Ipv4Addr::new(10, 0, 0, 2));
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+
+        // Act
+        let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("wrong EtherType should fail"),
+            "EtherType is not address resolution protocol"
+        );
+    }
+
+    #[test]
+    fn rejects_reply_when_arp_hardware_type_is_not_ethernet() {
+        // Arrange
+        let mut frame = reply_fixture([9; 6], Ipv4Addr::new(10, 0, 0, 2));
+        let arp_start = ETHERNET_HEADER_LENGTH;
+        frame[arp_start..arp_start + 2].copy_from_slice(&2u16.to_be_bytes());
+
+        // Act
+        let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("non-Ethernet hardware type should fail"),
+            "address resolution hardware type is not Ethernet"
+        );
+    }
+
+    #[test]
+    fn rejects_reply_when_arp_protocol_type_is_not_ipv4() {
+        // Arrange
+        let mut frame = reply_fixture([9; 6], Ipv4Addr::new(10, 0, 0, 2));
+        let arp_start = ETHERNET_HEADER_LENGTH;
+        frame[arp_start + 2..arp_start + 4].copy_from_slice(&0x86ddu16.to_be_bytes());
+
+        // Act
+        let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("non-IPv4 protocol type should fail"),
+            "address resolution protocol type is not IPv4"
+        );
+    }
+
+    #[test]
+    fn rejects_reply_when_arp_address_lengths_are_not_ethernet_ipv4() {
+        // Arrange
+        let mut frame = reply_fixture([9; 6], Ipv4Addr::new(10, 0, 0, 2));
+        let arp_start = ETHERNET_HEADER_LENGTH;
+        frame[arp_start + 4] = 5;
+
+        // Act
+        let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("wrong hardware length should fail"),
+            "address resolution address lengths are not Ethernet plus IPv4"
+        );
+    }
 }

@@ -330,6 +330,21 @@ mod tests {
     }
 
     #[test]
+    fn interface_index_from_name_fails_for_nonexistent_interface() {
+        // Arrange
+        let name = CString::new("narp___nonexistent_iface___").expect("fixture name");
+
+        // Act
+        let outcome = interface_index_from_name(&name);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "bogus interface names should fail resolution, got: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn poll_on_inet_datagram_socket_reports_pollout_without_blocking_forever() {
         // Arrange
         let socket = open_inet_datagram_socket().expect("inet datagram socket should open");

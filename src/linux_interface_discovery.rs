@@ -57,7 +57,14 @@ fn read_ipv4_from_sockaddr(
             .read_unaligned()
     };
 
-    let octets = socket_address_internet.sin_addr.s_addr.to_be_bytes();
+    // POSIX stores `in_addr.s_addr` in network byte order: the four bytes at `&s_addr` are the
+    // IPv4 octets in order. Do not use `s_addr.to_be_bytes()` — that re-encodes the `u32` value in
+    // host-endian form and swaps octets on little-endian targets (breaking real `ioctl` results).
+    let octets: [u8; 4] = unsafe {
+        std::ptr::from_ref(&socket_address_internet.sin_addr.s_addr)
+            .cast::<[u8; 4]>()
+            .read_unaligned()
+    };
     Ok(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
 }
 
@@ -190,6 +197,7 @@ fn read_interface_hardware_address(
 
 #[cfg(test)]
 mod tests {
+    use super::read_hardware_address_from_sockaddr;
     use super::read_ipv4_from_sockaddr;
     use crate::error::AppError;
     use std::mem::zeroed;
@@ -202,7 +210,13 @@ mod tests {
         let mut socket_address_internet: libc::sockaddr_in = unsafe { zeroed() };
         socket_address_internet.sin_family =
             libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET should fit sa_family_t");
-        socket_address_internet.sin_addr.s_addr = u32::from_be_bytes(expected.octets());
+        // Match the kernel: `s_addr` memory is wire-order octets, not `u32::from_be_bytes(...)`
+        // stored in native endian (which would not match `read_ipv4_from_sockaddr`).
+        unsafe {
+            std::ptr::addr_of_mut!(socket_address_internet.sin_addr.s_addr)
+                .cast::<[u8; 4]>()
+                .write(expected.octets());
+        }
 
         let sockaddr = std::ptr::from_ref(&socket_address_internet).cast::<libc::sockaddr>();
         // SAFETY: `sockaddr` points to a valid `sockaddr_in` for the lifetime of this test.
@@ -220,6 +234,103 @@ mod tests {
             outcome.expect("fixture sockaddr_in should parse"),
             expected,
             "parsed IPv4 should match fixture"
+        );
+    }
+
+    #[test]
+    fn reads_slash_22_netmask_fixture_from_sockaddr() {
+        // Arrange
+        let expected = Ipv4Addr::new(255, 255, 252, 0);
+        let mut socket_address_internet: libc::sockaddr_in = unsafe { zeroed() };
+        socket_address_internet.sin_family =
+            libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET should fit sa_family_t");
+        unsafe {
+            std::ptr::addr_of_mut!(socket_address_internet.sin_addr.s_addr)
+                .cast::<[u8; 4]>()
+                .write(expected.octets());
+        }
+        let sockaddr = std::ptr::from_ref(&socket_address_internet).cast::<libc::sockaddr>();
+        let sockaddr_ref = unsafe { &*sockaddr };
+
+        // Act
+        let outcome = read_ipv4_from_sockaddr(sockaddr_ref, |family| {
+            AppError::InterfaceIpv4NetmaskInvalidFamily {
+                interface_name: "eth0".to_string(),
+                address_family: family,
+            }
+        });
+
+        // Assert
+        assert_eq!(
+            outcome.expect("netmask fixture should parse"),
+            expected,
+            "parsed netmask should match kernel-style wire-order octets"
+        );
+    }
+
+    #[test]
+    fn read_ipv4_from_sockaddr_returns_error_when_family_is_not_inet() {
+        // Arrange
+        let mut socket_address_internet: libc::sockaddr_in = unsafe { zeroed() };
+        socket_address_internet.sin_family =
+            libc::sa_family_t::try_from(libc::AF_INET6).expect("AF_INET6 should fit sa_family_t");
+        let sockaddr = std::ptr::from_ref(&socket_address_internet).cast::<libc::sockaddr>();
+        let sockaddr_ref = unsafe { &*sockaddr };
+
+        // Act
+        let outcome = read_ipv4_from_sockaddr(sockaddr_ref, |family| {
+            AppError::InterfaceIpv4AddressInvalidFamily {
+                address_family: family,
+            }
+        });
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::InterfaceIpv4AddressInvalidFamily { .. })
+            ),
+            "non-AF_INET sockaddr should be rejected, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn read_hardware_address_accepts_ethernet_sockaddr_fixture() {
+        // Arrange
+        let mut sockaddr: libc::sockaddr = unsafe { zeroed() };
+        sockaddr.sa_family = libc::ARPHRD_ETHER;
+        let expected_mac = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x12, 0x34];
+        for (index, byte) in expected_mac.iter().enumerate() {
+            sockaddr.sa_data[index] = *byte as _;
+        }
+
+        // Act
+        let outcome = read_hardware_address_from_sockaddr("eth0", &sockaddr);
+
+        // Assert
+        assert_eq!(
+            outcome.expect("Ethernet sockaddr should yield MAC octets"),
+            expected_mac
+        );
+    }
+
+    #[test]
+    fn read_hardware_address_rejects_non_ethernet_family() {
+        // Arrange
+        let mut sockaddr: libc::sockaddr = unsafe { zeroed() };
+        sockaddr.sa_family =
+            libc::sa_family_t::try_from(libc::AF_INET).expect("AF_INET should fit sa_family_t");
+
+        // Act
+        let outcome = read_hardware_address_from_sockaddr("eth0", &sockaddr);
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::InterfaceHardwareAddressUnsupported { .. })
+            ),
+            "AF_INET sockaddr should not be treated as Ethernet hardware, got: {outcome:?}"
         );
     }
 }

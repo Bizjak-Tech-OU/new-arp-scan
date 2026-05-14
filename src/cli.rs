@@ -66,6 +66,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_scan_subcommand_with_iface_visible_alias() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--iface", "enp0s1"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.interface_name, "enp0s1",
+                    "visible alias --iface should populate interface name"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn returns_error_when_scan_subcommand_missing_interface_flag() {
         // Arrange
         let arguments = ["new-arp-scan", "scan"];
@@ -106,6 +127,21 @@ mod tests {
         assert!(
             help.contains("scan"),
             "help should mention scan subcommand, got: {help}"
+        );
+    }
+
+    #[test]
+    fn rendered_help_includes_examples_footer() {
+        // Arrange
+        let mut command = CliRoot::command();
+
+        // Act
+        let help = command.render_help().to_string();
+
+        // Assert
+        assert!(
+            help.contains("EXAMPLES:") && help.contains("new-arp-scan scan"),
+            "after_help should surface operator examples, got: {help}"
         );
     }
 }

@@ -232,3 +232,90 @@ fn ipv4_sender_is_probed_target(
     sender_ipv4_address == source_ipv4_address
         || ipv4_address_is_strictly_inside_subnet(sender_ipv4_address, network_bits, broadcast_bits)
 }
+
+#[cfg(test)]
+mod ipv4_sender_is_probed_target_tests {
+    use super::ipv4_sender_is_probed_target;
+    use std::net::Ipv4Addr;
+
+    fn network_broadcast_slash_24() -> (u32, u32) {
+        let net = Ipv4Addr::new(192, 168, 1, 0);
+        let bcast = Ipv4Addr::new(192, 168, 1, 255);
+        (net.to_bits(), bcast.to_bits())
+    }
+
+    #[test]
+    fn treats_interface_source_address_as_in_scope_even_when_not_strictly_inside_open_interval() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 1);
+
+        // Act
+        let outcome = ipv4_sender_is_probed_target(source, source, network_bits, broadcast_bits);
+
+        // Assert
+        assert!(
+            outcome,
+            "gateway-style interface address on the subnet edge should still count as in-scope"
+        );
+    }
+
+    #[test]
+    fn interior_subnet_address_is_in_scope() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let sender = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Act
+        let outcome = ipv4_sender_is_probed_target(sender, source, network_bits, broadcast_bits);
+
+        // Assert
+        assert!(
+            outcome,
+            "strictly interior host addresses should be accepted"
+        );
+    }
+
+    #[test]
+    fn network_and_broadcast_addresses_are_out_of_scope_when_not_source() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let network = Ipv4Addr::new(192, 168, 1, 0);
+        let broadcast = Ipv4Addr::new(192, 168, 1, 255);
+
+        // Act
+        let network_outcome =
+            ipv4_sender_is_probed_target(network, source, network_bits, broadcast_bits);
+        let broadcast_outcome =
+            ipv4_sender_is_probed_target(broadcast, source, network_bits, broadcast_bits);
+
+        // Assert
+        assert!(
+            !network_outcome,
+            "network address should not match strict interior rule"
+        );
+        assert!(
+            !broadcast_outcome,
+            "broadcast address should not match strict interior rule"
+        );
+    }
+
+    #[test]
+    fn address_outside_subnet_is_rejected_when_distinct_from_source() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let outsider = Ipv4Addr::new(10, 0, 0, 1);
+
+        // Act
+        let outcome = ipv4_sender_is_probed_target(outsider, source, network_bits, broadcast_bits);
+
+        // Assert
+        assert!(
+            !outcome,
+            "off-subnet senders should be ignored unless they equal the interface address"
+        );
+    }
+}

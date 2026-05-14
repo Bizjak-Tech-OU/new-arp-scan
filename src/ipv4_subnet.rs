@@ -125,6 +125,77 @@ mod tests {
     }
 
     #[test]
+    fn computes_prefix_length_for_slash_22_netmask() {
+        // Arrange
+        let netmask = Ipv4Addr::new(255, 255, 252, 0);
+
+        // Act
+        let outcome = prefix_length_from_contiguous_netmask(netmask);
+
+        // Assert
+        assert_eq!(
+            outcome.expect("/22 contiguous mask should parse"),
+            22,
+            "expected /22 prefix length"
+        );
+    }
+
+    #[test]
+    fn computes_prefix_length_for_slash_32_host_mask() {
+        // Arrange
+        let netmask = Ipv4Addr::BROADCAST;
+
+        // Act
+        let outcome = prefix_length_from_contiguous_netmask(netmask);
+
+        // Assert
+        assert_eq!(
+            outcome.expect("/32 mask should parse"),
+            32,
+            "all-ones mask is treated as /32"
+        );
+    }
+
+    #[test]
+    fn computes_prefix_length_for_all_zero_mask_as_slash_zero() {
+        // Arrange
+        let netmask = Ipv4Addr::UNSPECIFIED;
+
+        // Act
+        let outcome = prefix_length_from_contiguous_netmask(netmask);
+
+        // Assert
+        assert_eq!(
+            outcome.expect("0.0.0.0 is contiguous in the implemented predicate"),
+            0,
+            "default route style mask yields prefix length 0"
+        );
+    }
+
+    #[test]
+    fn computes_host_range_for_slash_30() {
+        // Arrange
+        let address = Ipv4Addr::new(192, 168, 1, 5);
+        let netmask = Ipv4Addr::new(255, 255, 255, 252);
+
+        // Act
+        let outcome = inclusive_host_address_range_excluding_edges(address, netmask);
+
+        // Assert
+        let (first, last) = outcome.expect("/30 should expose two interior hosts");
+        assert_eq!(
+            Ipv4Addr::from_bits(first),
+            Ipv4Addr::new(192, 168, 1, 5),
+            "first host should be .5"
+        );
+        assert_eq!(
+            Ipv4Addr::from_bits(last),
+            Ipv4Addr::new(192, 168, 1, 6),
+            "last host should be .6"
+        );
+    }
+
+    #[test]
     fn returns_error_when_netmask_is_not_contiguous() {
         // Arrange
         let netmask = Ipv4Addr::new(255, 0, 255, 0);

@@ -259,4 +259,31 @@ mod tests {
             "INTERFACE_FLAG_NO_ARP should match libc::IFF_NOARP"
         );
     }
+
+    #[test]
+    fn sockaddr_link_layer_as_libc_view_reflects_assigned_scan_fields() {
+        // Arrange
+        let mut address = SockAddressLinkLayer {
+            socket_address_family: SOCKET_ADDRESS_FAMILY_PACKET,
+            link_layer_protocol: ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP),
+            interface_index: 42,
+            hardware_type: ARP_HARDWARE_TYPE_ETHERNET,
+            packet_type: 0,
+            hardware_address_length: 6,
+            hardware_address: [0; 8],
+        };
+        address.hardware_address[0..6].copy_from_slice(&[0xFF; 6]);
+
+        // Act
+        let ll = address.as_libc_sockaddr_link_layer();
+
+        // Assert
+        assert_eq!(ll.sll_family, address.socket_address_family);
+        assert_eq!(ll.sll_protocol, address.link_layer_protocol);
+        assert_eq!(ll.sll_ifindex, address.interface_index);
+        assert_eq!(ll.sll_hatype, address.hardware_type);
+        assert_eq!(ll.sll_pkttype, address.packet_type);
+        assert_eq!(ll.sll_halen, address.hardware_address_length);
+        assert_eq!(&ll.sll_addr[..6], &[0xFFu8; 6]);
+    }
 }

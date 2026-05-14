@@ -738,4 +738,132 @@ mod tests {
             "source should be non-empty, got: {source}"
         );
     }
+
+    #[test]
+    fn display_includes_interface_name_for_interface_hardware_address_query_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(19);
+        let application_error = AppError::InterfaceHardwareAddressQueryFailed {
+            interface_name: "wlan0".to_string(),
+            source: inner,
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("wlan0") && displayed.contains("hardware address"),
+            "display should name the interface and mention hardware address, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_interface_hardware_address_query_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(19);
+        let application_error = AppError::InterfaceHardwareAddressQueryFailed {
+            interface_name: "wlan0".to_string(),
+            source: inner,
+        };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("hardware address query failure should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_interface_ipv4_netmask_query_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(99);
+        let application_error = AppError::InterfaceIpv4NetmaskQueryFailed {
+            interface_name: "eth2".to_string(),
+            source: inner,
+        };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("netmask query failure should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
+    fn display_includes_address_family_for_interface_ipv4_address_invalid_family() {
+        // Arrange
+        let application_error = AppError::InterfaceIpv4AddressInvalidFamily {
+            address_family: 123,
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("123"),
+            "display should surface the unexpected family value, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_interface_and_family_for_netmask_invalid_family() {
+        // Arrange
+        let application_error = AppError::InterfaceIpv4NetmaskInvalidFamily {
+            interface_name: "eth3".to_string(),
+            address_family: 7,
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("eth3") && displayed.contains('7'),
+            "display should include interface and family, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_context_for_poll_wait_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(4);
+        let application_error = AppError::PollWaitFailed { source: inner };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("readiness"),
+            "display should describe poll/readiness failure, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_context_for_raw_packet_receive_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(5);
+        let application_error = AppError::RawPacketReceiveFailed { source: inner };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("receive") && displayed.contains("Ethernet"),
+            "display should describe receive failure, got: {displayed}"
+        );
+    }
 }

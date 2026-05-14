@@ -1,4 +1,4 @@
-.PHONY: build test lint clean
+.PHONY: build test lint clean coverage
 
 build: clean
 	cargo build
@@ -10,6 +10,9 @@ test:
 lint:
 	cargo fmt --all
 	cargo clippy --all-targets -- -D warnings
+
+coverage:
+	cargo llvm-cov --all-targets --summary-only
 
 clean:
 	cargo clean
