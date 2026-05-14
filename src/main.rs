@@ -58,37 +58,24 @@ fn print_application_outcome(outcome: ApplicationOutcome) {
             for host in &scan_outcome.discovered_hosts {
                 println!(
                     "{} {}",
-                    host.ipv4_address,
-                    format_media_access_control_address_colon_separated(host.mac_address)
+                    host.ipv4_address, host.media_access_control_address
                 );
             }
         }
     }
 }
 
-fn format_media_access_control_address_colon_separated(mac_address: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac_address[0],
-        mac_address[1],
-        mac_address[2],
-        mac_address[3],
-        mac_address[4],
-        mac_address[5],
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::format_media_access_control_address_colon_separated;
+    use new_arp_scan::mac_address::MacAddress;
 
     #[test]
-    fn formats_mac_address_with_lowercase_hex_and_colons() {
+    fn mac_address_display_matches_lowercase_colon_format() {
         // Arrange
-        let mac = [0x00u8, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E];
+        let address = MacAddress::from_octets([0x00u8, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E]);
 
         // Act
-        let formatted = format_media_access_control_address_colon_separated(mac);
+        let formatted = address.to_string();
 
         // Assert
         assert_eq!(

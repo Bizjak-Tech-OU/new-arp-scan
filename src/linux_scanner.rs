@@ -5,10 +5,12 @@ use std::mem::zeroed;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use crate::address_resolution_protocol::{
+    build_address_resolution_request_ethernet_frame,
+    try_parse_address_resolution_reply_ipv4_over_ethernet,
+};
 use crate::application_outcome::{DiscoveredHost, ScanOutcome};
 use crate::error::AppError;
-use crate::ethernet_arp::build_address_resolution_request_ethernet_frame;
-use crate::ethernet_arp::try_parse_address_resolution_reply_ipv4_over_ethernet;
 use crate::ipv4_subnet::{
     inclusive_host_address_range_excluding_edges, ipv4_address_is_strictly_inside_subnet,
 };
@@ -21,6 +23,7 @@ use crate::linux_socket::{
     open_bound_raw_arp_packet_socket, validated_interface_index_for_arp_scanning,
 };
 use crate::linux_system_call;
+use crate::mac_address::MacAddress;
 
 /// Duration after the last request transmission during which replies are collected.
 const RECEIVE_WINDOW_AFTER_LAST_REQUEST: Duration = Duration::from_secs(3);
@@ -95,7 +98,7 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
     }
 
     let deadline = Instant::now() + RECEIVE_WINDOW_AFTER_LAST_REQUEST;
-    let mut discovered_hosts: BTreeMap<Ipv4Addr, [u8; 6]> = BTreeMap::new();
+    let mut discovered_hosts: BTreeMap<Ipv4Addr, MacAddress> = BTreeMap::new();
     let mut receive_buffer = [0u8; 4096];
 
     while Instant::now() < deadline {
@@ -129,10 +132,12 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
 
     let hosts: Vec<DiscoveredHost> = discovered_hosts
         .into_iter()
-        .map(|(ipv4_address, mac_address)| DiscoveredHost {
-            ipv4_address,
-            mac_address,
-        })
+        .map(
+            |(ipv4_address, media_access_control_address)| DiscoveredHost {
+                ipv4_address,
+                media_access_control_address,
+            },
+        )
         .collect();
 
     Ok(ScanOutcome {
@@ -144,7 +149,7 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
 fn send_one_address_resolution_request(
     packet_socket: &std::os::fd::OwnedFd,
     link_layer_destination: &SockAddressLinkLayer,
-    source_mac_address: [u8; 6],
+    source_mac_address: MacAddress,
     source_ipv4_address: Ipv4Addr,
     target_ipv4_address: Ipv4Addr,
     warnings: &mut Vec<String>,
@@ -174,7 +179,7 @@ fn drain_readable_packet_socket(
     source_ipv4_address: Ipv4Addr,
     network_bits: u32,
     broadcast_bits: u32,
-    discovered_hosts: &mut BTreeMap<Ipv4Addr, [u8; 6]>,
+    discovered_hosts: &mut BTreeMap<Ipv4Addr, MacAddress>,
     warnings: &mut Vec<String>,
 ) -> Result<(), AppError> {
     loop {

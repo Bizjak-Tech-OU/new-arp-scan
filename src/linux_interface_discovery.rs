@@ -7,6 +7,7 @@ use std::os::fd::OwnedFd;
 use crate::error::AppError;
 use crate::interface_validation;
 use crate::linux_system_call;
+use crate::mac_address::MacAddress;
 
 /// IPv4 configuration and Ethernet hardware address discovered for scanning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +17,7 @@ pub struct InterfaceScanAddresses {
     /// IPv4 netmask associated with [`Self::source_ipv4_address`].
     pub ipv4_netmask: Ipv4Addr,
     /// Source Ethernet hardware address used in outgoing frames.
-    pub source_mac_address: [u8; 6],
+    pub source_mac_address: MacAddress,
 }
 
 fn copy_interface_name_to_ifreq(
@@ -71,7 +72,7 @@ fn read_ipv4_from_sockaddr(
 fn read_hardware_address_from_sockaddr(
     interface_name: &str,
     sockaddr: &libc::sockaddr,
-) -> Result<[u8; 6], AppError> {
+) -> Result<MacAddress, AppError> {
     if sockaddr.sa_family != libc::ARPHRD_ETHER {
         return Err(AppError::InterfaceHardwareAddressUnsupported {
             interface_name: interface_name.to_string(),
@@ -83,15 +84,15 @@ fn read_hardware_address_from_sockaddr(
         });
     }
 
-    let mut mac_address = [0u8; 6];
-    for (index, octet) in mac_address.iter_mut().enumerate() {
+    let mut hardware_address_octets = [0u8; 6];
+    for (octet_index, octet) in hardware_address_octets.iter_mut().enumerate() {
         // `libc` may use `c_char` (`i8`) or `u8` for `sa_data`; cast is a no-op on `u8` targets.
         #[allow(clippy::unnecessary_cast)]
         {
-            *octet = sockaddr.sa_data[index] as u8;
+            *octet = sockaddr.sa_data[octet_index] as u8;
         }
     }
-    Ok(mac_address)
+    Ok(MacAddress::from_octets(hardware_address_octets))
 }
 
 /// Reads [`InterfaceScanAddresses`] for `interface_name` using `ioctl(2)` on an `AF_INET` datagram
@@ -176,7 +177,7 @@ fn read_interface_ipv4_netmask(
 fn read_interface_hardware_address(
     control_socket: &OwnedFd,
     interface_name: &str,
-) -> Result<[u8; 6], AppError> {
+) -> Result<MacAddress, AppError> {
     let mut request: libc::ifreq = unsafe { zeroed() };
     copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
@@ -200,6 +201,7 @@ mod tests {
     use super::read_hardware_address_from_sockaddr;
     use super::read_ipv4_from_sockaddr;
     use crate::error::AppError;
+    use crate::mac_address::MacAddress;
     use std::mem::zeroed;
     use std::net::Ipv4Addr;
 
@@ -310,7 +312,7 @@ mod tests {
         // Assert
         assert_eq!(
             outcome.expect("Ethernet sockaddr should yield MAC octets"),
-            expected_mac
+            MacAddress::from_octets(expected_mac)
         );
     }
 
