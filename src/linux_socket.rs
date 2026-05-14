@@ -90,7 +90,9 @@ fn copy_interface_name_to_ifreq(
     }
 
     for (index, byte) in bytes.iter().enumerate() {
-        request.ifr_name[index] = byte.cast_signed();
+        // `libc` may expose `ifr_name` as either `c_char` (`i8`) or `u8` depending on the target
+        // and crate version; `as _` assigns the correct representation in both cases.
+        request.ifr_name[index] = *byte as _;
     }
 
     Ok(())
