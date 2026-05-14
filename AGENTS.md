@@ -12,3 +12,11 @@
 - The `Makefile` `lint` target runs `cargo fmt --all` and then `cargo clippy --all-targets -- -D warnings`.
 - The `Makefile` `test` target runs `cargo test` and then `cargo test --tests`.
 - The `Makefile` `build` target depends on `clean`, so `cargo clean` runs before `cargo build`.
+
+## Cursor Cloud specific instructions
+
+- **Rust toolchain:** The project uses `edition = "2024"` which requires Rust ≥ 1.85. The update script ensures stable toolchain is installed. Use `cargo build` (not `make build`) to avoid the `cargo clean` that the Makefile prepends.
+- **Running the CLI:** The binary is at `./target/debug/new-arp-scan` after `cargo build`. A full ARP scan requires `CAP_NET_RAW` (run as root or with `sudo`). The CLI argument parsing and error paths can be exercised without privileges.
+- **Tests:** `make test` or `cargo test`. Two tests are environment-sensitive: `computes_prefix_length_for_slash_24_netmask` and `returns_rejection_when_scanning_loopback_interface_on_linux` may fail in containers where the loopback hardware type differs from a standard Linux host.
+- **Lint:** `make lint` runs `cargo fmt --all` then `cargo clippy --all-targets -- -D warnings`. Clippy pedantic is enabled; newer Rust toolchains may surface additional lints not present when the code was last updated.
+- **No external services:** This is a pure systems CLI — no databases, Docker, or network services are needed.
