@@ -1,4 +1,4 @@
-//! Discovers IPv4 addresses, netmasks, and hardware addresses for a named Linux interface.
+//! Discovers Linux network interfaces and IPv4 configuration for ARP scanning.
 
 use std::mem::zeroed;
 use std::net::Ipv4Addr;
@@ -6,6 +6,8 @@ use std::os::fd::OwnedFd;
 
 use crate::error::AppError;
 use crate::interface_validation;
+use crate::linux_packet::{INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP};
+use crate::linux_socket::validated_interface_index_for_arp_scanning;
 use crate::linux_system_call;
 use crate::mac_address::MacAddress;
 
@@ -20,27 +22,19 @@ pub struct InterfaceScanAddresses {
     pub source_mac_address: MacAddress,
 }
 
-fn copy_interface_name_to_ifreq(
-    interface_name: &str,
-    request: &mut libc::ifreq,
-) -> Result<(), AppError> {
-    let bytes = interface_name.as_bytes();
-    if bytes.len() >= interface_validation::INTERFACE_NAME_BUFFER_SIZE {
-        return Err(AppError::InvalidInterfaceName {
-            message: format!(
-                "interface name must be shorter than {} bytes",
-                interface_validation::INTERFACE_NAME_BUFFER_SIZE
-            ),
-        });
-    }
-
-    for (index, byte) in bytes.iter().enumerate() {
-        // `libc` may expose `ifr_name` as either `c_char` (`i8`) or `u8` depending on the target
-        // and crate version; `as _` assigns the correct representation in both cases.
-        request.ifr_name[index] = *byte as _;
-    }
-
-    Ok(())
+/// One local interface that satisfies ARP scan filtering rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArpScanInterfaceCandidate {
+    /// Operating system interface name (for example `eth0`).
+    pub interface_name: String,
+    /// Linux interface index (`ifindex`).
+    pub interface_index: u32,
+    /// Primary IPv4 address on this interface.
+    pub source_ipv4_address: Ipv4Addr,
+    /// IPv4 netmask associated with [`Self::source_ipv4_address`].
+    pub ipv4_netmask: Ipv4Addr,
+    /// Ethernet hardware address for this interface.
+    pub source_mac_address: MacAddress,
 }
 
 fn read_ipv4_from_sockaddr(
@@ -92,43 +86,44 @@ fn read_hardware_address_from_sockaddr(
             *octet = sockaddr.sa_data[octet_index] as u8;
         }
     }
-    Ok(MacAddress::from_octets(hardware_address_octets))
+
+    let address = MacAddress::from_octets(hardware_address_octets);
+    if address.is_zero() {
+        return Err(AppError::InterfaceHardwareAddressUnsupported {
+            interface_name: interface_name.to_string(),
+            reason: "hardware address is all zero".to_string(),
+        });
+    }
+
+    Ok(address)
 }
 
-/// Reads [`InterfaceScanAddresses`] for `interface_name` using `ioctl(2)` on an `AF_INET` datagram
-/// control socket.
-///
-/// # Errors
-///
-/// Returns [`AppError`] when the interface name is invalid, when any `ioctl` fails, when the
-/// address family is unexpected, or when the hardware address is not Ethernet.
-///
-/// # Panics
-///
-/// This function does not panic.
-pub fn discover_interface_scan_addresses(
+fn read_interface_flags_with_control_socket(
+    control_socket: &OwnedFd,
     interface_name: &str,
-) -> Result<InterfaceScanAddresses, AppError> {
-    interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
-    let control_socket = linux_system_call::open_inet_datagram_socket().map_err(AppError::Io)?;
+) -> Result<i32, AppError> {
+    let mut request: libc::ifreq = unsafe { zeroed() };
+    interface_validation::copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
-    let source_ipv4_address = read_interface_ipv4_address(&control_socket, interface_name)?;
-    let ipv4_netmask = read_interface_ipv4_netmask(&control_socket, interface_name)?;
-    let source_mac_address = read_interface_hardware_address(&control_socket, interface_name)?;
+    linux_system_call::ioctl_ifreq(
+        control_socket,
+        linux_system_call::SIOCGIFFLAGS_REQUEST,
+        &mut request,
+    )
+    .map_err(|source| AppError::InterfaceFlagsQueryFailed {
+        interface_name: interface_name.to_string(),
+        source,
+    })?;
 
-    Ok(InterfaceScanAddresses {
-        source_ipv4_address,
-        ipv4_netmask,
-        source_mac_address,
-    })
+    Ok(i32::from(unsafe { request.ifr_ifru.ifru_flags }))
 }
 
-fn read_interface_ipv4_address(
+fn read_interface_ipv4_address_with_control_socket(
     control_socket: &OwnedFd,
     interface_name: &str,
 ) -> Result<Ipv4Addr, AppError> {
     let mut request: libc::ifreq = unsafe { zeroed() };
-    copy_interface_name_to_ifreq(interface_name, &mut request)?;
+    interface_validation::copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
     linux_system_call::ioctl_ifreq(
         control_socket,
@@ -147,12 +142,12 @@ fn read_interface_ipv4_address(
     })
 }
 
-fn read_interface_ipv4_netmask(
+fn read_interface_ipv4_netmask_with_control_socket(
     control_socket: &OwnedFd,
     interface_name: &str,
 ) -> Result<Ipv4Addr, AppError> {
     let mut request: libc::ifreq = unsafe { zeroed() };
-    copy_interface_name_to_ifreq(interface_name, &mut request)?;
+    interface_validation::copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
     linux_system_call::ioctl_ifreq(
         control_socket,
@@ -174,12 +169,12 @@ fn read_interface_ipv4_netmask(
     })
 }
 
-fn read_interface_hardware_address(
+fn read_interface_hardware_address_with_control_socket(
     control_socket: &OwnedFd,
     interface_name: &str,
 ) -> Result<MacAddress, AppError> {
     let mut request: libc::ifreq = unsafe { zeroed() };
-    copy_interface_name_to_ifreq(interface_name, &mut request)?;
+    interface_validation::copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
     linux_system_call::ioctl_ifreq(
         control_socket,
@@ -196,11 +191,166 @@ fn read_interface_hardware_address(
     read_hardware_address_from_sockaddr(interface_name, &sockaddr)
 }
 
+/// Attempts to build an [`ArpScanInterfaceCandidate`] for `interface_name` using one control socket.
+///
+/// Returns [`None`] when the interface is not usable for ARP scanning under the current rules.
+fn try_build_arp_scan_interface_candidate(
+    control_socket: &OwnedFd,
+    interface_name: &str,
+    interface_index: libc::c_uint,
+) -> Option<ArpScanInterfaceCandidate> {
+    interface_validation::validate_interface_name_for_linux_packet_socket(interface_name).ok()?;
+
+    let flags = read_interface_flags_with_control_socket(control_socket, interface_name).ok()?;
+    if !interface_flags_allow_arp_scanning(flags) {
+        return None;
+    }
+
+    let source_ipv4_address =
+        read_interface_ipv4_address_with_control_socket(control_socket, interface_name).ok()?;
+    let ipv4_netmask =
+        read_interface_ipv4_netmask_with_control_socket(control_socket, interface_name).ok()?;
+    let source_mac_address =
+        read_interface_hardware_address_with_control_socket(control_socket, interface_name).ok()?;
+
+    Some(ArpScanInterfaceCandidate {
+        interface_name: interface_name.to_string(),
+        interface_index,
+        source_ipv4_address,
+        ipv4_netmask,
+        source_mac_address,
+    })
+}
+
+/// Enumerates local interfaces that are usable for ARP scanning.
+///
+/// # Errors
+///
+/// Returns [`AppError::InterfaceEnumerationFailed`] when `if_nameindex(3)` fails, or [`AppError::Io`]
+/// when opening the control socket fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn enumerate_usable_arp_scan_interface_candidates()
+-> Result<Vec<ArpScanInterfaceCandidate>, AppError> {
+    let name_index_pairs = linux_system_call::list_interface_name_and_index_pairs()
+        .map_err(|source| AppError::InterfaceEnumerationFailed { source })?;
+
+    let control_socket = linux_system_call::open_inet_datagram_socket().map_err(AppError::Io)?;
+
+    let mut candidates = Vec::new();
+    for (interface_name, interface_index) in name_index_pairs {
+        if let Some(candidate) = try_build_arp_scan_interface_candidate(
+            &control_socket,
+            &interface_name,
+            interface_index,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        left.interface_index
+            .cmp(&right.interface_index)
+            .then_with(|| left.interface_name.cmp(&right.interface_name))
+    });
+
+    Ok(candidates)
+}
+
+/// Resolves which interface name to use for scanning.
+///
+/// When `explicit_interface_name` is [`Some`], that name is validated the same way as a direct
+/// scan request. When it is [`None`], this function requires exactly one usable interface.
+///
+/// # Errors
+///
+/// Returns [`AppError`] for invalid names, interface rejection, discovery failures, or ambiguous
+/// automatic selection.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn resolve_scan_interface_name(
+    explicit_interface_name: Option<&str>,
+) -> Result<String, AppError> {
+    if let Some(interface_name) = explicit_interface_name {
+        interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
+        validated_interface_index_for_arp_scanning(interface_name)?;
+        discover_interface_scan_addresses(interface_name)?;
+        return Ok(interface_name.to_string());
+    }
+
+    let candidates = enumerate_usable_arp_scan_interface_candidates()?;
+    match candidates.len() {
+        0 => Err(AppError::AutomaticInterfaceSelectionNoneFound),
+        1 => Ok(candidates[0].interface_name.clone()),
+        _ => Err(AppError::AutomaticInterfaceSelectionAmbiguous {
+            interface_names: candidates
+                .into_iter()
+                .map(|candidate| candidate.interface_name)
+                .collect(),
+        }),
+    }
+}
+
+/// Reads [`InterfaceScanAddresses`] for `interface_name` using `ioctl(2)` on an `AF_INET` datagram
+/// control socket.
+///
+/// # Errors
+///
+/// Returns [`AppError`] when the interface name is invalid, when any `ioctl` fails, when the
+/// address family is unexpected, or when the hardware address is not Ethernet.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn discover_interface_scan_addresses(
+    interface_name: &str,
+) -> Result<InterfaceScanAddresses, AppError> {
+    interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
+    let control_socket = linux_system_call::open_inet_datagram_socket().map_err(AppError::Io)?;
+
+    let source_ipv4_address =
+        read_interface_ipv4_address_with_control_socket(&control_socket, interface_name)?;
+    let ipv4_netmask =
+        read_interface_ipv4_netmask_with_control_socket(&control_socket, interface_name)?;
+    let source_mac_address =
+        read_interface_hardware_address_with_control_socket(&control_socket, interface_name)?;
+
+    Ok(InterfaceScanAddresses {
+        source_ipv4_address,
+        ipv4_netmask,
+        source_mac_address,
+    })
+}
+
+/// Returns `true` when `flags` indicate an interface that is administratively up, not loopback, and
+/// does not have `NOARP` set.
+///
+/// This mirrors [`crate::linux_socket::validate_interface_flags_for_arp_scanning`] without
+/// allocating [`AppError`] strings.
+///
+/// # Panics
+///
+/// This function does not panic.
+#[must_use]
+fn interface_flags_allow_arp_scanning(flags: i32) -> bool {
+    (flags & INTERFACE_FLAG_LOOPBACK) == 0
+        && (flags & INTERFACE_FLAG_NO_ARP) == 0
+        && (flags & INTERFACE_FLAG_UP) != 0
+}
+
 #[cfg(test)]
 mod tests {
+    use super::enumerate_usable_arp_scan_interface_candidates;
+    use super::interface_flags_allow_arp_scanning;
     use super::read_hardware_address_from_sockaddr;
     use super::read_ipv4_from_sockaddr;
+    use super::resolve_scan_interface_name;
     use crate::error::AppError;
+    use crate::linux_packet::{INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP};
     use crate::mac_address::MacAddress;
     use std::mem::zeroed;
     use std::net::Ipv4Addr;
@@ -333,6 +483,130 @@ mod tests {
                 Err(AppError::InterfaceHardwareAddressUnsupported { .. })
             ),
             "AF_INET sockaddr should not be treated as Ethernet hardware, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn read_hardware_address_rejects_all_zero_mac_even_when_family_is_ethernet() {
+        // Arrange
+        let mut sockaddr: libc::sockaddr = unsafe { zeroed() };
+        sockaddr.sa_family = libc::ARPHRD_ETHER;
+
+        // Act
+        let outcome = read_hardware_address_from_sockaddr("eth0", &sockaddr);
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::InterfaceHardwareAddressUnsupported { .. })
+            ),
+            "all-zero MAC should be rejected, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn interface_flags_allow_arp_scanning_accepts_up_non_loopback_without_no_arp() {
+        // Arrange
+        let flags = INTERFACE_FLAG_UP;
+
+        // Act
+        let outcome = interface_flags_allow_arp_scanning(flags);
+
+        // Assert
+        assert!(
+            outcome,
+            "UP without loopback or NOARP should be acceptable, got: {outcome}"
+        );
+    }
+
+    #[test]
+    fn interface_flags_allow_arp_scanning_rejects_loopback() {
+        // Arrange
+        let flags = INTERFACE_FLAG_UP | INTERFACE_FLAG_LOOPBACK;
+
+        // Act
+        let outcome = interface_flags_allow_arp_scanning(flags);
+
+        // Assert
+        assert!(
+            !outcome,
+            "loopback flag should disqualify the interface, got: {outcome}"
+        );
+    }
+
+    #[test]
+    fn interface_flags_allow_arp_scanning_rejects_no_arp() {
+        // Arrange
+        let flags = INTERFACE_FLAG_UP | INTERFACE_FLAG_NO_ARP;
+
+        // Act
+        let outcome = interface_flags_allow_arp_scanning(flags);
+
+        // Assert
+        assert!(
+            !outcome,
+            "NOARP should disqualify the interface, got: {outcome}"
+        );
+    }
+
+    #[test]
+    fn interface_flags_allow_arp_scanning_rejects_not_up() {
+        // Arrange
+        let flags = 0;
+
+        // Act
+        let outcome = interface_flags_allow_arp_scanning(flags);
+
+        // Assert
+        assert!(
+            !outcome,
+            "interfaces that are not UP should be rejected, got: {outcome}"
+        );
+    }
+
+    #[test]
+    fn enumerate_usable_arp_scan_interface_candidates_succeeds_on_linux() {
+        // Act
+        let outcome = enumerate_usable_arp_scan_interface_candidates();
+
+        // Assert
+        let candidates = outcome.expect("enumeration should succeed on Linux test hosts");
+        for candidate in &candidates {
+            assert!(
+                !candidate.interface_name.is_empty(),
+                "every candidate should carry a non-empty interface name, got: {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_scan_interface_name_rejects_empty_explicit_name() {
+        // Arrange
+        let explicit_name = Some("");
+
+        // Act
+        let outcome = resolve_scan_interface_name(explicit_name);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InvalidInterfaceName { .. })),
+            "empty explicit name should fail validation before syscalls, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_scan_interface_name_returns_lookup_failure_for_unknown_interface() {
+        // Arrange
+        let explicit_name = Some("narp_none____");
+
+        // Act
+        let outcome = resolve_scan_interface_name(explicit_name);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InterfaceLookupFailed { .. })),
+            "unknown interface should fail lookup after name validation, got: {outcome:?}"
         );
     }
 }

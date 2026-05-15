@@ -48,6 +48,41 @@ pub fn validate_interface_name_for_linux_packet_socket(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+/// Copies `interface_name` into [`libc::ifreq::ifr_name`] for `ioctl(2)` requests.
+///
+/// Callers must invoke [`validate_interface_name_for_linux_packet_socket`] first when the name
+/// comes from untrusted input.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidInterfaceName`] when the name is too long for `IFNAMSIZ`.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub(crate) fn copy_interface_name_to_ifreq(
+    interface_name: &str,
+    request: &mut libc::ifreq,
+) -> Result<(), AppError> {
+    let bytes = interface_name.as_bytes();
+    if bytes.len() >= INTERFACE_NAME_BUFFER_SIZE {
+        return Err(AppError::InvalidInterfaceName {
+            message: format!(
+                "interface name must be shorter than {INTERFACE_NAME_BUFFER_SIZE} bytes"
+            ),
+        });
+    }
+
+    for (index, byte) in bytes.iter().enumerate() {
+        // `libc` may expose `ifr_name` as either `c_char` (`i8`) or `u8` depending on the target
+        // and crate version; `as _` assigns the correct representation in both cases.
+        request.ifr_name[index] = *byte as _;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::INTERFACE_NAME_MAXIMUM_BYTES;
@@ -141,6 +176,48 @@ mod tests {
         assert!(
             matches!(outcome, Ok(())),
             "IFNAMSIZ-1 byte names are valid on Linux, got: {outcome:?}"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod copy_interface_name_to_ifreq_linux_tests {
+    use super::INTERFACE_NAME_BUFFER_SIZE;
+    use super::copy_interface_name_to_ifreq;
+    use crate::error::AppError;
+    use std::mem::zeroed;
+
+    #[test]
+    fn returns_error_when_byte_length_reaches_ifreq_name_buffer_size() {
+        // Arrange
+        let mut request: libc::ifreq = unsafe { zeroed() };
+        let interface_name = "a".repeat(INTERFACE_NAME_BUFFER_SIZE);
+
+        // Act
+        let outcome = copy_interface_name_to_ifreq(&interface_name, &mut request);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InvalidInterfaceName { .. })),
+            "names that cannot fit with a trailing NUL in ifr_name should be rejected, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn copies_short_name_into_leading_bytes_of_ifr_name() {
+        // Arrange
+        let mut request: libc::ifreq = unsafe { zeroed() };
+
+        // Act
+        copy_interface_name_to_ifreq("ab", &mut request)
+            .expect("two-byte name should copy into ifreq");
+
+        // Assert
+        assert_eq!(request.ifr_name[0], b'a' as libc::c_char);
+        assert_eq!(request.ifr_name[1], b'b' as libc::c_char);
+        assert_eq!(
+            request.ifr_name[2], 0,
+            "copy should not write past the final interface name byte; remainder stays zero-filled"
         );
     }
 }

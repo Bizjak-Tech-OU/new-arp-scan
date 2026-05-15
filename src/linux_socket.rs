@@ -75,33 +75,10 @@ fn interface_index_from_name(interface_name: &str) -> Result<libc::c_uint, AppEr
     })
 }
 
-fn copy_interface_name_to_ifreq(
-    interface_name: &str,
-    request: &mut libc::ifreq,
-) -> Result<(), AppError> {
-    let bytes = interface_name.as_bytes();
-    if bytes.len() >= interface_validation::INTERFACE_NAME_BUFFER_SIZE {
-        return Err(AppError::InvalidInterfaceName {
-            message: format!(
-                "interface name must be shorter than {} bytes",
-                interface_validation::INTERFACE_NAME_BUFFER_SIZE
-            ),
-        });
-    }
-
-    for (index, byte) in bytes.iter().enumerate() {
-        // `libc` may expose `ifr_name` as either `c_char` (`i8`) or `u8` depending on the target
-        // and crate version; `as _` assigns the correct representation in both cases.
-        request.ifr_name[index] = *byte as _;
-    }
-
-    Ok(())
-}
-
 fn read_interface_flags(interface_name: &str) -> Result<i32, AppError> {
     let control_socket = linux_system_call::open_inet_datagram_socket().map_err(AppError::Io)?;
     let mut request: libc::ifreq = unsafe { zeroed() };
-    copy_interface_name_to_ifreq(interface_name, &mut request)?;
+    interface_validation::copy_interface_name_to_ifreq(interface_name, &mut request)?;
 
     linux_system_call::ioctl_ifreq(
         &control_socket,
@@ -117,7 +94,7 @@ fn read_interface_flags(interface_name: &str) -> Result<i32, AppError> {
     Ok(flags)
 }
 
-fn validate_interface_flags_for_arp_scanning(
+pub(crate) fn validate_interface_flags_for_arp_scanning(
     interface_name: &str,
     flags: i32,
 ) -> Result<(), AppError> {

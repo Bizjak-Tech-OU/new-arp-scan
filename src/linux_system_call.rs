@@ -103,6 +103,67 @@ pub fn interface_index_from_name(interface_name: &std::ffi::CStr) -> std::io::Re
     Ok(index)
 }
 
+struct IfNameIndexArrayGuard(*mut libc::if_nameindex);
+
+impl Drop for IfNameIndexArrayGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was returned by `if_nameindex(3)` and must be released with
+            // `if_freenameindex(3)`.
+            unsafe {
+                libc::if_freenameindex(self.0);
+            }
+        }
+    }
+}
+
+/// Returns interface names and indexes from `if_nameindex(3)`.
+///
+/// Entries are sorted by interface index ascending. Names that are not valid UTF-8 are skipped.
+///
+/// # Errors
+///
+/// Returns the last operating system error when `if_nameindex(3)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn list_interface_name_and_index_pairs() -> std::io::Result<Vec<(String, libc::c_uint)>> {
+    // SAFETY: `if_nameindex(3)` returns either `NULL` or a pointer to a `NULL`-terminated array
+    // of `struct if_nameindex` (see `if_nameindex(3)`).
+    let head = unsafe { libc::if_nameindex() };
+    if head.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let _guard = IfNameIndexArrayGuard(head);
+    let mut pairs = Vec::new();
+    let mut offset = 0usize;
+
+    loop {
+        // SAFETY: `head` points at a valid array until the terminator entry is observed.
+        let entry = unsafe { *head.add(offset) };
+        if entry.if_index == 0 && entry.if_name.is_null() {
+            break;
+        }
+
+        // SAFETY: active entries have a non-null `if_name` per `if_nameindex(3)`.
+        let name_pointer = entry.if_name;
+        if !name_pointer.is_null() {
+            // SAFETY: `name_pointer` references a NUL-terminated interface name string.
+            let name_slice = unsafe { std::ffi::CStr::from_ptr(name_pointer) };
+            if let Ok(name) = name_slice.to_str() {
+                pairs.push((name.to_string(), entry.if_index));
+            }
+        }
+
+        offset = offset.saturating_add(1);
+    }
+
+    pairs.sort_by_key(|pair| pair.1);
+    Ok(pairs)
+}
+
 /// Opens a raw `AF_PACKET` / `SOCK_RAW` socket for the given Ethernet protocol (for example
 /// [`crate::linux_packet::ETHERNET_PROTOCOL_ARP`] in host byte order; the kernel expects
 /// `protocol` in network byte order per `packet(7)`).
@@ -326,6 +387,20 @@ mod tests {
             outcome.expect("index resolution should succeed"),
             0,
             "loopback index should be non-zero"
+        );
+    }
+
+    #[test]
+    fn list_interface_name_and_index_pairs_includes_loopback_on_linux() {
+        // Arrange
+        // Act
+        let outcome = super::list_interface_name_and_index_pairs();
+
+        // Assert
+        let pairs = outcome.expect("if_nameindex should succeed on Linux");
+        assert!(
+            pairs.iter().any(|(name, _)| name == "lo"),
+            "expected loopback interface in if_nameindex results, got: {pairs:?}"
         );
     }
 
