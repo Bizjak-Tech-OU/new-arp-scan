@@ -9,7 +9,7 @@ pub mod mac_address;
 #[cfg(target_os = "linux")]
 mod ethernet_frame;
 mod interface_validation;
-#[cfg(target_os = "linux")]
+mod ipv4_cidr;
 mod ipv4_subnet;
 
 #[cfg(target_os = "linux")]
@@ -30,6 +30,8 @@ pub use application_outcome::ApplicationOutcome;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
 pub use error::AppError;
+pub use ipv4_cidr::Ipv4Cidr;
+pub use ipv4_cidr::Ipv4HostAddressIterator;
 pub use mac_address::{MacAddress, MacAddressParseError};
 
 /// Runs the application logic for a parsed [`ApplicationCommand`].
