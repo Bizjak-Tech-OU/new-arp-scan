@@ -101,6 +101,13 @@ pub enum AppError {
         /// Human-readable explanation for operators.
         message: String,
     },
+    /// The IPv4 classless inter-domain routing string could not be parsed.
+    Ipv4CidrStringInvalid {
+        /// Original input supplied by the caller (trimmed of leading and trailing ASCII whitespace only).
+        source: String,
+        /// Human-readable explanation for operators.
+        message: String,
+    },
     /// Waiting for packet socket readiness with `poll(2)` failed.
     PollWaitFailed {
         /// Underlying operating system error (typically `errno`).
@@ -242,6 +249,10 @@ fn write_late_app_error_variants(
                 "IPv4 subnet is not supported for scanning: {message}"
             )
         }
+        AppError::Ipv4CidrStringInvalid { source, message } => write!(
+            formatter,
+            "invalid IPv4 classless inter-domain routing notation `{source}`: {message}"
+        ),
         AppError::PollWaitFailed { source } => {
             write!(
                 formatter,
@@ -726,6 +737,42 @@ mod tests {
         assert!(
             displayed.contains("no usable hosts"),
             "display should include message, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_source_and_message_for_ipv4_cidr_string_invalid() {
+        // Arrange
+        let application_error = AppError::Ipv4CidrStringInvalid {
+            source: "10/8".to_string(),
+            message: "fixture message".to_string(),
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("10/8") && displayed.contains("fixture message"),
+            "display should include source and message, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_none_for_ipv4_cidr_string_invalid() {
+        // Arrange
+        let application_error = AppError::Ipv4CidrStringInvalid {
+            source: "bad".to_string(),
+            message: "bad format".to_string(),
+        };
+
+        // Act
+        let source = application_error.source();
+
+        // Assert
+        assert!(
+            source.is_none(),
+            "CIDR parse errors should not chain a source error"
         );
     }
 

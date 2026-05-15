@@ -65,3 +65,19 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 **Reason:** `if_nameindex(3)` is the documented portable way to list `(if_index, name)` pairs without rtnetlink complexity; `netdevice(7)` continues to document the ioctl surface already used for per-interface discovery. Sharing `ifreq` name population avoids duplicated length checks across modules.
 
 **Consequences:** Listing and automatic interface selection share the same filtering rules as explicit scans; `libc` remains the only foreign-function-interface dependency for these calls.
+
+## 2026-05-15 — Ungate pure IPv4 helpers for cross-platform unit tests
+
+**Decision:** Compile [`src/ipv4_subnet.rs`](src/ipv4_subnet.rs) and [`src/ipv4_cidr.rs`](src/ipv4_cidr.rs) on every target; keep Linux-only modules (`linux_scanner`, raw sockets, and so on) behind `#[cfg(target_os = "linux")]`.
+
+**Reason:** Subnet and classless inter-domain routing parsing are pure standard-library logic with no `libc` dependency; building them on non-Linux hosts lets `cargo test` validate traversal and parse edge cases in continuous integration without packet sockets.
+
+**Consequences:** Public re-exports [`Ipv4Cidr`](src/ipv4_cidr.rs) and [`Ipv4HostAddressIterator`](src/ipv4_cidr.rs) document iterator-based expansion for library callers; the live scan path uses the same iterator as the tests.
+
+## 2026-05-15 — Clippy: `cast_possible_truncation` after bounded CIDR prefix parse
+
+**Decision:** Allow `clippy::cast_possible_truncation` when converting the parsed decimal `u32` prefix to `u8` immediately after rejecting values greater than `32`.
+
+**Reason:** The guard makes truncation impossible; a `u8::try_from` error branch was logically unreachable and obscured the real control flow.
+
+**Consequences:** If the accepted prefix range ever widens beyond what fits in `u8`, this site must be revisited together with the parser.

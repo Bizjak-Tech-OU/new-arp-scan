@@ -11,9 +11,8 @@ use crate::address_resolution_protocol::{
 };
 use crate::application_outcome::{DiscoveredHost, ScanOutcome};
 use crate::error::AppError;
-use crate::ipv4_subnet::{
-    inclusive_host_address_range_excluding_edges, ipv4_address_is_strictly_inside_subnet,
-};
+use crate::ipv4_cidr::Ipv4HostAddressIterator;
+use crate::ipv4_subnet::ipv4_address_is_strictly_inside_subnet;
 use crate::linux_interface_discovery::discover_interface_scan_addresses;
 use crate::linux_packet::{
     ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, SOCKET_ADDRESS_FAMILY_PACKET,
@@ -41,7 +40,7 @@ const RECEIVE_WINDOW_AFTER_LAST_REQUEST: Duration = Duration::from_secs(3);
 pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
     let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
     let addresses = discover_interface_scan_addresses(interface_name)?;
-    let (first_host_bits, last_host_bits) = inclusive_host_address_range_excluding_edges(
+    let host_address_iterator = Ipv4HostAddressIterator::try_from_ipv4_address_on_subnet(
         addresses.source_ipv4_address,
         addresses.ipv4_netmask,
     )?;
@@ -70,8 +69,7 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
 
     let mut warnings = Vec::new();
 
-    for host_bits in first_host_bits..=last_host_bits {
-        let target_ipv4_address = Ipv4Addr::from_bits(host_bits);
+    for target_ipv4_address in host_address_iterator {
         send_one_address_resolution_request(
             &packet_socket,
             &link_layer_destination,
