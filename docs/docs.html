@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full antialiased">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Documentation — new-arp-scan</title>
+    <meta name="description" content="Usage, requirements, and behaviour of the new-arp-scan ARP discovery tool." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@8..144,400;8..144,500;8..144,600;8..144,700&family=Google+Sans+Code:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: [
+                '"Google Sans Flex"',
+                "ui-sans-serif",
+                "system-ui",
+                "Segoe UI",
+                "Roboto",
+                "Helvetica Neue",
+                "Arial",
+                "sans-serif",
+              ],
+              mono: [
+                '"Google Sans Code"',
+                "ui-monospace",
+                "SFMono-Regular",
+                "Menlo",
+                "Monaco",
+                "Consolas",
+                "monospace",
+              ],
+            },
+          },
+        },
+      };
+    </script>
+    <script src="./theme.js"></script>
+  </head>
+  <body
+    class="h-full bg-zinc-50 font-sans text-zinc-900 transition-colors duration-200 dark:bg-zinc-950 dark:text-zinc-100"
+  >
+    <div class="flex min-h-full flex-col">
+      <header
+        class="border-b border-zinc-200 bg-zinc-50/80 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/80"
+      >
+        <div class="mx-auto flex max-w-3xl items-center justify-between gap-4 px-5 py-4 sm:px-6">
+          <a href="./index.html" class="font-mono text-sm font-medium tracking-tight text-zinc-900 dark:text-zinc-100">
+            new-arp-scan
+          </a>
+          <nav class="flex items-center gap-5 text-sm">
+            <a
+              href="./docs.html"
+              class="font-medium text-zinc-900 dark:text-zinc-100"
+              aria-current="page"
+              >Docs</a
+            >
+            <a
+              href="https://github.com/Bizjak-Tech-OU/new-arp-scan"
+              class="text-zinc-600 underline-offset-4 hover:text-zinc-900 hover:underline dark:text-zinc-400 dark:hover:text-zinc-100"
+              rel="noopener noreferrer"
+              target="_blank"
+              >GitHub</a
+            >
+            <button
+              type="button"
+              onclick="toggleNewArpScanTheme()"
+              class="rounded border border-zinc-300 px-2 py-1 font-mono text-xs text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              aria-label="Toggle light and dark theme"
+            >
+              <span class="dark:hidden">Dark</span>
+              <span class="hidden dark:inline">Light</span>
+            </button>
+          </nav>
+        </div>
+      </header>
+
+      <main class="mx-auto w-full max-w-3xl flex-1 px-5 py-12 sm:px-6 sm:py-16">
+        <h1 class="font-mono text-2xl font-semibold tracking-tight sm:text-3xl">Documentation</h1>
+        <p class="mt-2 text-zinc-600 dark:text-zinc-400">
+          Reference for the <span class="font-mono text-zinc-800 dark:text-zinc-200">new-arp-scan</span> CLI and
+          library behaviour (from the project README and repository).
+        </p>
+
+        <nav class="mt-10 border-y border-zinc-200 py-6 dark:border-zinc-800">
+          <p class="font-mono text-xs uppercase tracking-widest text-zinc-500">On this page</p>
+          <ul class="mt-3 flex flex-col gap-2 text-sm text-zinc-600 dark:text-zinc-400">
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#overview">Overview</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#platform">Platform support</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#permissions">Permissions</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#commands">Commands</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#scan-behaviour">Scan behaviour</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#output">Output</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#requirements">Requirements &amp; development</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#license">License</a></li>
+          </ul>
+        </nav>
+
+        <section id="overview" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Overview</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            <span class="font-mono text-zinc-800 dark:text-zinc-200">new-arp-scan</span> is an ARP scanning tool
+            written in Rust. On Linux, the <span class="font-mono">scan</span> command performs address resolution
+            protocol discovery across the selected interface’s IPv4 subnet using raw
+            <span class="font-mono">AF_PACKET</span> / <span class="font-mono">SOCK_RAW</span> sockets.
+          </p>
+        </section>
+
+        <section id="platform" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Platform support</h2>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>
+              <strong class="font-medium text-zinc-800 dark:text-zinc-200">Linux</strong> — full support for
+              <span class="font-mono">interfaces</span> and <span class="font-mono">scan</span>.
+            </li>
+            <li>
+              <strong class="font-medium text-zinc-800 dark:text-zinc-200">Non-Linux</strong> —
+              <span class="font-mono">scan</span> and <span class="font-mono">interfaces</span> return an
+              unsupported-platform error without calling Linux-only APIs.
+            </li>
+          </ul>
+        </section>
+
+        <section id="permissions" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Permissions</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            Creating the raw packet socket requires Linux capability
+            <code class="font-mono text-sm text-zinc-800 dark:text-zinc-200">CAP_NET_RAW</code> (often available to
+            the superuser). If opening the socket fails with permission denied, the tool surfaces an explicit
+            <span class="font-mono">CAP_NET_RAW</span> hint. See Linux
+            <span class="font-mono">packet(7)</span> and <span class="font-mono">capabilities(7)</span>.
+          </p>
+        </section>
+
+        <section id="commands" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Commands</h2>
+          <pre
+            class="mt-4 overflow-x-auto rounded border border-zinc-200 bg-white p-4 font-mono text-sm leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200"
+          ><code>new-arp-scan interfaces
+new-arp-scan scan [--interface &lt;NAME&gt;]</code></pre>
+          <p class="mt-3 text-sm text-zinc-500 dark:text-zinc-500">
+            Built-in help: <span class="font-mono">new-arp-scan --help</span>,
+            <span class="font-mono">new-arp-scan interfaces --help</span>,
+            <span class="font-mono">new-arp-scan scan --help</span>.
+          </p>
+
+          <h3 class="mt-8 font-mono text-sm font-semibold uppercase tracking-wide text-zinc-500">interfaces</h3>
+          <p class="mt-2 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            On Linux, lists interfaces usable for ARP scanning: Ethernet hardware type, administratively up, not
+            loopback, not <span class="font-mono">NOARP</span>, with an IPv4 address, netmask, and a non-zero hardware
+            address. Output is a plain aligned table. If none qualify, the tool prints
+            <span class="font-mono text-zinc-800 dark:text-zinc-200">no usable interfaces found</span> and exits
+            successfully.
+          </p>
+
+          <h3 class="mt-8 font-mono text-sm font-semibold uppercase tracking-wide text-zinc-500">scan</h3>
+          <p class="mt-2 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            On Linux, reads the interface IPv4 address, netmask, and Ethernet hardware address via
+            <span class="font-mono">ioctl</span>, opens a raw packet socket bound to ARP
+            (<span class="font-mono">ETH_P_ARP</span>), sends one broadcast ARP request per target address in the
+            subnet (excluding network and broadcast, but always including the interface’s own IPv4 when it falls
+            outside that open range), then collects replies for three seconds.
+          </p>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            If <span class="font-mono">scan</span> is run without <span class="font-mono">--interface</span> /
+            <span class="font-mono">--iface</span>, the tool selects an interface automatically
+            <strong class="font-medium text-zinc-800 dark:text-zinc-200">only</strong> when exactly one usable
+            interface exists; otherwise it exits with an error describing the ambiguity or that no usable interface was
+            found.
+          </p>
+        </section>
+
+        <section id="scan-behaviour" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Verification</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            To verify frames on the wire, run <span class="font-mono">tcpdump</span> or Wireshark on the same interface
+            (for example <span class="font-mono">tcpdump -ni eth0 arp</span>) while scanning. This is optional manual
+            validation and is not part of automated tests.
+          </p>
+        </section>
+
+        <section id="output" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Output</h2>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>
+              Discovered hosts: <span class="font-mono text-zinc-800 dark:text-zinc-200">&lt;IPv4&gt; &lt;MAC&gt;</span>
+              on standard output. MAC addresses are colon-separated lowercase hex.
+            </li>
+            <li>
+              Non-fatal issues (e.g. failed send, malformed frame):
+              <span class="font-mono text-zinc-800 dark:text-zinc-200">warning: ...</span> on standard error.
+            </li>
+            <li>
+              No responses: prints <span class="font-mono text-zinc-800 dark:text-zinc-200">no hosts found</span> and
+              exits successfully.
+            </li>
+          </ul>
+        </section>
+
+        <section id="requirements" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Requirements</h2>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>Rust toolchain with Cargo (<span class="font-mono">rustc</span>, <span class="font-mono">cargo fmt</span>, <span class="font-mono">cargo clippy</span>)</li>
+            <li>GNU Make (optional; recommended for Makefile targets)</li>
+          </ul>
+
+          <h3 class="mt-8 font-mono text-sm font-semibold uppercase tracking-wide text-zinc-500">Local development</h3>
+          <div class="mt-4 overflow-x-auto rounded border border-zinc-200 dark:border-zinc-800">
+            <table class="w-full min-w-[28rem] border-collapse text-left text-sm">
+              <thead>
+                <tr class="border-b border-zinc-200 bg-zinc-100 font-mono dark:border-zinc-800 dark:bg-zinc-900">
+                  <th class="px-4 py-3 font-medium text-zinc-800 dark:text-zinc-200">Command</th>
+                  <th class="px-4 py-3 font-medium text-zinc-800 dark:text-zinc-200">Description</th>
+                </tr>
+              </thead>
+              <tbody class="text-zinc-600 dark:text-zinc-400">
+                <tr class="border-b border-zinc-200 dark:border-zinc-800">
+                  <td class="px-4 py-3 font-mono text-zinc-800 dark:text-zinc-200">make build</td>
+                  <td class="px-4 py-3"><span class="font-mono">cargo clean</span> then <span class="font-mono">cargo build</span></td>
+                </tr>
+                <tr class="border-b border-zinc-200 dark:border-zinc-800">
+                  <td class="px-4 py-3 font-mono text-zinc-800 dark:text-zinc-200">make test</td>
+                  <td class="px-4 py-3"><span class="font-mono">cargo test</span> then <span class="font-mono">cargo test --tests</span></td>
+                </tr>
+                <tr class="border-b border-zinc-200 dark:border-zinc-800">
+                  <td class="px-4 py-3 font-mono text-zinc-800 dark:text-zinc-200">make lint</td>
+                  <td class="px-4 py-3">
+                    <span class="font-mono">cargo fmt --all</span> then
+                    <span class="font-mono">cargo clippy --all-targets -- -D warnings</span>
+                  </td>
+                </tr>
+                <tr class="border-b border-zinc-200 dark:border-zinc-800">
+                  <td class="px-4 py-3 font-mono text-zinc-800 dark:text-zinc-200">make coverage</td>
+                  <td class="px-4 py-3">
+                    <span class="font-mono">cargo llvm-cov --all-targets --summary-only</span> (install
+                    <span class="font-mono">cargo-llvm-cov</span>; may need
+                    <span class="font-mono">rustup component add llvm-tools-preview</span>)
+                  </td>
+                </tr>
+                <tr>
+                  <td class="px-4 py-3 font-mono text-zinc-800 dark:text-zinc-200">make clean</td>
+                  <td class="px-4 py-3"><span class="font-mono">cargo clean</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="mt-3 text-sm text-zinc-500 dark:text-zinc-500">
+            Run the same commands manually if you prefer not to use Make. Contributing guidelines:
+            <a
+              href="https://github.com/Bizjak-Tech-OU/new-arp-scan/blob/master/CONTRIBUTING.md"
+              class="underline underline-offset-2"
+              rel="noopener noreferrer"
+              target="_blank"
+              >CONTRIBUTING.md</a
+            >. Extra notes may live under
+            <a
+              href="https://github.com/Bizjak-Tech-OU/new-arp-scan/tree/master/docs"
+              class="underline underline-offset-2"
+              rel="noopener noreferrer"
+              target="_blank"
+              >docs/</a
+            >
+            in the repository.
+          </p>
+        </section>
+
+        <section id="license" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">License</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            Copyright © Bizjak Tech OÜ. Licensed under the
+            <a
+              href="https://github.com/Bizjak-Tech-OU/new-arp-scan/blob/master/LICENSE"
+              class="underline underline-offset-2"
+              rel="noopener noreferrer"
+              target="_blank"
+              >GNU Affero General Public License v3.0</a
+            >
+            only.
+          </p>
+        </section>
+
+        <p class="mt-16 text-sm text-zinc-500 dark:text-zinc-500">
+          <a href="./index.html" class="underline underline-offset-2 hover:text-zinc-800 dark:hover:text-zinc-200">← Back to home</a>
+        </p>
+      </main>
+
+      <footer class="border-t border-zinc-200 py-8 dark:border-zinc-800">
+        <div class="mx-auto max-w-3xl px-5 text-center font-mono text-xs text-zinc-500 sm:px-6">
+          GNU AGPL v3.0 · <span class="whitespace-nowrap">© Bizjak Tech OÜ</span>
+        </div>
+      </footer>
+    </div>
+  </body>
+</html>
