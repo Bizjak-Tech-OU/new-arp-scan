@@ -111,6 +111,18 @@ pub enum AppError {
         /// Underlying operating system error (typically `errno`).
         source: std::io::Error,
     },
+    /// Enumerating local interfaces with `if_nameindex(3)` failed.
+    InterfaceEnumerationFailed {
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
+    /// Automatic interface selection found no usable interface.
+    AutomaticInterfaceSelectionNoneFound,
+    /// Automatic interface selection found more than one usable interface.
+    AutomaticInterfaceSelectionAmbiguous {
+        /// Names of interfaces that were all considered usable.
+        interface_names: Vec<String>,
+    },
 }
 
 fn try_write_early_app_error_variants(
@@ -157,6 +169,19 @@ fn try_write_early_app_error_variants(
         AppError::SocketBindFailed { source } => {
             write!(formatter, "failed to bind raw packet socket: {source}")
         }
+        AppError::InterfaceEnumerationFailed { source } => write!(
+            formatter,
+            "failed to enumerate network interfaces: {source}"
+        ),
+        AppError::AutomaticInterfaceSelectionNoneFound => write!(
+            formatter,
+            "no usable network interface was found for automatic selection; specify one explicitly with --interface <NAME>"
+        ),
+        AppError::AutomaticInterfaceSelectionAmbiguous { interface_names } => write!(
+            formatter,
+            "multiple usable network interfaces were found for automatic selection: {}; specify one explicitly with --interface <NAME>",
+            interface_names.join(", ")
+        ),
         _ => return None,
     })
 }
@@ -255,7 +280,8 @@ impl std::error::Error for AppError {
             | AppError::InterfaceIpv4NetmaskQueryFailed { source, .. }
             | AppError::InterfaceHardwareAddressQueryFailed { source, .. }
             | AppError::PollWaitFailed { source }
-            | AppError::RawPacketReceiveFailed { source } => Some(source),
+            | AppError::RawPacketReceiveFailed { source }
+            | AppError::InterfaceEnumerationFailed { source } => Some(source),
             _ => None,
         }
     }
@@ -864,6 +890,104 @@ mod tests {
         assert!(
             displayed.contains("receive") && displayed.contains("Ethernet"),
             "display should describe receive failure, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_includes_context_for_interface_enumeration_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(12);
+        let application_error = AppError::InterfaceEnumerationFailed { source: inner };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("enumerate") && displayed.contains("interface"),
+            "display should describe enumeration failure, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_interface_enumeration_failed() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(12);
+        let application_error = AppError::InterfaceEnumerationFailed { source: inner };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("enumeration failure should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
+    fn display_mentions_explicit_interface_flag_for_automatic_selection_none_found() {
+        // Arrange
+        let application_error = AppError::AutomaticInterfaceSelectionNoneFound;
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("--interface"),
+            "display should tell the operator how to proceed, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_lists_interface_names_for_automatic_selection_ambiguous() {
+        // Arrange
+        let application_error = AppError::AutomaticInterfaceSelectionAmbiguous {
+            interface_names: vec!["eth0".to_string(), "wlan0".to_string()],
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("eth0") && displayed.contains("wlan0"),
+            "display should list ambiguous interface names, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_none_for_automatic_interface_selection_none_found() {
+        // Arrange
+        let application_error = AppError::AutomaticInterfaceSelectionNoneFound;
+
+        // Act
+        let source = application_error.source();
+
+        // Assert
+        assert!(
+            source.is_none(),
+            "automatic selection errors should not chain a source error"
+        );
+    }
+
+    #[test]
+    fn source_returns_none_for_automatic_interface_selection_ambiguous() {
+        // Arrange
+        let application_error = AppError::AutomaticInterfaceSelectionAmbiguous {
+            interface_names: vec!["eth0".to_string(), "wlan0".to_string()],
+        };
+
+        // Act
+        let source = application_error.source();
+
+        // Assert
+        assert!(
+            source.is_none(),
+            "ambiguous automatic selection should not chain a source error"
         );
     }
 }

@@ -27,13 +27,21 @@ mod linux_system_call;
 
 pub use application_command::ApplicationCommand;
 pub use application_outcome::ApplicationOutcome;
+pub use application_outcome::UsableInterfaceListingRow;
+pub use application_outcome::UsableInterfacesListOutcome;
 pub use error::AppError;
 pub use mac_address::{MacAddress, MacAddressParseError};
 
 /// Runs the application logic for a parsed [`ApplicationCommand`].
 ///
-/// On Linux, [`ApplicationCommand::Scan`] performs address resolution scanning on the selected
-/// interface and returns discovered hosts. On other operating systems, scanning is not supported.
+/// On Linux, [`ApplicationCommand::Scan`] performs address resolution scanning on the resolved
+/// interface and returns discovered hosts. When the scan command omits an interface name, the
+/// library selects an interface automatically only when exactly one usable interface exists.
+///
+/// On Linux, [`ApplicationCommand::UsableInterfacesList`] returns interfaces that pass the same
+/// usability rules as automatic scan selection.
+///
+/// On other operating systems, Linux-only commands return [`AppError::UnsupportedPlatform`].
 ///
 /// # Errors
 ///
@@ -46,7 +54,7 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 /// use new_arp_scan::{run, ApplicationCommand, AppError, ApplicationOutcome};
 ///
 /// let outcome = run(ApplicationCommand::Scan {
-///     interface_name: "eth0".to_string(),
+///     interface_name: Some("eth0".to_string()),
 /// });
 ///
 /// # #[cfg(not(target_os = "linux"))]
@@ -62,12 +70,48 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> {
     match command {
         ApplicationCommand::Scan { interface_name } => {
-            interface_validation::validate_interface_name_for_linux_packet_socket(&interface_name)?;
+            if let Some(interface_name) = interface_name.as_deref() {
+                interface_validation::validate_interface_name_for_linux_packet_socket(
+                    interface_name,
+                )?;
+            }
 
             #[cfg(target_os = "linux")]
             {
-                let scan_outcome = linux_scanner::perform_arp_scan(&interface_name)?;
+                let resolved_interface_name =
+                    linux_interface_discovery::resolve_scan_interface_name(
+                        interface_name.as_deref(),
+                    )?;
+                let scan_outcome = linux_scanner::perform_arp_scan(&resolved_interface_name)?;
                 Ok(ApplicationOutcome::Scan(scan_outcome))
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(AppError::UnsupportedPlatform {
+                    operating_system: std::env::consts::OS.to_string(),
+                })
+            }
+        }
+        ApplicationCommand::UsableInterfacesList => {
+            #[cfg(target_os = "linux")]
+            {
+                let candidates =
+                    linux_interface_discovery::enumerate_usable_arp_scan_interface_candidates()?;
+                let entries = candidates
+                    .into_iter()
+                    .map(|candidate| application_outcome::UsableInterfaceListingRow {
+                        interface_name: candidate.interface_name,
+                        interface_index: candidate.interface_index,
+                        ipv4_address: candidate.source_ipv4_address,
+                        ipv4_netmask: candidate.ipv4_netmask,
+                        media_access_control_address: candidate.source_mac_address,
+                    })
+                    .collect();
+
+                Ok(ApplicationOutcome::UsableInterfacesList(
+                    application_outcome::UsableInterfacesListOutcome { entries },
+                ))
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -91,7 +135,7 @@ mod tests {
     fn returns_invalid_interface_name_when_interface_name_is_empty_on_non_linux() {
         // Arrange
         let command = ApplicationCommand::Scan {
-            interface_name: String::new(),
+            interface_name: Some(String::new()),
         };
 
         // Act
@@ -109,7 +153,7 @@ mod tests {
     fn returns_unsupported_platform_when_scanning_on_non_linux() {
         // Arrange
         let command = ApplicationCommand::Scan {
-            interface_name: "eth0".to_string(),
+            interface_name: Some("eth0".to_string()),
         };
 
         // Act
@@ -122,12 +166,46 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn returns_unsupported_platform_when_listing_interfaces_on_non_linux() {
+        // Arrange
+        let command = ApplicationCommand::UsableInterfacesList;
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
+            "non-linux hosts should report unsupported platform, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn returns_unsupported_platform_when_scanning_without_interface_name_on_non_linux() {
+        // Arrange
+        let command = ApplicationCommand::Scan {
+            interface_name: None,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
+            "automatic selection should still hit unsupported platform off Linux, got: {outcome:?}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn returns_rejection_when_scanning_loopback_interface_on_linux() {
         // Arrange
         let command = ApplicationCommand::Scan {
-            interface_name: "lo".to_string(),
+            interface_name: Some("lo".to_string()),
         };
 
         // Act
@@ -164,6 +242,65 @@ mod tests {
             outcome,
             ApplicationOutcome::Scan(scan),
             "scan outcome should round-trip for equality"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_scan_without_interface_name_follows_usable_candidate_count() {
+        // Arrange
+        use crate::linux_interface_discovery::enumerate_usable_arp_scan_interface_candidates;
+
+        let candidate_count = enumerate_usable_arp_scan_interface_candidates()
+            .expect("enumeration should succeed on Linux test hosts")
+            .len();
+
+        let command = ApplicationCommand::Scan {
+            interface_name: None,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        match candidate_count {
+            0 => assert!(
+                matches!(outcome, Err(AppError::AutomaticInterfaceSelectionNoneFound)),
+                "zero usable interfaces should make automatic selection fail deterministically, got: {outcome:?}"
+            ),
+            1 => assert!(
+                !matches!(
+                    &outcome,
+                    Err(AppError::AutomaticInterfaceSelectionNoneFound
+                        | AppError::AutomaticInterfaceSelectionAmbiguous { .. })
+                ),
+                "exactly one usable interface must pass automatic selection (scan may still fail for capabilities or I/O), got: {outcome:?}"
+            ),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    Err(AppError::AutomaticInterfaceSelectionAmbiguous { .. })
+                ),
+                "multiple usable interfaces should make automatic selection ambiguous, got: {outcome:?}"
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_invalid_interface_name_when_scan_interface_name_is_empty_on_linux() {
+        // Arrange
+        let command = ApplicationCommand::Scan {
+            interface_name: Some(String::new()),
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InvalidInterfaceName { .. })),
+            "empty interface name should be rejected before raw socket setup, got: {outcome:?}"
         );
     }
 }

@@ -32,6 +32,17 @@ fn main() {
                     }
                 }
             }
+            Some(CliSubcommand::Interfaces) => {
+                match new_arp_scan::run(ApplicationCommand::UsableInterfacesList) {
+                    Ok(outcome) => {
+                        print_application_outcome(outcome);
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             None => {
                 let mut command = CliRoot::command();
                 command
@@ -61,6 +72,10 @@ fn print_application_outcome(outcome: ApplicationOutcome) {
                     host.ipv4_address, host.media_access_control_address
                 );
             }
+        }
+        ApplicationOutcome::UsableInterfacesList(listing_outcome) => {
+            let table = listing_outcome.format_plain_columns_table();
+            print!("{table}");
         }
     }
 }

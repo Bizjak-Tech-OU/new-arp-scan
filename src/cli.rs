@@ -5,8 +5,14 @@ use clap::{Args, Parser, Subcommand};
 /// Help footer examples appended to `--help` output.
 const EXAMPLES: &str = "\
 EXAMPLES:
+  List interfaces usable for ARP scanning on Linux:
+    new-arp-scan interfaces
+
   Scan the local IPv4 subnet on Linux (requires CAP_NET_RAW or equivalent):
     new-arp-scan scan --interface eth0
+
+  Scan using automatic interface selection when exactly one usable interface exists:
+    new-arp-scan scan
 ";
 
 /// Root command-line interface for `new-arp-scan`.
@@ -28,14 +34,17 @@ pub struct CliRoot {
 pub enum CliSubcommand {
     /// Scan the interface's local IPv4 subnet using address resolution protocol requests.
     Scan(ScanArguments),
+    /// List interfaces that are usable for ARP scanning on Linux.
+    Interfaces,
 }
 
 /// Arguments for [`CliSubcommand::Scan`].
 #[derive(Debug, Args)]
 pub struct ScanArguments {
-    /// Network interface name (for example `eth0`).
+    /// Network interface name (for example `eth0`). When omitted, a single usable interface must
+    /// exist or automatic selection fails.
     #[arg(long = "interface", value_name = "NAME", visible_alias = "iface")]
-    pub interface_name: String,
+    pub interface_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -58,9 +67,13 @@ mod tests {
         match subcommand {
             super::CliSubcommand::Scan(scan) => {
                 assert_eq!(
-                    scan.interface_name, "eth0",
+                    scan.interface_name.as_deref(),
+                    Some("eth0"),
                     "interface name should match flag value"
                 );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
             }
         }
     }
@@ -79,25 +92,55 @@ mod tests {
         match subcommand {
             super::CliSubcommand::Scan(scan) => {
                 assert_eq!(
-                    scan.interface_name, "enp0s1",
+                    scan.interface_name.as_deref(),
+                    Some("enp0s1"),
                     "visible alias --iface should populate interface name"
                 );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
             }
         }
     }
 
     #[test]
-    fn returns_error_when_scan_subcommand_missing_interface_flag() {
+    fn parses_scan_subcommand_without_interface_name() {
         // Arrange
         let arguments = ["new-arp-scan", "scan"];
 
         // Act
-        let outcome = CliRoot::try_parse_from(arguments);
+        let parsed = CliRoot::try_parse_from(arguments);
 
         // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.interface_name, None,
+                    "omitted interface flag should yield None"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_interfaces_subcommand() {
+        // Arrange
+        let arguments = ["new-arp-scan", "interfaces"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
         assert!(
-            outcome.is_err(),
-            "missing required flag should fail parsing, got: {outcome:?}"
+            matches!(subcommand, super::CliSubcommand::Interfaces),
+            "expected interfaces subcommand, got: {subcommand:?}"
         );
     }
 
@@ -117,6 +160,36 @@ mod tests {
     }
 
     #[test]
+    fn returns_error_when_scan_subcommand_receives_unknown_flag() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--not-a-defined-flag"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "undefined scan flags should fail parsing, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_interfaces_subcommand_receives_trailing_token() {
+        // Arrange
+        let arguments = ["new-arp-scan", "interfaces", "extra"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "interfaces subcommand should not accept stray positional arguments, got: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn help_command_factory_builds_without_panicking() {
         // Arrange
         // Act
@@ -125,8 +198,8 @@ mod tests {
         // Assert
         let help = command.render_help().to_string();
         assert!(
-            help.contains("scan"),
-            "help should mention scan subcommand, got: {help}"
+            help.contains("scan") && help.contains("interfaces"),
+            "help should mention scan and interfaces subcommands, got: {help}"
         );
     }
 

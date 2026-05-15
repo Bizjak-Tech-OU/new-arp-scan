@@ -28,7 +28,7 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 
 ## 2026-05-11 — `libc` for Linux packet sockets and ioctl
 
-**Decision:** Add the `libc` crate for Linux `AF_PACKET` raw sockets, `bind(2)`, `ioctl(2)` (including `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFHWADDR`), `if_nametoindex(3)`, `sendto(2)`, `recvfrom(2)`, `poll(2)`, and authoritative C layout types used to validate our `sockaddr_ll` mirror.
+**Decision:** Add the `libc` crate for Linux `AF_PACKET` raw sockets, `bind(2)`, `ioctl(2)` (including `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFHWADDR`), `if_nametoindex(3)`, `if_nameindex(3)` / `if_freenameindex(3)`, `sendto(2)`, `recvfrom(2)`, `poll(2)`, and authoritative C layout types used to validate our `sockaddr_ll` mirror.
 
 **Reason:** The standard library does not expose these system calls, socket options, or kernel ABI structures. Maintaining raw `extern "C"` declarations for the full surface would duplicate `libc`’s audited bindings without benefit.
 
@@ -57,3 +57,11 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 **Reason:** The project explicitly approved a parser dependency over hand-rolled `std::env::args` parsing for this milestone. Derive macros keep the command surface typed and documented next to the definitions.
 
 **Consequences:** Any future CLI expansion should extend the derive structs/enums and keep `main.rs` limited to parsing and dispatch.
+
+## 2026-05-15 — Linux interface enumeration via `if_nameindex(3)` plus ioctl
+
+**Decision:** Enumerate local interface names and indexes with `if_nameindex(3)` / `if_freenameindex(3)` (wrapped in [`src/linux_system_call.rs`](src/linux_system_call.rs)), then reuse existing `ioctl` reads for flags, IPv4 address, netmask, and hardware address when classifying usable ARP scan interfaces. Centralize copying an interface name into `struct ifreq` in [`src/interface_validation.rs`](src/interface_validation.rs) (Linux-only helper) for [`SIOCGIFFLAGS`](src/linux_system_call.rs) and related requests.
+
+**Reason:** `if_nameindex(3)` is the documented portable way to list `(if_index, name)` pairs without rtnetlink complexity; `netdevice(7)` continues to document the ioctl surface already used for per-interface discovery. Sharing `ifreq` name population avoids duplicated length checks across modules.
+
+**Consequences:** Listing and automatic interface selection share the same filtering rules as explicit scans; `libc` remains the only foreign-function-interface dependency for these calls.
