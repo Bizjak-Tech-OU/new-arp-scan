@@ -16,3 +16,5 @@ coverage:
 
 clean:
 	cargo clean
+
+all: build test lint

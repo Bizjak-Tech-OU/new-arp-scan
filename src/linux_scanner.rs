@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::mem::zeroed;
 use std::net::Ipv4Addr;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::address_resolution_protocol::{
@@ -24,10 +25,42 @@ use crate::linux_socket::{
 use crate::linux_system_call;
 use crate::mac_address::MacAddress;
 
-/// Duration after the last request transmission during which replies are collected.
-const RECEIVE_WINDOW_AFTER_LAST_REQUEST: Duration = Duration::from_secs(3);
+/// Converts remaining receive time to a `poll(2)` timeout in whole milliseconds, clamped to
+/// [`libc::c_int::MAX`] when the span does not fit the system call parameter type.
+fn poll_timeout_milliseconds_for_receive_wait(remaining: Duration) -> libc::c_int {
+    let milliseconds = remaining.as_millis();
+    libc::c_int::try_from(milliseconds).unwrap_or(libc::c_int::MAX)
+}
+
+/// Builds the ordered list of IPv4 targets: interior hosts from the iterator, then the interface
+/// address when it is not strictly inside the open `(network, broadcast)` interval.
+fn ipv4_scan_target_address_sequence(
+    interior_host_addresses: impl Iterator<Item = Ipv4Addr>,
+    source_ipv4_address: Ipv4Addr,
+    network_bits: u32,
+    broadcast_bits: u32,
+) -> Vec<Ipv4Addr> {
+    let mut targets: Vec<Ipv4Addr> = interior_host_addresses.collect();
+    if !ipv4_address_is_strictly_inside_subnet(source_ipv4_address, network_bits, broadcast_bits) {
+        targets.push(source_ipv4_address);
+    }
+    targets
+}
+
+/// Returns whether pacing should run after the send at `send_index` (zero-based).
+fn should_apply_pacing_after_send(
+    send_index: usize,
+    total_sends: usize,
+    pacing_between_target_sends: Duration,
+) -> bool {
+    !pacing_between_target_sends.is_zero() && send_index.saturating_add(1) < total_sends
+}
 
 /// Performs a full-subnet IPv4 address resolution scan on `interface_name`.
+///
+/// `receive_timeout_after_last_request` bounds how long the scanner waits for replies after the
+/// last request is sent. `pacing_between_target_sends` is the delay after each send except the
+/// final one.
 ///
 /// # Errors
 ///
@@ -37,7 +70,11 @@ const RECEIVE_WINDOW_AFTER_LAST_REQUEST: Duration = Duration::from_secs(3);
 /// # Panics
 ///
 /// This function does not panic.
-pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
+pub fn perform_arp_scan(
+    interface_name: &str,
+    receive_timeout_after_last_request: Duration,
+    pacing_between_target_sends: Duration,
+) -> Result<ScanOutcome, AppError> {
     let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
     let addresses = discover_interface_scan_addresses(interface_name)?;
     let host_address_iterator = Ipv4HostAddressIterator::try_from_ipv4_address_on_subnet(
@@ -69,40 +106,35 @@ pub fn perform_arp_scan(interface_name: &str) -> Result<ScanOutcome, AppError> {
 
     let mut warnings = Vec::new();
 
-    for target_ipv4_address in host_address_iterator {
-        send_one_address_resolution_request(
-            &packet_socket,
-            &link_layer_destination,
-            addresses.source_mac_address,
-            addresses.source_ipv4_address,
-            target_ipv4_address,
-            &mut warnings,
-        );
-    }
-
-    if !ipv4_address_is_strictly_inside_subnet(
+    let targets = ipv4_scan_target_address_sequence(
+        host_address_iterator,
         addresses.source_ipv4_address,
         network_bits,
         broadcast_bits,
-    ) {
+    );
+    let total_sends = targets.len();
+
+    for (send_index, target_ipv4_address) in targets.iter().enumerate() {
         send_one_address_resolution_request(
             &packet_socket,
             &link_layer_destination,
             addresses.source_mac_address,
             addresses.source_ipv4_address,
-            addresses.source_ipv4_address,
+            *target_ipv4_address,
             &mut warnings,
         );
+        if should_apply_pacing_after_send(send_index, total_sends, pacing_between_target_sends) {
+            thread::sleep(pacing_between_target_sends);
+        }
     }
 
-    let deadline = Instant::now() + RECEIVE_WINDOW_AFTER_LAST_REQUEST;
+    let deadline = Instant::now() + receive_timeout_after_last_request;
     let mut discovered_hosts: BTreeMap<Ipv4Addr, MacAddress> = BTreeMap::new();
     let mut receive_buffer = [0u8; 4096];
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout_milliseconds =
-            libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
+        let timeout_milliseconds = poll_timeout_milliseconds_for_receive_wait(remaining);
 
         match linux_system_call::poll_socket_readiness(
             &packet_socket,
@@ -234,6 +266,285 @@ fn ipv4_sender_is_probed_target(
 ) -> bool {
     sender_ipv4_address == source_ipv4_address
         || ipv4_address_is_strictly_inside_subnet(sender_ipv4_address, network_bits, broadcast_bits)
+}
+
+#[cfg(test)]
+mod poll_timeout_milliseconds_for_receive_wait_tests {
+    use super::poll_timeout_milliseconds_for_receive_wait;
+    use std::time::Duration;
+
+    #[test]
+    fn maps_zero_duration_to_zero_milliseconds() {
+        // Arrange
+        let remaining = Duration::ZERO;
+
+        // Act
+        let outcome = poll_timeout_milliseconds_for_receive_wait(remaining);
+
+        // Assert
+        assert_eq!(
+            outcome, 0,
+            "zero remaining time should map to immediate poll timeout"
+        );
+    }
+
+    #[test]
+    fn maps_small_duration_to_matching_milliseconds() {
+        // Arrange
+        let remaining = Duration::from_millis(1500);
+
+        // Act
+        let outcome = poll_timeout_milliseconds_for_receive_wait(remaining);
+
+        // Assert
+        assert_eq!(
+            outcome, 1500,
+            "poll timeout should match remaining milliseconds when it fits c_int"
+        );
+    }
+
+    #[test]
+    fn clamps_duration_when_milliseconds_exceed_c_int_maximum() {
+        // Arrange
+        let remaining = Duration::from_millis(u64::from(libc::c_int::MAX as u32).saturating_add(1));
+
+        // Act
+        let outcome = poll_timeout_milliseconds_for_receive_wait(remaining);
+
+        // Assert
+        assert_eq!(
+            outcome,
+            libc::c_int::MAX,
+            "oversized millisecond span should clamp to c_int::MAX for poll(2)"
+        );
+    }
+
+    #[test]
+    fn maps_duration_when_milliseconds_equal_c_int_maximum_without_clamping() {
+        // Arrange
+        let remaining = Duration::from_millis(libc::c_int::MAX as u64);
+
+        // Act
+        let outcome = poll_timeout_milliseconds_for_receive_wait(remaining);
+
+        // Assert
+        assert_eq!(
+            outcome,
+            libc::c_int::MAX,
+            "exactly representable maximum poll timeout should pass through unchanged"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ipv4_scan_target_address_sequence_tests {
+    use super::ipv4_scan_target_address_sequence;
+    use std::net::Ipv4Addr;
+
+    fn network_and_broadcast_slash_24() -> (u32, u32) {
+        let network = Ipv4Addr::new(192, 168, 1, 0);
+        let broadcast = Ipv4Addr::new(192, 168, 1, 255);
+        (network.to_bits(), broadcast.to_bits())
+    }
+
+    #[test]
+    fn appends_source_when_source_is_not_strictly_inside_open_host_interval() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_and_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 0);
+        let interior = [Ipv4Addr::new(192, 168, 1, 10)];
+
+        // Act
+        let targets = ipv4_scan_target_address_sequence(
+            interior.into_iter(),
+            source,
+            network_bits,
+            broadcast_bits,
+        );
+
+        // Assert
+        assert_eq!(
+            targets,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 1, 0),
+            ],
+            "interface address on the subnet boundary should be probed after interior hosts"
+        );
+    }
+
+    #[test]
+    fn does_not_append_source_when_source_is_strictly_inside_open_host_interval() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_and_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 50);
+        let interior = [
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(192, 168, 1, 11),
+        ];
+
+        // Act
+        let targets = ipv4_scan_target_address_sequence(
+            interior.into_iter(),
+            source,
+            network_bits,
+            broadcast_bits,
+        );
+
+        // Assert
+        assert_eq!(
+            targets,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 1, 11),
+            ],
+            "strictly interior interface address should not duplicate as trailing self-probe"
+        );
+    }
+
+    #[test]
+    fn appends_broadcast_source_after_interior_hosts_when_broadcast_is_interface_address() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_and_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 255);
+        let interior = [Ipv4Addr::new(192, 168, 1, 10)];
+
+        // Act
+        let targets = ipv4_scan_target_address_sequence(
+            interior.into_iter(),
+            source,
+            network_bits,
+            broadcast_bits,
+        );
+
+        // Assert
+        assert_eq!(
+            targets,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 1, 255),
+            ],
+            "broadcast interface address should still receive a trailing self-probe"
+        );
+    }
+
+    #[test]
+    fn yields_only_broadcast_source_when_interior_iterator_is_empty_and_source_is_broadcast() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_and_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 255);
+
+        // Act
+        let targets = ipv4_scan_target_address_sequence(
+            core::iter::empty(),
+            source,
+            network_bits,
+            broadcast_bits,
+        );
+
+        // Assert
+        assert_eq!(
+            targets,
+            vec![Ipv4Addr::new(192, 168, 1, 255)],
+            "empty interior range with broadcast source should still probe that address once"
+        );
+    }
+
+    #[test]
+    fn yields_empty_target_list_when_interior_iterator_is_empty_and_source_is_strictly_inside() {
+        // Arrange
+        let (network_bits, broadcast_bits) = network_and_broadcast_slash_24();
+        let source = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Act
+        let targets = ipv4_scan_target_address_sequence(
+            core::iter::empty(),
+            source,
+            network_bits,
+            broadcast_bits,
+        );
+
+        // Assert
+        assert!(
+            targets.is_empty(),
+            "strictly interior source with no interior iterator should not add duplicate self row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod should_apply_pacing_after_send_tests {
+    use super::should_apply_pacing_after_send;
+    use std::time::Duration;
+
+    #[test]
+    fn returns_true_when_more_sends_remain_and_pacing_is_nonzero() {
+        // Arrange
+        let pacing = Duration::from_millis(5);
+
+        // Act
+        let outcome = should_apply_pacing_after_send(0, 3, pacing);
+
+        // Assert
+        assert!(
+            outcome,
+            "pacing should apply between first and second send when pacing is nonzero"
+        );
+    }
+
+    #[test]
+    fn returns_false_on_final_send_even_when_pacing_is_nonzero() {
+        // Arrange
+        let pacing = Duration::from_millis(5);
+
+        // Act
+        let outcome = should_apply_pacing_after_send(2, 3, pacing);
+
+        // Assert
+        assert!(!outcome, "pacing must not run after the final send");
+    }
+
+    #[test]
+    fn returns_false_when_only_one_send_is_planned() {
+        // Arrange
+        let pacing = Duration::from_millis(5);
+
+        // Act
+        let outcome = should_apply_pacing_after_send(0, 1, pacing);
+
+        // Assert
+        assert!(
+            !outcome,
+            "single-target scan should not sleep after the only send"
+        );
+    }
+
+    #[test]
+    fn returns_false_when_pacing_duration_is_zero() {
+        // Arrange
+        let pacing = Duration::ZERO;
+
+        // Act
+        let outcome = should_apply_pacing_after_send(0, 5, pacing);
+
+        // Assert
+        assert!(
+            !outcome,
+            "zero pacing should never schedule sleeps between sends"
+        );
+    }
+
+    #[test]
+    fn returns_false_when_total_sends_is_zero_even_with_nonzero_pacing() {
+        // Arrange
+        let pacing = Duration::from_millis(1);
+
+        // Act
+        let outcome = should_apply_pacing_after_send(0, 0, pacing);
+
+        // Assert
+        assert!(!outcome, "empty send plan must not schedule pacing sleeps");
+    }
 }
 
 #[cfg(test)]

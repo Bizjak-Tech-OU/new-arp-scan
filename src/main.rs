@@ -1,5 +1,7 @@
 //! Binary entry point for the new ARP scan tool.
 
+use std::time::Duration;
+
 use clap::CommandFactory;
 use clap::Parser;
 
@@ -22,6 +24,8 @@ fn main() {
             Some(CliSubcommand::Scan(scan)) => {
                 match new_arp_scan::run(ApplicationCommand::Scan {
                     interface_name: scan.interface_name,
+                    timeout: Duration::from_millis(scan.timeout_milliseconds),
+                    pacing: Duration::from_millis(scan.pacing_milliseconds),
                 }) {
                     Ok(outcome) => {
                         print_application_outcome(outcome);
