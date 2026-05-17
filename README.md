@@ -10,17 +10,17 @@ Licensed under the GNU Affero General Public License v3.0 only. See [LICENSE](LI
 
 ```text
 new-arp-scan interfaces
-new-arp-scan scan [--interface <NAME>]
+new-arp-scan scan [--interface <NAME>] [--timeout-ms <MILLISECONDS>] [--pacing-ms <MILLISECONDS>]
 ```
 
 - On Linux, `interfaces` lists interfaces that are usable for ARP scanning (Ethernet hardware type, administratively up, not loopback, not `NOARP`, with an IPv4 address, netmask, and a non-zero hardware address). Output is a plain aligned table; if none qualify, the tool prints `no usable interfaces found` and exits successfully.
-- On Linux, `scan` reads the interface IPv4 address, netmask, and Ethernet hardware address via `ioctl`, opens a raw packet socket bound to ARP (`ETH_P_ARP`), sends one broadcast ARP request per target address in the subnet (excluding network and broadcast, but always including the interface’s own IPv4 address when it falls outside that open range), then collects replies for three seconds. Discovered hosts are printed as `<IPv4> <MAC>` on standard output; the library represents each MAC as `MacAddress` on `DiscoveredHost::media_access_control_address` (colon-separated lowercase hex, same as the binary). Non-fatal issues (for example a failed send or a malformed frame) are reported as `warning: ...` lines on standard error. If nothing responds, the tool prints `no hosts found` and exits successfully.
+- On Linux, `scan` reads the interface IPv4 address, netmask, and Ethernet hardware address via `ioctl`, opens a raw packet socket bound to ARP (`ETH_P_ARP`), sends one broadcast ARP request per target address in the subnet (excluding network and broadcast, but always including the interface’s own IPv4 address when it falls outside that open range). By default it sleeps `--pacing-ms` milliseconds after each send except the last (default `0`), then collects replies until `--timeout-ms` elapses after the last send (default `3000`). Values larger than Linux `poll(2)` accepts in milliseconds are clamped internally. Discovered hosts are printed as `<IPv4> <MAC>` on standard output in ascending IPv4 order; the library represents each MAC as `MacAddress` on `DiscoveredHost::media_access_control_address` (colon-separated lowercase hex, same as the binary). Non-fatal issues (for example a failed send or a malformed frame) are reported as `warning: ...` lines on standard error. If nothing responds, the tool prints `no hosts found` and exits successfully.
 - On Linux, when `scan` is run without `--interface` / `--iface`, the tool selects an interface automatically **only** when exactly one usable interface exists; otherwise it exits with an error that names the ambiguity or states that no usable interface was found.
 - On non-Linux hosts, `scan` and `interfaces` return an unsupported-platform error without calling Linux-only APIs.
 
 Creating the raw packet socket requires Linux capability **`CAP_NET_RAW`** (often available to the superuser). Permission denied when opening the socket is surfaced with an explicit `CAP_NET_RAW` hint. See Linux `packet(7)` and `capabilities(7)`.
 
-To verify frames on the wire, run `tcpdump` or Wireshark on the same interface (for example `tcpdump -ni eth0 arp`) while scanning; this is optional manual validation and is not part of automated tests.
+To verify frames on the wire, run `tcpdump` or Wireshark on the same interface (for example `tcpdump -ni eth0 arp`) while scanning; this is optional manual validation and is not part of automated tests. For a full acceptance check on hardware you control, run a privileged scan (for example `sudo ./target/debug/new-arp-scan scan --interface eth0`) and compare custom `--timeout-ms` / `--pacing-ms` values with the defaults documented above.
 
 Run `new-arp-scan --help`, `new-arp-scan interfaces --help`, or `new-arp-scan scan --help` for built-in examples.
 

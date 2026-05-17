@@ -81,3 +81,11 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 **Reason:** The guard makes truncation impossible; a `u8::try_from` error branch was logically unreachable and obscured the real control flow.
 
 **Consequences:** If the accepted prefix range ever widens beyond what fits in `u8`, this site must be revisited together with the parser.
+
+## 2026-05-17 — Configurable scan receive window and inter-target pacing
+
+**Decision:** Extend [`ApplicationCommand::Scan`](src/application_command.rs) with `std::time::Duration` fields `timeout` and `pacing`, public defaults [`DEFAULT_SCAN_TIMEOUT`](src/application_command.rs) and [`DEFAULT_SCAN_PACING`](src/application_command.rs), and CLI flags `--timeout-ms` / `--pacing-ms`. The Linux scanner keeps a global receive phase after the last send while pacing only between sends; millisecond spans passed to `poll(2)` clamp to [`libc::c_int::MAX`](https://man7.org/linux/man-pages/man2/poll.2.html) when they do not fit the system call parameter type.
+
+**Reason:** GitHub issue #14 requires configurable timeout and pacing without abandoning the existing burst-send plus single receive-window model operators already rely on.
+
+**Consequences:** Library callers must supply explicit `Duration` values or the defaults; documentation and static site pages describe the new flags. Hermetic unit tests cover poll clamping, target ordering with the optional self-probe, and pacing gating without live sockets.

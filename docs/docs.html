@@ -144,7 +144,7 @@
           <pre
             class="mt-4 overflow-x-auto rounded border border-zinc-200 bg-white p-4 font-mono text-sm leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200"
           ><code>new-arp-scan interfaces
-new-arp-scan scan [--interface &lt;NAME&gt;]</code></pre>
+new-arp-scan scan [--interface &lt;NAME&gt;] [--timeout-ms &lt;MILLISECONDS&gt;] [--pacing-ms &lt;MILLISECONDS&gt;]</code></pre>
           <p class="mt-3 text-sm text-zinc-500 dark:text-zinc-500">
             Built-in help: <span class="font-mono">new-arp-scan --help</span>,
             <span class="font-mono">new-arp-scan interfaces --help</span>,
@@ -166,7 +166,11 @@ new-arp-scan scan [--interface &lt;NAME&gt;]</code></pre>
             <span class="font-mono">ioctl</span>, opens a raw packet socket bound to ARP
             (<span class="font-mono">ETH_P_ARP</span>), sends one broadcast ARP request per target address in the
             subnet (excluding network and broadcast, but always including the interface’s own IPv4 when it falls
-            outside that open range), then collects replies for three seconds.
+            outside that open range). By default it sleeps <span class="font-mono">--pacing-ms</span> after each send
+            except the last (default <span class="font-mono">0</span>), then collects replies until
+            <span class="font-mono">--timeout-ms</span> elapses after the last send (default
+            <span class="font-mono">3000</span>). Millisecond values that exceed what Linux
+            <span class="font-mono">poll(2)</span> accepts are clamped internally.
           </p>
           <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
             If <span class="font-mono">scan</span> is run without <span class="font-mono">--interface</span> /

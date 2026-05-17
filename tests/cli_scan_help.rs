@@ -46,7 +46,10 @@ fn binary_scan_help_exits_successfully_and_mentions_interface_flag() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("--interface") || stdout.contains("--iface"),
-        "scan help should document the interface flag, got: {stdout}"
+        (stdout.contains("--interface") || stdout.contains("--iface"))
+            && stdout.contains("--timeout-ms")
+            && stdout.contains("--pacing-ms")
+            && stdout.to_lowercase().contains("millisecond"),
+        "scan help should document interface and timing flags with millisecond semantics, got: {stdout}"
     );
 }

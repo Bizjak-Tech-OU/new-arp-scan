@@ -25,7 +25,7 @@ mod linux_socket;
 #[cfg(target_os = "linux")]
 mod linux_system_call;
 
-pub use application_command::ApplicationCommand;
+pub use application_command::{ApplicationCommand, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT};
 pub use application_outcome::ApplicationOutcome;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
@@ -37,8 +37,10 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 /// Runs the application logic for a parsed [`ApplicationCommand`].
 ///
 /// On Linux, [`ApplicationCommand::Scan`] performs address resolution scanning on the resolved
-/// interface and returns discovered hosts. When the scan command omits an interface name, the
-/// library selects an interface automatically only when exactly one usable interface exists.
+/// interface and returns discovered hosts. The `timeout` field bounds the global receive window
+/// after the last request is sent; the `pacing` field sleeps after each target send except the
+/// last. When the scan command omits an interface name, the library selects an interface
+/// automatically only when exactly one usable interface exists.
 ///
 /// On Linux, [`ApplicationCommand::UsableInterfacesList`] returns interfaces that pass the same
 /// usability rules as automatic scan selection.
@@ -53,10 +55,15 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 /// # Examples
 ///
 /// ```
-/// use new_arp_scan::{run, ApplicationCommand, AppError, ApplicationOutcome};
+/// use new_arp_scan::{
+///     run, ApplicationCommand, AppError, ApplicationOutcome, DEFAULT_SCAN_PACING,
+///     DEFAULT_SCAN_TIMEOUT,
+/// };
 ///
 /// let outcome = run(ApplicationCommand::Scan {
 ///     interface_name: Some("eth0".to_string()),
+///     timeout: DEFAULT_SCAN_TIMEOUT,
+///     pacing: DEFAULT_SCAN_PACING,
 /// });
 ///
 /// # #[cfg(not(target_os = "linux"))]
@@ -71,7 +78,11 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 /// ```
 pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> {
     match command {
-        ApplicationCommand::Scan { interface_name } => {
+        ApplicationCommand::Scan {
+            interface_name,
+            timeout,
+            pacing,
+        } => {
             if let Some(interface_name) = interface_name.as_deref() {
                 interface_validation::validate_interface_name_for_linux_packet_socket(
                     interface_name,
@@ -84,7 +95,8 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                     linux_interface_discovery::resolve_scan_interface_name(
                         interface_name.as_deref(),
                     )?;
-                let scan_outcome = linux_scanner::perform_arp_scan(&resolved_interface_name)?;
+                let scan_outcome =
+                    linux_scanner::perform_arp_scan(&resolved_interface_name, timeout, pacing)?;
                 Ok(ApplicationOutcome::Scan(scan_outcome))
             }
 
@@ -130,6 +142,8 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
 mod tests {
     use super::AppError;
     use super::ApplicationCommand;
+    use super::DEFAULT_SCAN_PACING;
+    use super::DEFAULT_SCAN_TIMEOUT;
     use super::run;
 
     #[cfg(not(target_os = "linux"))]
@@ -138,6 +152,8 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some(String::new()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
         };
 
         // Act
@@ -156,6 +172,8 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
         };
 
         // Act
@@ -165,6 +183,26 @@ mod tests {
         assert!(
             matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
             "non-linux hosts should report unsupported platform, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn returns_unsupported_platform_when_scanning_on_non_linux_even_with_custom_scan_timing() {
+        // Arrange
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            timeout: std::time::Duration::from_secs(60),
+            pacing: std::time::Duration::from_millis(999),
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
+            "custom scan timing must not bypass unsupported platform handling, got: {outcome:?}"
         );
     }
 
@@ -190,6 +228,8 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
         };
 
         // Act
@@ -208,6 +248,8 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("lo".to_string()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
         };
 
         // Act
@@ -217,6 +259,26 @@ mod tests {
         assert!(
             matches!(outcome, Err(AppError::InterfaceRejectedForScanning { .. })),
             "loopback should be rejected before opening a raw socket, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_rejection_when_scanning_loopback_on_linux_even_with_non_default_scan_timing() {
+        // Arrange
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("lo".to_string()),
+            timeout: std::time::Duration::from_millis(1),
+            pacing: std::time::Duration::from_millis(5),
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InterfaceRejectedForScanning { .. })),
+            "custom scan timing must not bypass loopback rejection, got: {outcome:?}"
         );
     }
 
@@ -259,6 +321,8 @@ mod tests {
 
         let command = ApplicationCommand::Scan {
             interface_name: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
         };
 
         // Act
@@ -294,6 +358,8 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some(String::new()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
         };
 
         // Act
