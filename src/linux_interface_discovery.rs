@@ -87,7 +87,8 @@ fn read_hardware_address_from_sockaddr(
             sockaddr.sa_data.len(),
         )
     };
-    hardware_address_octets.copy_from_slice(&sockaddr_data_bytes[..hardware_address_octets.len()]);
+    let hardware_address_length = hardware_address_octets.len();
+    hardware_address_octets.copy_from_slice(&sockaddr_data_bytes[..hardware_address_length]);
 
     let address = MacAddress::from_octets(hardware_address_octets);
     if address.is_zero() {
