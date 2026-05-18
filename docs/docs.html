@@ -96,8 +96,11 @@
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#platform">Platform support</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#permissions">Permissions</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#commands">Commands</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#examples">Examples</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#scan-behaviour">Scan behaviour</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#output">Output</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#library">Library API</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#verification">Verification</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#requirements">Requirements &amp; development</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#license">License</a></li>
           </ul>
@@ -149,13 +152,17 @@ new-arp-scan scan [--interface &lt;NAME&gt;] [--timeout-ms &lt;MILLISECONDS&gt;]
             Built-in help: <span class="font-mono">new-arp-scan --help</span>,
             <span class="font-mono">new-arp-scan interfaces --help</span>,
             <span class="font-mono">new-arp-scan scan --help</span>.
+            Running <span class="font-mono">new-arp-scan</span> with no arguments prints the root help and exits
+            successfully.
           </p>
 
           <h3 class="mt-8 font-mono text-sm font-semibold uppercase tracking-wide text-zinc-500">interfaces</h3>
           <p class="mt-2 leading-relaxed text-zinc-600 dark:text-zinc-400">
             On Linux, lists interfaces usable for ARP scanning: Ethernet hardware type, administratively up, not
             loopback, not <span class="font-mono">NOARP</span>, with an IPv4 address, netmask, and a non-zero hardware
-            address. Output is a plain aligned table. If none qualify, the tool prints
+            address. Output is a plain aligned table sorted by interface index, then name, with
+            <span class="font-mono">NAME</span>, <span class="font-mono">INDEX</span>, <span class="font-mono">IPV4</span>,
+            <span class="font-mono">NETMASK</span>, and <span class="font-mono">MAC</span> columns. If none qualify, the tool prints
             <span class="font-mono text-zinc-800 dark:text-zinc-200">no usable interfaces found</span> and exits
             successfully.
           </p>
@@ -181,13 +188,52 @@ new-arp-scan scan [--interface &lt;NAME&gt;] [--timeout-ms &lt;MILLISECONDS&gt;]
           </p>
         </section>
 
-        <section id="scan-behaviour" class="mt-12 scroll-mt-20">
-          <h2 class="font-mono text-lg font-semibold">Verification</h2>
+        <section id="examples" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Examples</h2>
           <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
-            To verify frames on the wire, run <span class="font-mono">tcpdump</span> or Wireshark on the same interface
-            (for example <span class="font-mono">tcpdump -ni eth0 arp</span>) while scanning. This is optional manual
-            validation and is not part of automated tests.
+            These examples match the CLI help footer and current operator workflows:
           </p>
+          <pre
+            class="mt-4 overflow-x-auto rounded border border-zinc-200 bg-white p-4 font-mono text-sm leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200"
+          ><code># List interfaces usable for ARP scanning on Linux
+new-arp-scan interfaces
+
+# Scan a specific local IPv4 subnet
+new-arp-scan scan --interface eth0
+
+# Let the tool select the interface when exactly one usable interface exists
+new-arp-scan scan
+
+# Use a custom receive window and pacing between sends
+new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10</code></pre>
+        </section>
+
+        <section id="scan-behaviour" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Scan behaviour</h2>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>
+              Target addresses come from the selected interface’s IPv4 address and netmask. The scanner excludes the
+              network and broadcast addresses, but includes the interface’s own IPv4 address when that address falls
+              outside the open host range.
+            </li>
+            <li>
+              Requests are broadcast ARP frames sent through a Linux raw packet socket bound to
+              <span class="font-mono">ETH_P_ARP</span>.
+            </li>
+            <li>
+              <span class="font-mono">--pacing-ms</span> sleeps after each target send except the last. The default is
+              <span class="font-mono">0</span>, so the default scan sends without intentional inter-target delay.
+            </li>
+            <li>
+              <span class="font-mono">--timeout-ms</span> is the receive window after the last send. The default is
+              <span class="font-mono">3000</span>, and values larger than Linux <span class="font-mono">poll(2)</span>
+              accepts are clamped internally.
+            </li>
+            <li>
+              Non-fatal send or frame-parse problems are collected as warnings, while fatal interface, socket, receive,
+              or poll failures return an error.
+            </li>
+          </ul>
         </section>
 
         <section id="output" class="mt-12 scroll-mt-20">
@@ -195,7 +241,7 @@ new-arp-scan scan [--interface &lt;NAME&gt;] [--timeout-ms &lt;MILLISECONDS&gt;]
           <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
             <li>
               Discovered hosts: <span class="font-mono text-zinc-800 dark:text-zinc-200">&lt;IPv4&gt; &lt;MAC&gt;</span>
-              on standard output. MAC addresses are colon-separated lowercase hex.
+              on standard output, sorted by ascending IPv4 address. MAC addresses are colon-separated lowercase hex.
             </li>
             <li>
               Non-fatal issues (e.g. failed send, malformed frame):
@@ -206,6 +252,53 @@ new-arp-scan scan [--interface &lt;NAME&gt;] [--timeout-ms &lt;MILLISECONDS&gt;]
               exits successfully.
             </li>
           </ul>
+        </section>
+
+        <section id="library" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Library API</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            The crate exposes the same application surface used by the binary. Call
+            <span class="font-mono">run(ApplicationCommand::Scan { ... })</span> or
+            <span class="font-mono">run(ApplicationCommand::UsableInterfacesList)</span> and handle
+            <span class="font-mono">ApplicationOutcome</span> or <span class="font-mono">AppError</span>.
+          </p>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>
+              Scan commands take explicit <span class="font-mono">Duration</span> values for
+              <span class="font-mono">timeout</span> and <span class="font-mono">pacing</span>. Use
+              <span class="font-mono">DEFAULT_SCAN_TIMEOUT</span> and
+              <span class="font-mono">DEFAULT_SCAN_PACING</span> to match CLI defaults.
+            </li>
+            <li>
+              <span class="font-mono">ScanOutcome::discovered_hosts</span> contains
+              <span class="font-mono">DiscoveredHost</span> values sorted by IPv4 address. Each host stores the MAC in
+              <span class="font-mono">DiscoveredHost::media_access_control_address</span> as a typed
+              <span class="font-mono">MacAddress</span>.
+            </li>
+            <li>
+              <span class="font-mono">UsableInterfacesListOutcome</span> exposes the same interface rows printed by
+              the <span class="font-mono">interfaces</span> command.
+            </li>
+            <li>
+              Pure IPv4 helpers <span class="font-mono">Ipv4Cidr</span> and
+              <span class="font-mono">Ipv4HostAddressIterator</span> are public for CIDR parsing and target expansion.
+            </li>
+          </ul>
+        </section>
+
+        <section id="verification" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Verification</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            To verify frames on the wire, run <span class="font-mono">tcpdump</span> or Wireshark on the same interface
+            (for example <span class="font-mono">tcpdump -ni eth0 arp</span>) while scanning. This is optional manual
+            validation and is not part of automated tests.
+          </p>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            For a full acceptance check on hardware you control, build the binary and run a privileged scan such as
+            <span class="font-mono">sudo ./target/debug/new-arp-scan scan --interface eth0</span>. Compare default runs
+            with custom <span class="font-mono">--timeout-ms</span> and <span class="font-mono">--pacing-ms</span>
+            values to confirm timing behaviour for your network.
+          </p>
         </section>
 
         <section id="requirements" class="mt-12 scroll-mt-20">
@@ -244,7 +337,7 @@ new-arp-scan scan [--interface &lt;NAME&gt;] [--timeout-ms &lt;MILLISECONDS&gt;]
                   <td class="px-4 py-3 font-mono text-zinc-800 dark:text-zinc-200">make coverage</td>
                   <td class="px-4 py-3">
                     <span class="font-mono">cargo llvm-cov --all-targets --summary-only</span> (install
-                    <span class="font-mono">cargo-llvm-cov</span>; may need
+                    once with <span class="font-mono">cargo install cargo-llvm-cov</span>; may need
                     <span class="font-mono">rustup component add llvm-tools-preview</span>)
                   </td>
                 </tr>
