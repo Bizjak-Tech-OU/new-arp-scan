@@ -25,7 +25,9 @@ mod linux_socket;
 #[cfg(target_os = "linux")]
 mod linux_system_call;
 
-pub use application_command::{ApplicationCommand, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT};
+pub use application_command::{
+    ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
+};
 pub use application_outcome::ApplicationOutcome;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
@@ -38,9 +40,10 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 ///
 /// On Linux, [`ApplicationCommand::Scan`] performs address resolution scanning on the resolved
 /// interface and returns discovered hosts. The `timeout` field bounds the global receive window
-/// after the last request is sent; the `pacing` field sleeps after each target send except the
-/// last. When the scan command omits an interface name, the library selects an interface
-/// automatically only when exactly one usable interface exists.
+/// after the last request is sent; the `pacing` field sleeps after each full round of target
+/// sends except the last round; the `attempts` field is how many such rounds run. When the scan
+/// command omits an interface name, the library selects an interface automatically only when
+/// exactly one usable interface exists.
 ///
 /// On Linux, [`ApplicationCommand::UsableInterfacesList`] returns interfaces that pass the same
 /// usability rules as automatic scan selection.
@@ -56,14 +59,15 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 ///
 /// ```
 /// use new_arp_scan::{
-///     run, ApplicationCommand, AppError, ApplicationOutcome, DEFAULT_SCAN_PACING,
-///     DEFAULT_SCAN_TIMEOUT,
+///     run, ApplicationCommand, AppError, ApplicationOutcome, DEFAULT_SCAN_ATTEMPTS,
+///     DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
 /// };
 ///
 /// let outcome = run(ApplicationCommand::Scan {
 ///     interface_name: Some("eth0".to_string()),
 ///     timeout: DEFAULT_SCAN_TIMEOUT,
 ///     pacing: DEFAULT_SCAN_PACING,
+///     attempts: DEFAULT_SCAN_ATTEMPTS,
 /// });
 ///
 /// # #[cfg(not(target_os = "linux"))]
@@ -82,6 +86,7 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
             interface_name,
             timeout,
             pacing,
+            attempts,
         } => {
             if let Some(interface_name) = interface_name.as_deref() {
                 interface_validation::validate_interface_name_for_linux_packet_socket(
@@ -95,8 +100,12 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                     linux_interface_discovery::resolve_scan_interface_name(
                         interface_name.as_deref(),
                     )?;
-                let scan_outcome =
-                    linux_scanner::perform_arp_scan(&resolved_interface_name, timeout, pacing)?;
+                let scan_outcome = linux_scanner::perform_arp_scan(
+                    &resolved_interface_name,
+                    timeout,
+                    pacing,
+                    attempts,
+                )?;
                 Ok(ApplicationOutcome::Scan(scan_outcome))
             }
 
@@ -142,6 +151,7 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
 mod tests {
     use super::AppError;
     use super::ApplicationCommand;
+    use super::DEFAULT_SCAN_ATTEMPTS;
     use super::DEFAULT_SCAN_PACING;
     use super::DEFAULT_SCAN_TIMEOUT;
     use super::run;
@@ -154,6 +164,7 @@ mod tests {
             interface_name: Some(String::new()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -174,6 +185,7 @@ mod tests {
             interface_name: Some("eth0".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -194,6 +206,7 @@ mod tests {
             interface_name: Some("eth0".to_string()),
             timeout: std::time::Duration::from_secs(60),
             pacing: std::time::Duration::from_millis(999),
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -230,6 +243,7 @@ mod tests {
             interface_name: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -250,6 +264,7 @@ mod tests {
             interface_name: Some("lo".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -270,6 +285,7 @@ mod tests {
             interface_name: Some("lo".to_string()),
             timeout: std::time::Duration::from_millis(1),
             pacing: std::time::Duration::from_millis(5),
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -279,6 +295,29 @@ mod tests {
         assert!(
             matches!(outcome, Err(AppError::InterfaceRejectedForScanning { .. })),
             "custom scan timing must not bypass loopback rejection, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_rejection_when_scanning_loopback_on_linux_even_with_high_attempt_count() {
+        // Arrange
+        use std::num::NonZeroU64;
+
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("lo".to_string()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: NonZeroU64::new(99).expect("ninety-nine is non-zero"),
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InterfaceRejectedForScanning { .. })),
+            "high attempt count must not bypass loopback rejection, got: {outcome:?}"
         );
     }
 
@@ -323,6 +362,7 @@ mod tests {
             interface_name: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -360,6 +400,7 @@ mod tests {
             interface_name: Some(String::new()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act

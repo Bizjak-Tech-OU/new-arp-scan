@@ -28,7 +28,7 @@ pub struct DiscoveredHost {
 pub struct ScanOutcome {
     /// Hosts discovered during scanning, sorted by IPv4 ascending.
     pub discovered_hosts: Vec<DiscoveredHost>,
-    /// Non-fatal warnings (for example malformed frames or per-target send failures).
+    /// Non-fatal warnings (for example malformed frames, per-target send failures, or conflicting duplicate address resolution replies for the same IPv4).
     pub warnings: Vec<String>,
 }
 

@@ -26,6 +26,9 @@ fn main() {
                     interface_name: scan.interface_name,
                     timeout: Duration::from_millis(scan.timeout_milliseconds),
                     pacing: Duration::from_millis(scan.pacing_milliseconds),
+                    attempts: std::num::NonZeroU64::new(scan.attempts).expect(
+                        "clap should reject zero attempts before reaching the application run path",
+                    ),
                 }) {
                     Ok(outcome) => {
                         print_application_outcome(outcome);

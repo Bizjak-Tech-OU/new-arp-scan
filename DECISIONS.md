@@ -89,3 +89,11 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 **Reason:** GitHub issue #14 requires configurable timeout and pacing without abandoning the existing burst-send plus single receive-window model operators already rely on.
 
 **Consequences:** Library callers must supply explicit `Duration` values or the defaults; documentation and static site pages describe the new flags. Hermetic unit tests cover poll clamping, target ordering with the optional self-probe, and pacing gating without live sockets.
+
+## 2026-05-18 — Scan rounds, inter-round pacing, attempts, and duplicate reply warnings
+
+**Decision:** Extend [`ApplicationCommand::Scan`](src/application_command.rs) with `attempts: std::num::NonZeroU64` and public [`DEFAULT_SCAN_ATTEMPTS`](src/application_command.rs). Add CLI `--attempts` (minimum `1`, total scan rounds). Repurpose `--pacing-ms` to mean delay after each full round of target sends except the last round; keep `--timeout-ms` as the receive window after the final round. Implement round iteration in [`perform_arp_scan`](src/linux_scanner.rs). On conflicting address resolution replies for the same IPv4, keep the first media access control address and emit one warning per later conflicting reply.
+
+**Reason:** Operators need optional retransmission across the subnet without per-target pacing; total rounds with inter-round pacing matches the agreed product behavior. Duplicate-safe merging avoids unstable output when multiple replies disagree.
+
+**Consequences:** The 2026-05-17 “inter-target pacing” semantics are superseded: pacing is now strictly between rounds. Library callers pass `NonZeroU64` for `attempts` (or `DEFAULT_SCAN_ATTEMPTS`). README and static docs describe rounds, attempts, and conflict warnings.
