@@ -79,13 +79,16 @@ fn read_hardware_address_from_sockaddr(
     }
 
     let mut hardware_address_octets = [0u8; 6];
-    for (octet_index, octet) in hardware_address_octets.iter_mut().enumerate() {
-        // `libc` may use `c_char` (`i8`) or `u8` for `sa_data`; cast is a no-op on `u8` targets.
-        #[allow(clippy::unnecessary_cast)]
-        {
-            *octet = sockaddr.sa_data[octet_index] as u8;
-        }
-    }
+    let sockaddr_data_bytes = unsafe {
+        // SAFETY: `sa_data` is the fixed-size byte payload in the POSIX `sockaddr` ABI. Reading it
+        // as bytes preserves the kernel-provided address regardless of signed character exposure.
+        std::slice::from_raw_parts(
+            sockaddr.sa_data.as_ptr().cast::<u8>(),
+            sockaddr.sa_data.len(),
+        )
+    };
+    let hardware_address_length = hardware_address_octets.len();
+    hardware_address_octets.copy_from_slice(&sockaddr_data_bytes[..hardware_address_length]);
 
     let address = MacAddress::from_octets(hardware_address_octets);
     if address.is_zero() {
@@ -452,8 +455,13 @@ mod tests {
         let mut sockaddr: libc::sockaddr = unsafe { zeroed() };
         sockaddr.sa_family = libc::ARPHRD_ETHER;
         let expected_mac = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x12, 0x34];
-        for (index, byte) in expected_mac.iter().enumerate() {
-            sockaddr.sa_data[index] = *byte as _;
+        unsafe {
+            // SAFETY: `expected_mac` is six bytes, which fits inside `sockaddr.sa_data`.
+            std::ptr::copy_nonoverlapping(
+                expected_mac.as_ptr(),
+                sockaddr.sa_data.as_mut_ptr().cast::<u8>(),
+                expected_mac.len(),
+            );
         }
 
         // Act
