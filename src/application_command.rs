@@ -1,12 +1,16 @@
 //! Application commands accepted by [`crate::run`].
 
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// Default global receive window after the last address resolution request is sent.
 pub const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Default delay between sequential target sends (no pacing).
+/// Default delay between full scan rounds (no pacing between rounds).
 pub const DEFAULT_SCAN_PACING: Duration = Duration::ZERO;
+
+/// Default number of times each target address receives at least one address resolution request.
+pub const DEFAULT_SCAN_ATTEMPTS: NonZeroU64 = NonZeroU64::MIN;
 
 /// A command dispatched from the binary after command-line parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +22,10 @@ pub enum ApplicationCommand {
         interface_name: Option<String>,
         /// Global receive window after the final request transmission.
         timeout: Duration,
-        /// Delay after each target send except the last.
+        /// Delay after each full round of target sends except the last round.
         pacing: Duration,
+        /// Total request rounds: each round sends one broadcast request per target.
+        attempts: NonZeroU64,
     },
     /// List interfaces that are usable for ARP scanning on Linux.
     UsableInterfacesList,
@@ -27,7 +33,10 @@ pub enum ApplicationCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationCommand, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT};
+    use super::{
+        ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
+    };
+    use std::num::NonZeroU64;
     use std::time::Duration;
 
     #[test]
@@ -54,7 +63,21 @@ mod tests {
         assert_eq!(
             pacing,
             Duration::ZERO,
-            "default scan pacing should impose no delay between sends"
+            "default scan pacing should impose no delay between scan rounds"
+        );
+    }
+
+    #[test]
+    fn default_scan_attempts_is_one() {
+        // Arrange
+        // Act
+        let attempts = DEFAULT_SCAN_ATTEMPTS;
+
+        // Assert
+        assert_eq!(
+            attempts.get(),
+            1,
+            "default scan attempts should preserve historical single-round behavior"
         );
     }
 
@@ -65,11 +88,13 @@ mod tests {
             interface_name: Some("eth0".to_string()),
             timeout: Duration::from_millis(500),
             pacing: Duration::from_millis(1),
+            attempts: NonZeroU64::new(2).expect("two is non-zero"),
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
             timeout: Duration::from_millis(500),
             pacing: Duration::from_millis(1),
+            attempts: NonZeroU64::new(2).expect("two is non-zero"),
         };
 
         // Act
@@ -89,11 +114,13 @@ mod tests {
             interface_name: Some("eth0".to_string()),
             timeout: Duration::from_secs(1),
             pacing: Duration::ZERO,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
             timeout: Duration::from_secs(2),
             pacing: Duration::ZERO,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -113,11 +140,13 @@ mod tests {
             interface_name: Some("eth0".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: Duration::from_millis(1),
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: Duration::from_millis(2),
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -137,11 +166,13 @@ mod tests {
             interface_name: Some("eth0".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth1".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -161,11 +192,13 @@ mod tests {
             interface_name: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let explicit = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
         };
 
         // Act
@@ -175,6 +208,32 @@ mod tests {
         assert!(
             !equal,
             "automatic versus explicit interface selection should not compare equal"
+        );
+    }
+
+    #[test]
+    fn scan_command_variants_compare_unequal_when_attempts_differs() {
+        // Arrange
+        let first = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: NonZeroU64::new(1).expect("one is non-zero"),
+        };
+        let second = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: NonZeroU64::new(3).expect("three is non-zero"),
+        };
+
+        // Act
+        let equal = first == second;
+
+        // Assert
+        assert!(
+            !equal,
+            "scan commands with different attempts values must not compare equal"
         );
     }
 }

@@ -1,8 +1,8 @@
 //! Integration smoke tests for repository bootstrap.
 
 use new_arp_scan::{
-    AppError, ApplicationCommand, ApplicationOutcome, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
-    run,
+    AppError, ApplicationCommand, ApplicationOutcome, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,
+    DEFAULT_SCAN_TIMEOUT, run,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -13,6 +13,7 @@ fn run_scan_returns_unsupported_platform_on_non_linux() {
         interface_name: Some("eth0".to_string()),
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
+        attempts: DEFAULT_SCAN_ATTEMPTS,
     };
 
     // Act
@@ -75,6 +76,7 @@ fn run_scan_rejects_loopback_interface_on_linux() {
         interface_name: Some("lo".to_string()),
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
+        attempts: DEFAULT_SCAN_ATTEMPTS,
     };
 
     // Act

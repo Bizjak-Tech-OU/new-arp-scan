@@ -1,8 +1,10 @@
 //! Linux address resolution scanning orchestration.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::mem::zeroed;
 use std::net::Ipv4Addr;
+use std::num::NonZeroU64;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -47,20 +49,69 @@ fn ipv4_scan_target_address_sequence(
     targets
 }
 
-/// Returns whether pacing should run after the send at `send_index` (zero-based).
-fn should_apply_pacing_after_send(
-    send_index: usize,
-    total_sends: usize,
-    pacing_between_target_sends: Duration,
+/// Returns whether inter-round pacing should run after the round at `round_index` (zero-based).
+fn should_apply_pacing_after_scan_round(
+    round_index: u64,
+    total_rounds: u64,
+    pacing_between_scan_rounds: Duration,
 ) -> bool {
-    !pacing_between_target_sends.is_zero() && send_index.saturating_add(1) < total_sends
+    !pacing_between_scan_rounds.is_zero() && round_index.saturating_add(1) < total_rounds
+}
+
+/// Returns how many address resolution requests are sent for `target_count` targets over
+/// `scan_round_count` full rounds, or [`None`] when the product does not fit [`u64`].
+#[cfg(test)]
+fn total_address_resolution_request_send_count(
+    target_count: usize,
+    scan_round_count: NonZeroU64,
+) -> Option<u64> {
+    let target_count_u64 = u64::try_from(target_count).ok()?;
+    target_count_u64.checked_mul(scan_round_count.get())
+}
+
+/// Counts inter-round pacing sleeps implied by [`should_apply_pacing_after_scan_round`] for every
+/// zero-based round index in a scan.
+#[cfg(test)]
+fn inter_round_sleep_count_for_scan_schedule(
+    total_rounds: u64,
+    pacing_between_scan_rounds: Duration,
+) -> u64 {
+    if pacing_between_scan_rounds.is_zero() || total_rounds <= 1 {
+        return 0;
+    }
+    total_rounds - 1
+}
+
+/// Inserts or merges a sender IPv4 and Ethernet address from a parsed address resolution reply.
+///
+/// The first media access control address wins; later replies with a different address for the
+/// same IPv4 produce a warning and are ignored.
+fn merge_address_resolution_reply_sender_into_discovered_hosts(
+    discovered_hosts: &mut BTreeMap<Ipv4Addr, MacAddress>,
+    ipv4_address: Ipv4Addr,
+    media_access_control_address: MacAddress,
+    warnings: &mut Vec<String>,
+) {
+    match discovered_hosts.entry(ipv4_address) {
+        Entry::Vacant(entry) => {
+            entry.insert(media_access_control_address);
+        }
+        Entry::Occupied(entry) => {
+            let stored = *entry.get();
+            if stored != media_access_control_address {
+                warnings.push(format!(
+                    "conflicting address resolution reply for {ipv4_address}: keeping {stored}, ignoring {media_access_control_address}"
+                ));
+            }
+        }
+    }
 }
 
 /// Performs a full-subnet IPv4 address resolution scan on `interface_name`.
 ///
 /// `receive_timeout_after_last_request` bounds how long the scanner waits for replies after the
-/// last request is sent. `pacing_between_target_sends` is the delay after each send except the
-/// final one.
+/// last request is sent. `pacing_between_scan_rounds` is the delay after each full round of
+/// target sends except the final round. `scan_round_count` is how many such rounds run.
 ///
 /// # Errors
 ///
@@ -73,7 +124,8 @@ fn should_apply_pacing_after_send(
 pub fn perform_arp_scan(
     interface_name: &str,
     receive_timeout_after_last_request: Duration,
-    pacing_between_target_sends: Duration,
+    pacing_between_scan_rounds: Duration,
+    scan_round_count: NonZeroU64,
 ) -> Result<ScanOutcome, AppError> {
     let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
     let addresses = discover_interface_scan_addresses(interface_name)?;
@@ -112,19 +164,25 @@ pub fn perform_arp_scan(
         network_bits,
         broadcast_bits,
     );
-    let total_sends = targets.len();
+    let total_rounds = scan_round_count.get();
 
-    for (send_index, target_ipv4_address) in targets.iter().enumerate() {
-        send_one_address_resolution_request(
-            &packet_socket,
-            &link_layer_destination,
-            addresses.source_mac_address,
-            addresses.source_ipv4_address,
-            *target_ipv4_address,
-            &mut warnings,
-        );
-        if should_apply_pacing_after_send(send_index, total_sends, pacing_between_target_sends) {
-            thread::sleep(pacing_between_target_sends);
+    for round_index in 0..total_rounds {
+        for target_ipv4_address in &targets {
+            send_one_address_resolution_request(
+                &packet_socket,
+                &link_layer_destination,
+                addresses.source_mac_address,
+                addresses.source_ipv4_address,
+                *target_ipv4_address,
+                &mut warnings,
+            );
+        }
+        if should_apply_pacing_after_scan_round(
+            round_index,
+            total_rounds,
+            pacing_between_scan_rounds,
+        ) {
+            thread::sleep(pacing_between_scan_rounds);
         }
     }
 
@@ -232,9 +290,12 @@ fn drain_readable_packet_socket(
                             network_bits,
                             broadcast_bits,
                         ) {
-                            discovered_hosts
-                                .entry(sender_ipv4_address)
-                                .or_insert(sender_mac_address);
+                            merge_address_resolution_reply_sender_into_discovered_hosts(
+                                discovered_hosts,
+                                sender_ipv4_address,
+                                sender_mac_address,
+                                warnings,
+                            );
                         }
                     }
                     Err(reason) => {
@@ -473,49 +534,49 @@ mod ipv4_scan_target_address_sequence_tests {
 }
 
 #[cfg(test)]
-mod should_apply_pacing_after_send_tests {
-    use super::should_apply_pacing_after_send;
+mod should_apply_pacing_after_scan_round_tests {
+    use super::should_apply_pacing_after_scan_round;
     use std::time::Duration;
 
     #[test]
-    fn returns_true_when_more_sends_remain_and_pacing_is_nonzero() {
+    fn returns_true_when_more_rounds_remain_and_pacing_is_nonzero() {
         // Arrange
         let pacing = Duration::from_millis(5);
 
         // Act
-        let outcome = should_apply_pacing_after_send(0, 3, pacing);
+        let outcome = should_apply_pacing_after_scan_round(0, 3, pacing);
 
         // Assert
         assert!(
             outcome,
-            "pacing should apply between first and second send when pacing is nonzero"
+            "pacing should apply between first and second round when pacing is nonzero"
         );
     }
 
     #[test]
-    fn returns_false_on_final_send_even_when_pacing_is_nonzero() {
+    fn returns_false_on_final_round_even_when_pacing_is_nonzero() {
         // Arrange
         let pacing = Duration::from_millis(5);
 
         // Act
-        let outcome = should_apply_pacing_after_send(2, 3, pacing);
+        let outcome = should_apply_pacing_after_scan_round(2, 3, pacing);
 
         // Assert
-        assert!(!outcome, "pacing must not run after the final send");
+        assert!(!outcome, "pacing must not run after the final round");
     }
 
     #[test]
-    fn returns_false_when_only_one_send_is_planned() {
+    fn returns_false_when_only_one_round_is_planned() {
         // Arrange
         let pacing = Duration::from_millis(5);
 
         // Act
-        let outcome = should_apply_pacing_after_send(0, 1, pacing);
+        let outcome = should_apply_pacing_after_scan_round(0, 1, pacing);
 
         // Assert
         assert!(
             !outcome,
-            "single-target scan should not sleep after the only send"
+            "single-round scan should not sleep after the only round"
         );
     }
 
@@ -525,25 +586,329 @@ mod should_apply_pacing_after_send_tests {
         let pacing = Duration::ZERO;
 
         // Act
-        let outcome = should_apply_pacing_after_send(0, 5, pacing);
+        let outcome = should_apply_pacing_after_scan_round(0, 5, pacing);
 
         // Assert
         assert!(
             !outcome,
-            "zero pacing should never schedule sleeps between sends"
+            "zero pacing should never schedule sleeps between rounds"
         );
     }
 
     #[test]
-    fn returns_false_when_total_sends_is_zero_even_with_nonzero_pacing() {
+    fn returns_false_when_total_rounds_is_zero_even_with_nonzero_pacing() {
         // Arrange
         let pacing = Duration::from_millis(1);
 
         // Act
-        let outcome = should_apply_pacing_after_send(0, 0, pacing);
+        let outcome = should_apply_pacing_after_scan_round(0, 0, pacing);
 
         // Assert
-        assert!(!outcome, "empty send plan must not schedule pacing sleeps");
+        assert!(!outcome, "empty round plan must not schedule pacing sleeps");
+    }
+
+    #[test]
+    fn returns_true_for_middle_round_when_more_than_two_rounds_remain() {
+        // Arrange
+        let pacing = Duration::from_millis(1);
+
+        // Act
+        let outcome = should_apply_pacing_after_scan_round(1, 4, pacing);
+
+        // Assert
+        assert!(
+            outcome,
+            "middle rounds should still schedule pacing when more rounds follow"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scan_round_schedule_tests {
+    use super::{
+        inter_round_sleep_count_for_scan_schedule, should_apply_pacing_after_scan_round,
+        total_address_resolution_request_send_count,
+    };
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    #[test]
+    fn total_send_count_is_zero_when_target_count_is_zero() {
+        // Arrange
+        let rounds = NonZeroU64::new(5).expect("five is non-zero");
+
+        // Act
+        let outcome = total_address_resolution_request_send_count(0, rounds);
+
+        // Assert
+        assert_eq!(
+            outcome,
+            Some(0),
+            "empty target list should yield zero sends regardless of rounds"
+        );
+    }
+
+    #[test]
+    fn total_send_count_multiplies_targets_by_rounds() {
+        // Arrange
+        let rounds = NonZeroU64::new(4).expect("four is non-zero");
+
+        // Act
+        let outcome = total_address_resolution_request_send_count(7, rounds);
+
+        // Assert
+        assert_eq!(
+            outcome,
+            Some(28),
+            "seven targets across four rounds should schedule twenty-eight sends"
+        );
+    }
+
+    #[test]
+    fn total_send_count_returns_none_when_product_overflows_u64() {
+        // Arrange
+        let rounds = NonZeroU64::new(u64::MAX).expect("maximum is non-zero");
+
+        // Act
+        let outcome = total_address_resolution_request_send_count(2, rounds);
+
+        // Assert
+        assert_eq!(
+            outcome, None,
+            "overflowing send count should surface as None instead of wrapping"
+        );
+    }
+
+    #[test]
+    fn inter_round_sleep_count_matches_sum_of_pacing_gates_for_each_round_index() {
+        // Arrange
+        let pacing = Duration::from_nanos(1);
+
+        for total_rounds in 0_u64..=6_u64 {
+            // Act
+            let expected = inter_round_sleep_count_for_scan_schedule(total_rounds, pacing);
+            let summed = (0..total_rounds)
+                .filter(|&round_index| {
+                    should_apply_pacing_after_scan_round(round_index, total_rounds, pacing)
+                })
+                .count() as u64;
+
+            // Assert
+            assert_eq!(
+                summed, expected,
+                "aggregated pacing gates should match closed-form count for total_rounds={total_rounds}"
+            );
+        }
+    }
+
+    #[test]
+    fn inter_round_sleep_count_is_zero_when_pacing_is_zero_even_with_many_rounds() {
+        // Arrange
+        let pacing = Duration::ZERO;
+
+        // Act
+        let outcome = inter_round_sleep_count_for_scan_schedule(50, pacing);
+
+        // Assert
+        assert_eq!(
+            outcome, 0,
+            "zero pacing should never schedule sleeps between rounds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_address_resolution_reply_sender_into_discovered_hosts_tests {
+    use super::merge_address_resolution_reply_sender_into_discovered_hosts;
+    use crate::mac_address::MacAddress;
+    use std::collections::BTreeMap;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn inserts_first_reply_for_each_ipv4_address() {
+        // Arrange
+        let mut map = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+        let first_mac = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+
+        // Act
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            first_mac,
+            &mut warnings,
+        );
+
+        // Assert
+        assert_eq!(
+            map.get(&ip).copied(),
+            Some(first_mac),
+            "first reply should populate the table"
+        );
+        assert!(
+            warnings.is_empty(),
+            "first insert should not warn, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_identical_duplicate_replies_without_warning() {
+        // Arrange
+        let mut map = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+        let mac = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+
+        // Act
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            mac,
+            &mut warnings,
+        );
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            mac,
+            &mut warnings,
+        );
+
+        // Assert
+        assert_eq!(map.get(&ip).copied(), Some(mac));
+        assert!(
+            warnings.is_empty(),
+            "same media access control should not warn, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_first_mac_and_emits_warning_for_each_conflicting_duplicate() {
+        // Arrange
+        let mut map = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+        let first_mac = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let second_mac = MacAddress::from_octets([9, 8, 7, 6, 5, 4]);
+        let third_mac = MacAddress::from_octets([0xAA; 6]);
+
+        // Act
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            first_mac,
+            &mut warnings,
+        );
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            second_mac,
+            &mut warnings,
+        );
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            third_mac,
+            &mut warnings,
+        );
+
+        // Assert
+        assert_eq!(map.get(&ip).copied(), Some(first_mac));
+        assert_eq!(
+            warnings.len(),
+            2,
+            "each conflicting duplicate should warn once, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("conflicting") && warnings[0].contains("ignoring"),
+            "warning should describe conflict, got: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn tracks_independent_ipv4_addresses_without_cross_talk() {
+        // Arrange
+        let mut map = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let first_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let second_ip = Ipv4Addr::new(10, 0, 0, 3);
+        let first_mac = MacAddress::from_octets([1, 1, 1, 1, 1, 1]);
+        let second_mac = MacAddress::from_octets([2, 2, 2, 2, 2, 2]);
+
+        // Act
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            first_ip,
+            first_mac,
+            &mut warnings,
+        );
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            second_ip,
+            second_mac,
+            &mut warnings,
+        );
+
+        // Assert
+        assert_eq!(
+            map.len(),
+            2,
+            "two distinct IPv4 addresses should both be stored"
+        );
+        assert_eq!(map.get(&first_ip).copied(), Some(first_mac));
+        assert_eq!(map.get(&second_ip).copied(), Some(second_mac));
+        assert!(
+            warnings.is_empty(),
+            "independent first inserts should not warn, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn emits_separate_warning_each_time_the_same_conflicting_media_access_control_address_returns()
+    {
+        // Arrange
+        let mut map = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+        let first_mac = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let conflicting_mac = MacAddress::from_octets([9, 9, 9, 9, 9, 9]);
+
+        // Act
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            first_mac,
+            &mut warnings,
+        );
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            conflicting_mac,
+            &mut warnings,
+        );
+        merge_address_resolution_reply_sender_into_discovered_hosts(
+            &mut map,
+            ip,
+            conflicting_mac,
+            &mut warnings,
+        );
+
+        // Assert
+        assert_eq!(map.get(&ip).copied(), Some(first_mac));
+        assert_eq!(
+            warnings.len(),
+            2,
+            "repeated identical conflicting sender should still warn each time, got: {warnings:?}"
+        );
+        for (index, warning) in warnings.iter().enumerate() {
+            assert!(
+                warning.contains("10.0.0.5")
+                    && warning.contains("01:02:03:04:05:06")
+                    && warning.contains("09:09:09:09:09:09"),
+                "warning {index} should name the IPv4 and both media access control addresses, got: {warning}"
+            );
+        }
     }
 }
 

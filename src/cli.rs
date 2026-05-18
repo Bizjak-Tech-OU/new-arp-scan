@@ -14,8 +14,8 @@ EXAMPLES:
   Scan using automatic interface selection when exactly one usable interface exists:
     new-arp-scan scan
 
-  Scan with a custom receive window and pacing between sends (milliseconds):
-    new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10
+  Scan with a custom receive window, pacing between scan rounds, and multiple attempts:
+    new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10 --attempts 3
 ";
 
 /// Root command-line interface for `new-arp-scan`.
@@ -55,9 +55,17 @@ pub struct ScanArguments {
         default_value_t = 3000
     )]
     pub timeout_milliseconds: u64,
-    /// Milliseconds to sleep after each target send except the last.
+    /// Milliseconds to sleep after each full round of target sends except the last round.
     #[arg(long = "pacing-ms", value_name = "MILLISECONDS", default_value_t = 0)]
     pub pacing_milliseconds: u64,
+    /// Total scan rounds: each round sends one broadcast request per target (minimum 1).
+    #[arg(
+        long = "attempts",
+        value_name = "COUNT",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub attempts: u64,
 }
 
 #[cfg(test)]
@@ -92,6 +100,10 @@ mod tests {
                     scan.pacing_milliseconds, 0,
                     "omitted pacing should use default milliseconds"
                 );
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -125,6 +137,10 @@ mod tests {
                     scan.pacing_milliseconds, 0,
                     "omitted pacing should use default milliseconds"
                 );
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -156,6 +172,10 @@ mod tests {
                 assert_eq!(
                     scan.pacing_milliseconds, 0,
                     "omitted pacing should use default milliseconds"
+                );
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
                 );
             }
             super::CliSubcommand::Interfaces => {
@@ -238,6 +258,44 @@ mod tests {
                     "explicit timeout should parse"
                 );
                 assert_eq!(scan.pacing_milliseconds, 12, "explicit pacing should parse");
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_explicit_attempts_alongside_timing_flags() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--timeout-ms",
+            "4000",
+            "--pacing-ms",
+            "7",
+            "--attempts",
+            "8",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.timeout_milliseconds, 4000);
+                assert_eq!(scan.pacing_milliseconds, 7);
+                assert_eq!(scan.attempts, 8);
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -347,12 +405,19 @@ mod tests {
 
         // Assert
         assert!(
-            help.contains("--timeout-ms") && help.contains("--pacing-ms"),
-            "scan long help should name timing flags, got:\n{help}"
+            help.contains("--timeout-ms")
+                && help.contains("--pacing-ms")
+                && help.contains("--attempts"),
+            "scan long help should name timing and attempts flags, got:\n{help}"
         );
         assert!(
             help.contains("3000"),
             "scan long help should document default timeout milliseconds, got:\n{help}"
+        );
+        let lower = help.to_lowercase();
+        assert!(
+            lower.contains("round"),
+            "scan long help should describe pacing as between scan rounds, got:\n{help}"
         );
     }
 
@@ -379,6 +444,10 @@ mod tests {
                 assert_eq!(
                     scan.timeout_milliseconds, 0,
                     "explicit zero timeout should parse as immediate poll loop"
+                );
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
                 );
             }
             super::CliSubcommand::Interfaces => {
@@ -409,6 +478,10 @@ mod tests {
                     scan.timeout_milliseconds,
                     u64::MAX,
                     "maximum u64 timeout should parse for library clamping downstream"
+                );
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
                 );
             }
             super::CliSubcommand::Interfaces => {
@@ -483,11 +556,88 @@ mod tests {
             super::CliSubcommand::Scan(scan) => {
                 assert_eq!(scan.timeout_milliseconds, 1);
                 assert_eq!(scan.pacing_milliseconds, 0);
+                assert_eq!(
+                    scan.attempts, 1,
+                    "omitted attempts should use default count"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
             }
         }
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_explicit_attempts_count() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--attempts",
+            "4",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.attempts, 4, "explicit attempts should parse");
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_scan_subcommand_receives_zero_attempts() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--attempts", "0"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "zero attempts should fail parsing, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_scan_subcommand_receives_duplicate_attempts_flags() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--attempts", "2", "--attempts", "3"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "duplicate attempts flags should be rejected to avoid ambiguous operator intent, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_scan_subcommand_receives_non_numeric_attempts() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--attempts", "x"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "non-numeric attempts should fail parsing, got: {outcome:?}"
+        );
     }
 
     #[test]
