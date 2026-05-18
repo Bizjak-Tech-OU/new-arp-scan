@@ -74,10 +74,16 @@ pub(crate) fn copy_interface_name_to_ifreq(
         });
     }
 
-    for (index, byte) in bytes.iter().enumerate() {
-        // `libc` may expose `ifr_name` as either `c_char` (`i8`) or `u8` depending on the target
-        // and crate version; `as _` assigns the correct representation in both cases.
-        request.ifr_name[index] = *byte as _;
+    request.ifr_name = [0; INTERFACE_NAME_BUFFER_SIZE];
+    unsafe {
+        // SAFETY: `bytes.len()` is strictly less than `INTERFACE_NAME_BUFFER_SIZE`, so the copy
+        // fits inside `ifr_name`. Viewing the destination as bytes preserves the kernel ABI layout
+        // whether `libc` exposes the field as signed or unsigned characters.
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            request.ifr_name.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
     }
 
     Ok(())
@@ -213,10 +219,17 @@ mod copy_interface_name_to_ifreq_linux_tests {
             .expect("two-byte name should copy into ifreq");
 
         // Assert
-        assert_eq!(request.ifr_name[0], b'a' as libc::c_char);
-        assert_eq!(request.ifr_name[1], b'b' as libc::c_char);
+        let request_name_bytes = unsafe {
+            // SAFETY: `ifr_name` is a fixed-size byte buffer in the Linux `ifreq` ABI.
+            std::slice::from_raw_parts(
+                request.ifr_name.as_ptr().cast::<u8>(),
+                request.ifr_name.len(),
+            )
+        };
+        assert_eq!(request_name_bytes[0], b'a');
+        assert_eq!(request_name_bytes[1], b'b');
         assert_eq!(
-            request.ifr_name[2], 0,
+            request_name_bytes[2], 0,
             "copy should not write past the final interface name byte; remainder stays zero-filled"
         );
     }
