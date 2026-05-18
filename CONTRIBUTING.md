@@ -31,7 +31,7 @@ If you believe `unsafe` is required, record the architectural justification in `
 
 - Use **`Result` and `?`** for recoverable failures in library code. Do not use `unwrap()` or `expect()` in production paths.
 - `expect()` is acceptable **only** in tests and in `main.rs` when the program cannot proceed (and the message must explain the invariant, not repeat the failure).
-- Extend [`AppError`](src/error.rs) with new variants when behaviour warrants it; avoid stringly-typed errors for control flow.
+- Extend [`AppError`](src/error.rs) with new variants when behavior warrants it; avoid stringly-typed errors for control flow.
 - Every fallible **public** function’s documentation must include an **`# Errors`** section describing which variants callers should handle.
 
 ## Dependencies
@@ -45,7 +45,7 @@ If you believe `unsafe` is required, record the architectural justification in `
 - **Business logic** must be tested (unit tests beside the code, integration tests under `tests/` against the public library application programming interface).
 - Follow **Arrange, Act, Assert** structure with a blank line between phases.
 - Name tests as **full sentences** in `snake_case` describing the scenario.
-- Cover **positive**, **negative**, and **adversarial** cases for behaviour that matters; do not assert only `is_ok()` / `is_err()` without inspecting the outcome.
+- Cover **positive**, **negative**, and **adversarial** cases for behavior that matters; do not assert only `is_ok()` / `is_err()` without inspecting the outcome.
 - Avoid tests that depend on the network, uncontrollable global state, or the real filesystem except behind isolation helpers approved in `DECISIONS.md`.
 - Public functions require **documentation examples** that compile (`cargo test` runs them).
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Documentation — new-arp-scan</title>
-    <meta name="description" content="Usage, requirements, and behaviour of the new-arp-scan ARP discovery tool." />
+    <meta name="description" content="Usage, requirements, and behavior of the new-arp-scan ARP discovery tool." />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -86,7 +86,7 @@
         <h1 class="font-mono text-2xl font-semibold tracking-tight sm:text-3xl">Documentation</h1>
         <p class="mt-2 text-zinc-600 dark:text-zinc-400">
           Reference for the <span class="font-mono text-zinc-800 dark:text-zinc-200">new-arp-scan</span> CLI and
-          library behaviour (from the project README and repository).
+          library behavior (from the project README and repository).
         </p>
 
         <nav class="mt-10 border-y border-zinc-200 py-6 dark:border-zinc-800">
@@ -97,7 +97,7 @@
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#permissions">Permissions</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#commands">Commands</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#examples">Examples</a></li>
-            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#scan-behaviour">Scan behaviour</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#scan-behavior">Scan behavior</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#output">Output</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#library">Library API</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#verification">Verification</a></li>
@@ -208,8 +208,8 @@ new-arp-scan scan
 new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10</code></pre>
         </section>
 
-        <section id="scan-behaviour" class="mt-12 scroll-mt-20">
-          <h2 class="font-mono text-lg font-semibold">Scan behaviour</h2>
+        <section id="scan-behavior" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Scan behavior</h2>
           <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
             <li>
               Target addresses come from the selected interface’s IPv4 address and netmask. The scanner excludes the
@@ -297,7 +297,7 @@ new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10</code></pre>
             For a full acceptance check on hardware you control, build the binary and run a privileged scan such as
             <span class="font-mono">sudo ./target/debug/new-arp-scan scan --interface eth0</span>. Compare default runs
             with custom <span class="font-mono">--timeout-ms</span> and <span class="font-mono">--pacing-ms</span>
-            values to confirm timing behaviour for your network.
+            values to confirm timing behavior for your network.
           </p>
         </section>
 

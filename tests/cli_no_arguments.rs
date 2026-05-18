@@ -1,4 +1,4 @@
-//! Integration tests for command-line behaviour when no arguments are supplied.
+//! Integration tests for command-line behavior when no arguments are supplied.
 
 use std::path::PathBuf;
 
