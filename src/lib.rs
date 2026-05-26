@@ -29,6 +29,9 @@ pub use application_command::{
     ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
 };
 pub use application_outcome::ApplicationOutcome;
+pub use application_outcome::DiscoveredHost;
+pub use application_outcome::ScanOutcome;
+pub use application_outcome::ScanTimingSummary;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
 pub use error::AppError;
@@ -49,7 +52,9 @@ pub use linux_scanner::perform_arp_probe;
 /// window after the last request is sent; the `pacing` field sleeps after each full round of target
 /// sends except the last round; the `attempts` field is how many such rounds run. When the scan
 /// command omits an interface name, the library selects an interface automatically only when
-/// exactly one usable interface exists.
+/// exactly one usable interface exists. On Linux, successful scans populate
+/// [`application_outcome::ScanOutcome::timing_summary`] with wall-clock timing, the resolved
+/// interface name, round count, and discovered host count for operator-facing summaries.
 ///
 /// On Linux, [`ApplicationCommand::UsableInterfacesList`] returns interfaces that pass the same
 /// usability rules as automatic scan selection.
@@ -108,6 +113,7 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                     linux_interface_discovery::resolve_scan_interface_name(
                         interface_name.as_deref(),
                     )?;
+                let scan_wall_clock_started = std::time::Instant::now();
                 let scan_outcome = match target_ipv4_address {
                     Some(target_ipv4_address) => linux_scanner::perform_arp_probe(
                         &resolved_interface_name,
@@ -123,6 +129,11 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                         attempts,
                     )?,
                 };
+                let scan_outcome = scan_outcome.with_scan_timing_summary(
+                    resolved_interface_name,
+                    scan_wall_clock_started.elapsed(),
+                    attempts,
+                );
                 Ok(ApplicationOutcome::Scan(scan_outcome))
             }
 
@@ -407,6 +418,7 @@ mod tests {
         let scan = super::application_outcome::ScanOutcome {
             discovered_hosts: vec![host],
             warnings: vec!["fixture warning".to_string()],
+            timing_summary: None,
         };
 
         // Act

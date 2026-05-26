@@ -21,10 +21,21 @@ fn run_scan_returns_unsupported_platform_on_non_linux() {
     let outcome = run(command);
 
     // Assert
-    assert!(
-        matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-        "public scan API should report unsupported platform on non-linux, got: {outcome:?}"
-    );
+    match outcome {
+        Err(AppError::UnsupportedPlatform { operating_system }) => {
+            assert_eq!(
+                operating_system,
+                std::env::consts::OS,
+                "unsupported platform error should name the actual host operating system"
+            );
+        }
+        Ok(value) => {
+            panic!("expected unsupported platform error, got success: {value:?}");
+        }
+        Err(other) => {
+            panic!("expected unsupported platform error, got: {other:?}");
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -37,10 +48,21 @@ fn run_usable_interfaces_list_returns_unsupported_platform_on_non_linux() {
     let outcome = run(command);
 
     // Assert
-    assert!(
-        matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-        "public interfaces list API should report unsupported platform on non-linux, got: {outcome:?}"
-    );
+    match outcome {
+        Err(AppError::UnsupportedPlatform { operating_system }) => {
+            assert_eq!(
+                operating_system,
+                std::env::consts::OS,
+                "unsupported platform error should name the actual host operating system"
+            );
+        }
+        Ok(value) => {
+            panic!("expected unsupported platform error, got success: {value:?}");
+        }
+        Err(other) => {
+            panic!("expected unsupported platform error, got: {other:?}");
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -85,8 +107,25 @@ fn run_scan_rejects_loopback_interface_on_linux() {
     let outcome = run(command);
 
     // Assert
-    assert!(
-        matches!(outcome, Err(AppError::InterfaceRejectedForScanning { .. })),
-        "public scan API should reject loopback before raw socket, got: {outcome:?}"
-    );
+    match outcome {
+        Err(AppError::InterfaceRejectedForScanning {
+            interface_name,
+            reason,
+        }) => {
+            assert_eq!(
+                interface_name, "lo",
+                "rejection should name the loopback interface the operator selected"
+            );
+            assert!(
+                reason.to_ascii_lowercase().contains("loopback"),
+                "rejection reason should mention loopback, got: {reason}"
+            );
+        }
+        Ok(value) => {
+            panic!("expected loopback rejection, got success: {value:?}");
+        }
+        Err(other) => {
+            panic!("expected loopback rejection, got: {other:?}");
+        }
+    }
 }

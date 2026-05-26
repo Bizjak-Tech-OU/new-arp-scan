@@ -2,7 +2,8 @@
 
 - For substantial or multi-issue work, investigate the full codebase and official documentation, follow project Cursor rules, and ask clarifying questions until the scope is unambiguous before implementing.
 - When executing an attached implementation plan, do not edit the plan file itself; use existing todos (mark them in progress and complete them) instead of creating duplicate todo lists.
-- Prefer standard-library-only CLI argument parsing; do not add third-party parser dependencies unless explicitly approved for the project or task, and record any approved parser in `DECISIONS.md`.
+- CLI parsing uses the approved `clap` dependency (`DECISIONS.md`); do not remove `clap` or migrate to `std::env::args` unless the user explicitly requests it.
+- After substantial feature work, when asked, run a self-correction pass: critically review tests for gaps, improve tests until satisfied, and verify coverage meets project requirements (constitution and `testing.mdc`).
 - When changing developer workflow commands, update the `Makefile` and the matching documentation together so they stay aligned.
 
 ## Learned Workspace Facts
@@ -17,6 +18,8 @@
 - Newer stable Rust toolchains paired with recent `libc` releases can change whether fields such as `ifreq.ifr_name` and `sockaddr.sa_data` expose `c_char` or `u8` elements; portable code should coerce through `as _` (or equivalent) instead of assuming signed octets indefinitely.
 - Non-interactive `cargo llvm-cov` runs should install `llvm-tools-preview` first (`rustup component add llvm-tools-preview`) so coverage does not block on an interactive toolchain install prompt.
 - Beyond the two known environment-sensitive tests, Linux tests that open `AF_INET` datagram or raw sockets can fail with permission denied in locked-down sandboxes; rerun outside those restrictions when validating the full suite.
+- CLI scan targets derive from the selected interface's IPv4 address and netmask, with optional `--host` for a single address; there is no `--cidr` flag (`Ipv4Cidr` is library-only).
+- Process exit codes are minimal: `0` success, `1` for `AppError`/operational failure, `2` for clap usage errors; after a successful `scan`, the binary prints host lines (or `no hosts found`) on standard output, then one `scan complete: interface …` timing summary line on standard error.
 
 ## Cursor Cloud specific instructions
 
