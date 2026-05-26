@@ -29,7 +29,7 @@ From the repository root:
 cargo build
 ```
 
-The debug binary is `target/debug/new-arp-scan`. The Makefile `build` target runs `cargo clean` first; for everyday work, prefer plain **`cargo build`** to avoid a full rebuild every time (see [AGENTS.md](../AGENTS.md) Cursor Cloud notes).
+The debug binary is `target/debug/new-arp-scan`. The Makefile `build` target runs `cargo clean` then `cargo build --release` (binary at `target/release/new-arp-scan`); for everyday work, prefer plain **`cargo build`** to avoid a full rebuild every time (see [AGENTS.md](../AGENTS.md) Cursor Cloud notes).
 
 ---
 

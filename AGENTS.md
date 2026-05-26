@@ -12,7 +12,7 @@
 - Roadmap and issue planning are driven from repository `issues.md` alongside GitHub issues and milestones.
 - The `Makefile` `lint` target runs `cargo fmt --all` and then `cargo clippy --all-targets -- -D warnings`.
 - The `Makefile` `test` target runs `cargo test` and then `cargo test --tests`.
-- The `Makefile` `build` target depends on `clean`, so `cargo clean` runs before `cargo build`.
+- The `Makefile` `build` target depends on `clean`, so `cargo clean` runs before `cargo build --release`.
 - The `Makefile` `coverage` target runs `cargo llvm-cov --all-targets --summary-only` (requires `cargo install cargo-llvm-cov` once on the machine).
 - When decoding IPv4 addresses returned in `sockaddr_in` from Linux `ioctl`, read the four octets stored at `sin_addr.s_addr` in wire order as laid out by the kernel; using `s_addr.to_be_bytes()` on little-endian hosts can permute octets and make valid contiguous netmasks look invalid.
 - Newer stable Rust toolchains paired with recent `libc` releases can change whether fields such as `ifreq.ifr_name` and `sockaddr.sa_data` expose `c_char` or `u8` elements; portable code should coerce through `as _` (or equivalent) instead of assuming signed octets indefinitely.

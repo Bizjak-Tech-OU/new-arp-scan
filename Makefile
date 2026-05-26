@@ -1,7 +1,7 @@
 .PHONY: build test lint clean coverage
 
 build: clean
-	cargo build
+	cargo build --release
 
 test:
 	cargo test
