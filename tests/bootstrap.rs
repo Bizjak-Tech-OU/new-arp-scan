@@ -11,6 +11,7 @@ fn run_scan_returns_unsupported_platform_on_non_linux() {
     // Arrange
     let command = ApplicationCommand::Scan {
         interface_name: Some("eth0".to_string()),
+        target_ipv4_address: None,
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
         attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -74,6 +75,7 @@ fn run_scan_rejects_loopback_interface_on_linux() {
     // Arrange
     let command = ApplicationCommand::Scan {
         interface_name: Some("lo".to_string()),
+        target_ipv4_address: None,
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
         attempts: DEFAULT_SCAN_ATTEMPTS,

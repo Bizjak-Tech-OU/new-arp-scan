@@ -51,8 +51,9 @@ fn binary_scan_help_exits_successfully_and_mentions_interface_flag() {
             && stdout.contains("--timeout-ms")
             && stdout.contains("--pacing-ms")
             && stdout.contains("--attempts")
+            && stdout.contains("--host")
             && lower.contains("millisecond")
             && lower.contains("round"),
-        "scan help should document interface, timing, attempts flags with millisecond and inter-round pacing semantics, got: {stdout}"
+        "scan help should document interface, host, timing, attempts flags with millisecond and inter-round pacing semantics, got: {stdout}"
     );
 }

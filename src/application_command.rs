@@ -1,5 +1,6 @@
 //! Application commands accepted by [`crate::run`].
 
+use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ pub enum ApplicationCommand {
         /// Operating system name of the network interface (for example `eth0`), or [`None`] to
         /// select automatically when exactly one usable interface exists.
         interface_name: Option<String>,
+        /// When set, probe only this IPv4 address (strictly interior on the interface subnet).
+        target_ipv4_address: Option<Ipv4Addr>,
         /// Global receive window after the final request transmission.
         timeout: Duration,
         /// Delay after each full round of target sends except the last round.
@@ -86,12 +89,14 @@ mod tests {
         // Arrange
         let first = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: Duration::from_millis(500),
             pacing: Duration::from_millis(1),
             attempts: NonZeroU64::new(2).expect("two is non-zero"),
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: Duration::from_millis(500),
             pacing: Duration::from_millis(1),
             attempts: NonZeroU64::new(2).expect("two is non-zero"),
@@ -112,12 +117,14 @@ mod tests {
         // Arrange
         let first = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: Duration::from_secs(1),
             pacing: Duration::ZERO,
             attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: Duration::from_secs(2),
             pacing: Duration::ZERO,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -138,12 +145,14 @@ mod tests {
         // Arrange
         let first = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: Duration::from_millis(1),
             attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: Duration::from_millis(2),
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -164,12 +173,14 @@ mod tests {
         // Arrange
         let first = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth1".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -190,12 +201,14 @@ mod tests {
         // Arrange
         let automatic = ApplicationCommand::Scan {
             interface_name: None,
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
         };
         let explicit = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -216,12 +229,14 @@ mod tests {
         // Arrange
         let first = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(1).expect("one is non-zero"),
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(3).expect("three is non-zero"),
@@ -234,6 +249,96 @@ mod tests {
         assert!(
             !equal,
             "scan commands with different attempts values must not compare equal"
+        );
+    }
+
+    #[test]
+    fn scan_command_variants_compare_unequal_when_target_ipv4_address_differs() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let subnet_only = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+        let single_target = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(192, 168, 1, 50)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let equal = subnet_only == single_target;
+
+        // Assert
+        assert!(
+            !equal,
+            "scan commands with different target IPv4 addresses must not compare equal"
+        );
+    }
+
+    #[test]
+    fn scan_command_variants_compare_equal_when_target_ipv4_address_is_some_on_both_sides() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let first = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(10, 0, 0, 7)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+        let second = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(10, 0, 0, 7)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let equal = first == second;
+
+        // Assert
+        assert!(
+            equal,
+            "scan commands with identical non-None targets should compare equal"
+        );
+    }
+
+    #[test]
+    fn scan_command_variants_compare_unequal_when_both_targets_are_some_but_ipv4_differs() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let first = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+        let second = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let equal = first == second;
+
+        // Assert
+        assert!(
+            !equal,
+            "scan commands with different Some targets must not compare equal"
         );
     }
 }

@@ -15,7 +15,9 @@ use crate::address_resolution_protocol::{
 use crate::application_outcome::{DiscoveredHost, ScanOutcome};
 use crate::error::AppError;
 use crate::ipv4_cidr::Ipv4HostAddressIterator;
-use crate::ipv4_subnet::ipv4_address_is_strictly_inside_subnet;
+use crate::ipv4_subnet::{
+    ipv4_address_is_strictly_inside_subnet, validate_strict_interior_scan_target_ipv4_address,
+};
 use crate::linux_interface_discovery::discover_interface_scan_addresses;
 use crate::linux_packet::{
     ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, SOCKET_ADDRESS_FAMILY_PACKET,
@@ -107,6 +109,138 @@ fn merge_address_resolution_reply_sender_into_discovered_hosts(
     }
 }
 
+fn ipv4_sender_is_probed_target(
+    sender_ipv4_address: Ipv4Addr,
+    source_ipv4_address: Ipv4Addr,
+    network_bits: u32,
+    broadcast_bits: u32,
+) -> bool {
+    sender_ipv4_address == source_ipv4_address
+        || ipv4_address_is_strictly_inside_subnet(sender_ipv4_address, network_bits, broadcast_bits)
+}
+
+/// Selects which address resolution reply senders are recorded during a receive phase.
+enum ArpReplyAcceptance {
+    /// Accept the interface address and any strictly interior subnet senders (full-subnet scan).
+    SubnetScope {
+        source_ipv4_address: Ipv4Addr,
+        network_bits: u32,
+        broadcast_bits: u32,
+    },
+    /// Accept only replies whose sender IPv4 equals the probed target.
+    ExactTarget { target_ipv4_address: Ipv4Addr },
+}
+
+impl ArpReplyAcceptance {
+    fn accepts_sender_ipv4_address(&self, sender_ipv4_address: Ipv4Addr) -> bool {
+        match self {
+            ArpReplyAcceptance::SubnetScope {
+                source_ipv4_address,
+                network_bits,
+                broadcast_bits,
+            } => ipv4_sender_is_probed_target(
+                sender_ipv4_address,
+                *source_ipv4_address,
+                *network_bits,
+                *broadcast_bits,
+            ),
+            ArpReplyAcceptance::ExactTarget {
+                target_ipv4_address,
+            } => sender_ipv4_address == *target_ipv4_address,
+        }
+    }
+}
+
+fn link_layer_broadcast_destination_for_arp(
+    interface_name: &str,
+    interface_index: libc::c_uint,
+) -> Result<SockAddressLinkLayer, AppError> {
+    let mut link_layer_destination: SockAddressLinkLayer = unsafe { zeroed() };
+    link_layer_destination.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
+    link_layer_destination.link_layer_protocol =
+        ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+    link_layer_destination.interface_index =
+        libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
+            interface_name: interface_name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("interface index {interface_index} does not fit sockaddr_ll"),
+            ),
+        })?;
+    link_layer_destination.hardware_type = ARP_HARDWARE_TYPE_ETHERNET;
+    link_layer_destination.hardware_address_length = 6;
+    link_layer_destination.hardware_address[0..6].fill(0xFF);
+    Ok(link_layer_destination)
+}
+
+fn run_address_resolution_request_rounds(
+    packet_socket: &std::os::fd::OwnedFd,
+    link_layer_destination: &SockAddressLinkLayer,
+    target_ipv4_addresses: &[Ipv4Addr],
+    source_identity: (MacAddress, Ipv4Addr),
+    scan_round_count: NonZeroU64,
+    pacing_between_scan_rounds: Duration,
+    warnings: &mut Vec<String>,
+) {
+    let total_rounds = scan_round_count.get();
+    let (source_mac_address, source_ipv4_address) = source_identity;
+    for round_index in 0..total_rounds {
+        for target_ipv4_address in target_ipv4_addresses {
+            send_one_address_resolution_request(
+                packet_socket,
+                link_layer_destination,
+                source_mac_address,
+                source_ipv4_address,
+                *target_ipv4_address,
+                warnings,
+            );
+        }
+        if should_apply_pacing_after_scan_round(
+            round_index,
+            total_rounds,
+            pacing_between_scan_rounds,
+        ) {
+            thread::sleep(pacing_between_scan_rounds);
+        }
+    }
+}
+
+fn collect_address_resolution_replies_until_deadline(
+    packet_socket: &std::os::fd::OwnedFd,
+    receive_buffer: &mut [u8],
+    deadline: Instant,
+    reply_acceptance: &ArpReplyAcceptance,
+    warnings: &mut Vec<String>,
+) -> Result<BTreeMap<Ipv4Addr, MacAddress>, AppError> {
+    let mut discovered_hosts: BTreeMap<Ipv4Addr, MacAddress> = BTreeMap::new();
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_milliseconds = poll_timeout_milliseconds_for_receive_wait(remaining);
+
+        match linux_system_call::poll_socket_readiness(
+            packet_socket,
+            libc::POLLIN,
+            timeout_milliseconds,
+        ) {
+            Ok(0) => {}
+            Ok(_) => {
+                drain_readable_packet_socket(
+                    packet_socket,
+                    receive_buffer,
+                    reply_acceptance,
+                    &mut discovered_hosts,
+                    warnings,
+                )?;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(AppError::PollWaitFailed { source });
+            }
+        }
+    }
+    Ok(discovered_hosts)
+}
+
 /// Performs a full-subnet IPv4 address resolution scan on `interface_name`.
 ///
 /// `receive_timeout_after_last_request` bounds how long the scanner waits for replies after the
@@ -139,22 +273,8 @@ pub fn perform_arp_scan(
     let broadcast_bits = network_bits | !mask_bits;
 
     let packet_socket = open_bound_raw_arp_packet_socket(interface_name)?;
-
-    let mut link_layer_destination: SockAddressLinkLayer = unsafe { zeroed() };
-    link_layer_destination.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
-    link_layer_destination.link_layer_protocol =
-        ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
-    link_layer_destination.interface_index =
-        libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
-            interface_name: interface_name.to_string(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("interface index {interface_index} does not fit sockaddr_ll"),
-            ),
-        })?;
-    link_layer_destination.hardware_type = ARP_HARDWARE_TYPE_ETHERNET;
-    link_layer_destination.hardware_address_length = 6;
-    link_layer_destination.hardware_address[0..6].fill(0xFF);
+    let link_layer_destination =
+        link_layer_broadcast_destination_for_arp(interface_name, interface_index)?;
 
     let mut warnings = Vec::new();
 
@@ -164,59 +284,129 @@ pub fn perform_arp_scan(
         network_bits,
         broadcast_bits,
     );
-    let total_rounds = scan_round_count.get();
-
-    for round_index in 0..total_rounds {
-        for target_ipv4_address in &targets {
-            send_one_address_resolution_request(
-                &packet_socket,
-                &link_layer_destination,
-                addresses.source_mac_address,
-                addresses.source_ipv4_address,
-                *target_ipv4_address,
-                &mut warnings,
-            );
-        }
-        if should_apply_pacing_after_scan_round(
-            round_index,
-            total_rounds,
-            pacing_between_scan_rounds,
-        ) {
-            thread::sleep(pacing_between_scan_rounds);
-        }
-    }
+    run_address_resolution_request_rounds(
+        &packet_socket,
+        &link_layer_destination,
+        &targets,
+        (addresses.source_mac_address, addresses.source_ipv4_address),
+        scan_round_count,
+        pacing_between_scan_rounds,
+        &mut warnings,
+    );
 
     let deadline = Instant::now() + receive_timeout_after_last_request;
-    let mut discovered_hosts: BTreeMap<Ipv4Addr, MacAddress> = BTreeMap::new();
     let mut receive_buffer = [0u8; 4096];
+    let reply_acceptance = ArpReplyAcceptance::SubnetScope {
+        source_ipv4_address: addresses.source_ipv4_address,
+        network_bits,
+        broadcast_bits,
+    };
+    let discovered_hosts = collect_address_resolution_replies_until_deadline(
+        &packet_socket,
+        &mut receive_buffer,
+        deadline,
+        &reply_acceptance,
+        &mut warnings,
+    )?;
 
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout_milliseconds = poll_timeout_milliseconds_for_receive_wait(remaining);
+    let hosts: Vec<DiscoveredHost> = discovered_hosts
+        .into_iter()
+        .map(
+            |(ipv4_address, media_access_control_address)| DiscoveredHost {
+                ipv4_address,
+                media_access_control_address,
+            },
+        )
+        .collect();
 
-        match linux_system_call::poll_socket_readiness(
-            &packet_socket,
-            libc::POLLIN,
-            timeout_milliseconds,
-        ) {
-            Ok(0) => {}
-            Ok(_) => {
-                drain_readable_packet_socket(
-                    &packet_socket,
-                    &mut receive_buffer,
-                    addresses.source_ipv4_address,
-                    network_bits,
-                    broadcast_bits,
-                    &mut discovered_hosts,
-                    &mut warnings,
-                )?;
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(source) => {
-                return Err(AppError::PollWaitFailed { source });
-            }
-        }
-    }
+    Ok(ScanOutcome {
+        discovered_hosts: hosts,
+        warnings,
+    })
+}
+
+/// Performs address resolution probing for a single strictly interior IPv4 target on
+/// `interface_name`.
+///
+/// Semantics match [`perform_arp_scan`] for timing: `receive_timeout_after_last_request` is the
+/// global receive window after the last request, `pacing_between_scan_rounds` sleeps between
+/// full send rounds except the last, and `scan_round_count` is how many rounds run. Only replies
+/// whose sender IPv4 equals `target_ipv4_address` are recorded.
+///
+/// # Errors
+///
+/// Returns [`AppError`] when the target is not strictly interior on the interface subnet, when
+/// interface discovery or socket setup fails, or when the receive poll loop fails fatally.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::Ipv4Addr;
+/// use std::num::NonZeroU64;
+/// use std::time::Duration;
+///
+/// # fn main() {
+/// #[cfg(target_os = "linux")]
+/// {
+///     let _: fn(
+///         &str,
+///         Ipv4Addr,
+///         Duration,
+///         Duration,
+///         NonZeroU64,
+///     ) -> Result<new_arp_scan::application_outcome::ScanOutcome, new_arp_scan::AppError> =
+///         new_arp_scan::perform_arp_probe;
+/// }
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn perform_arp_probe(
+    interface_name: &str,
+    target_ipv4_address: Ipv4Addr,
+    receive_timeout_after_last_request: Duration,
+    pacing_between_scan_rounds: Duration,
+    scan_round_count: NonZeroU64,
+) -> Result<ScanOutcome, AppError> {
+    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
+    let addresses = discover_interface_scan_addresses(interface_name)?;
+    validate_strict_interior_scan_target_ipv4_address(
+        interface_name,
+        target_ipv4_address,
+        addresses.source_ipv4_address,
+        addresses.ipv4_netmask,
+    )?;
+
+    let packet_socket = open_bound_raw_arp_packet_socket(interface_name)?;
+    let link_layer_destination =
+        link_layer_broadcast_destination_for_arp(interface_name, interface_index)?;
+
+    let mut warnings = Vec::new();
+    let targets = [target_ipv4_address];
+    run_address_resolution_request_rounds(
+        &packet_socket,
+        &link_layer_destination,
+        &targets,
+        (addresses.source_mac_address, addresses.source_ipv4_address),
+        scan_round_count,
+        pacing_between_scan_rounds,
+        &mut warnings,
+    );
+
+    let deadline = Instant::now() + receive_timeout_after_last_request;
+    let mut receive_buffer = [0u8; 4096];
+    let reply_acceptance = ArpReplyAcceptance::ExactTarget {
+        target_ipv4_address,
+    };
+    let discovered_hosts = collect_address_resolution_replies_until_deadline(
+        &packet_socket,
+        &mut receive_buffer,
+        deadline,
+        &reply_acceptance,
+        &mut warnings,
+    )?;
 
     let hosts: Vec<DiscoveredHost> = discovered_hosts
         .into_iter()
@@ -264,9 +454,7 @@ fn send_one_address_resolution_request(
 fn drain_readable_packet_socket(
     packet_socket: &std::os::fd::OwnedFd,
     receive_buffer: &mut [u8],
-    source_ipv4_address: Ipv4Addr,
-    network_bits: u32,
-    broadcast_bits: u32,
+    reply_acceptance: &ArpReplyAcceptance,
     discovered_hosts: &mut BTreeMap<Ipv4Addr, MacAddress>,
     warnings: &mut Vec<String>,
 ) -> Result<(), AppError> {
@@ -284,12 +472,7 @@ fn drain_readable_packet_socket(
                 let frame_slice = &receive_buffer[..bytes_received];
                 match try_parse_address_resolution_reply_ipv4_over_ethernet(frame_slice) {
                     Ok((sender_ipv4_address, sender_mac_address)) => {
-                        if ipv4_sender_is_probed_target(
-                            sender_ipv4_address,
-                            source_ipv4_address,
-                            network_bits,
-                            broadcast_bits,
-                        ) {
+                        if reply_acceptance.accepts_sender_ipv4_address(sender_ipv4_address) {
                             merge_address_resolution_reply_sender_into_discovered_hosts(
                                 discovered_hosts,
                                 sender_ipv4_address,
@@ -317,16 +500,6 @@ fn drain_readable_packet_socket(
     }
 
     Ok(())
-}
-
-fn ipv4_sender_is_probed_target(
-    sender_ipv4_address: Ipv4Addr,
-    source_ipv4_address: Ipv4Addr,
-    network_bits: u32,
-    broadcast_bits: u32,
-) -> bool {
-    sender_ipv4_address == source_ipv4_address
-        || ipv4_address_is_strictly_inside_subnet(sender_ipv4_address, network_bits, broadcast_bits)
 }
 
 #[cfg(test)]
@@ -995,6 +1168,77 @@ mod ipv4_sender_is_probed_target_tests {
         assert!(
             !outcome,
             "off-subnet senders should be ignored unless they equal the interface address"
+        );
+    }
+}
+
+#[cfg(test)]
+mod arp_reply_acceptance_tests {
+    use super::ArpReplyAcceptance;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn exact_target_accepts_only_matching_sender() {
+        // Arrange
+        let target = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target,
+        };
+
+        // Act
+        let match_outcome = acceptance.accepts_sender_ipv4_address(target);
+        let other_interior = acceptance.accepts_sender_ipv4_address(Ipv4Addr::new(192, 168, 1, 51));
+
+        // Assert
+        assert!(match_outcome, "exact target should accept matching sender");
+        assert!(
+            !other_interior,
+            "different interior sender should be ignored in exact-target mode"
+        );
+    }
+
+    #[test]
+    fn subnet_scope_matches_ipv4_sender_is_probed_target_rules() {
+        // Arrange
+        let network = Ipv4Addr::new(192, 168, 1, 0).to_bits();
+        let broadcast = Ipv4Addr::new(192, 168, 1, 255).to_bits();
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let acceptance = ArpReplyAcceptance::SubnetScope {
+            source_ipv4_address: source,
+            network_bits: network,
+            broadcast_bits: broadcast,
+        };
+
+        // Act
+        let interior = acceptance.accepts_sender_ipv4_address(Ipv4Addr::new(192, 168, 1, 20));
+
+        // Assert
+        assert!(
+            interior,
+            "subnet scope should accept interior senders like full scan"
+        );
+    }
+
+    #[test]
+    fn subnet_scope_rejects_sender_outside_local_subnet_when_not_equal_to_source() {
+        // Arrange
+        let network = Ipv4Addr::new(192, 168, 1, 0).to_bits();
+        let broadcast = Ipv4Addr::new(192, 168, 1, 255).to_bits();
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let acceptance = ArpReplyAcceptance::SubnetScope {
+            source_ipv4_address: source,
+            network_bits: network,
+            broadcast_bits: broadcast,
+        };
+
+        // Act
+        let outsider = Ipv4Addr::new(10, 0, 0, 1);
+        let outcome = acceptance.accepts_sender_ipv4_address(outsider);
+
+        // Assert
+        assert!(
+            !outcome,
+            "off-subnet sender should be rejected in subnet scope unless it equals the interface address"
         );
     }
 }

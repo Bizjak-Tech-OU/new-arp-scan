@@ -97,3 +97,11 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 **Reason:** Operators need optional retransmission across the subnet without per-target pacing; total rounds with inter-round pacing matches the agreed product behavior. Duplicate-safe merging avoids unstable output when multiple replies disagree.
 
 **Consequences:** The 2026-05-17 “inter-target pacing” semantics are superseded: pacing is now strictly between rounds. Library callers pass `NonZeroU64` for `attempts` (or `DEFAULT_SCAN_ATTEMPTS`). README and static docs describe rounds, attempts, and conflict warnings.
+
+## 2026-05-26 — Single-target ARP scan (`--host`) and `perform_arp_probe`
+
+**Decision:** Add optional CLI `--host <IPv4>` on `scan`, optional `target_ipv4_address: Option<std::net::Ipv4Addr>` on [`ApplicationCommand::Scan`](src/application_command.rs), and public [`perform_arp_probe`](src/linux_scanner.rs) on Linux (re-exported from the crate root). Refactor [`linux_scanner`](src/linux_scanner.rs) so subnet scans and probes share send and receive scheduling, with separate reply filtering for subnet-wide versus exact-target modes. Validate targets with [`validate_strict_interior_scan_target_ipv4_address`](src/ipv4_subnet.rs); reject invalid targets with [`AppError::SingleScanTargetRejected`](src/error.rs) before opening the raw socket. Keep “no hosts found”, exit success, and stderr warnings aligned with full-subnet scans when the probe times out.
+
+**Reason:** GitHub issue #24 requires an end-to-end single-address flow without duplicating packet logic; strict-interior validation matches full-scan interior rules and avoids ambiguous probes of network or broadcast addresses.
+
+**Consequences:** Operators and library callers can probe one interior host with the same `--timeout-ms`, `--pacing-ms`, and `--attempts` semantics as subnet scans. README, static docs, and CLI examples describe `--host` and the new error variant.
