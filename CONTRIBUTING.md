@@ -1,6 +1,8 @@
 # Contributing
 
-Thank you for contributing to **new-arp-scan**. This document records project-wide conventions that extend the Rust toolchain defaults and the expectations documented in this repository.
+Thank you for contributing to **new-arp-scan**. If you are new to the repository, start with **[docs/contributor-onboarding.md](docs/contributor-onboarding.md)** (toolchain, build, lint, tests), then read **[docs/architecture.md](docs/architecture.md)** for a map of the codebase and **[docs/linux-platform.md](docs/linux-platform.md)** if you touch Linux packet paths.
+
+This document records project-wide conventions that extend the Rust toolchain defaults and the expectations documented in this repository.
 
 ## Safety comments and `unsafe`
 

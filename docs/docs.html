@@ -93,6 +93,7 @@
           <p class="font-mono text-xs uppercase tracking-widest text-zinc-500">On this page</p>
           <ul class="mt-3 flex flex-col gap-2 text-sm text-zinc-600 dark:text-zinc-400">
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#overview">Overview</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#contributor-guides">Contributor guides</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#platform">Platform support</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#permissions">Permissions</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#commands">Commands</a></li>
@@ -115,6 +116,27 @@
             protocol discovery across the selected interface’s IPv4 subnet using raw
             <span class="font-mono">AF_PACKET</span> / <span class="font-mono">SOCK_RAW</span> sockets.
           </p>
+        </section>
+
+        <section id="contributor-guides" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Contributor guides</h2>
+          <p class="mt-3 leading-relaxed text-zinc-600 dark:text-zinc-400">
+            Markdown guides in the repository complement this page:
+          </p>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>
+              <a class="underline underline-offset-2" href="./contributor-onboarding.md">Contributor onboarding</a> —
+              toolchain, build, lint, tests, conventions summary
+            </li>
+            <li>
+              <a class="underline underline-offset-2" href="./architecture.md">Architecture overview</a> — module map,
+              <span class="font-mono">unsafe</span> boundaries, packet flow, testing strategy
+            </li>
+            <li>
+              <a class="underline underline-offset-2" href="./linux-platform.md">Linux platform support</a> —
+              <span class="font-mono">AF_PACKET</span>, capabilities, test environments, namespaces
+            </li>
+          </ul>
         </section>
 
         <section id="platform" class="mt-12 scroll-mt-20">

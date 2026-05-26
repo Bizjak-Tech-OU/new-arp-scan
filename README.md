@@ -55,4 +55,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Documentation
 
-Additional notes live under [docs/](docs/).
+Additional notes live under [docs/](docs/):
+
+| Guide | Audience |
+|-------|----------|
+| [Contributor onboarding](docs/contributor-onboarding.md) | First-time build, lint, test, and pull-request checklist |
+| [Architecture overview](docs/architecture.md) | Module map, `unsafe` boundaries, packet flow, testing strategy |
+| [Linux platform support](docs/linux-platform.md) | `AF_PACKET` / raw sockets, capabilities, CI vs local testing, namespaces |
+| [Operator reference (HTML)](docs/docs.html) | CLI behavior, output, and library overview (static site) |
