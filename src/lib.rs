@@ -36,11 +36,17 @@ pub use ipv4_cidr::Ipv4Cidr;
 pub use ipv4_cidr::Ipv4HostAddressIterator;
 pub use mac_address::{MacAddress, MacAddressParseError};
 
+#[cfg(target_os = "linux")]
+pub use linux_scanner::perform_arp_probe;
+
 /// Runs the application logic for a parsed [`ApplicationCommand`].
 ///
 /// On Linux, [`ApplicationCommand::Scan`] performs address resolution scanning on the resolved
-/// interface and returns discovered hosts. The `timeout` field bounds the global receive window
-/// after the last request is sent; the `pacing` field sleeps after each full round of target
+/// interface and returns discovered hosts. When `target_ipv4_address` is [`None`], the library
+/// scans the full interior host set for that interface subnet. When it is [`Some`], the library
+/// sends requests only for that address (which must be strictly interior on the subnet) and
+/// records replies only from that sender IPv4. The `timeout` field bounds the global receive
+/// window after the last request is sent; the `pacing` field sleeps after each full round of target
 /// sends except the last round; the `attempts` field is how many such rounds run. When the scan
 /// command omits an interface name, the library selects an interface automatically only when
 /// exactly one usable interface exists.
@@ -65,6 +71,7 @@ pub use mac_address::{MacAddress, MacAddressParseError};
 ///
 /// let outcome = run(ApplicationCommand::Scan {
 ///     interface_name: Some("eth0".to_string()),
+///     target_ipv4_address: None,
 ///     timeout: DEFAULT_SCAN_TIMEOUT,
 ///     pacing: DEFAULT_SCAN_PACING,
 ///     attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -84,6 +91,7 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
     match command {
         ApplicationCommand::Scan {
             interface_name,
+            target_ipv4_address,
             timeout,
             pacing,
             attempts,
@@ -100,12 +108,21 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                     linux_interface_discovery::resolve_scan_interface_name(
                         interface_name.as_deref(),
                     )?;
-                let scan_outcome = linux_scanner::perform_arp_scan(
-                    &resolved_interface_name,
-                    timeout,
-                    pacing,
-                    attempts,
-                )?;
+                let scan_outcome = match target_ipv4_address {
+                    Some(target_ipv4_address) => linux_scanner::perform_arp_probe(
+                        &resolved_interface_name,
+                        target_ipv4_address,
+                        timeout,
+                        pacing,
+                        attempts,
+                    )?,
+                    None => linux_scanner::perform_arp_scan(
+                        &resolved_interface_name,
+                        timeout,
+                        pacing,
+                        attempts,
+                    )?,
+                };
                 Ok(ApplicationOutcome::Scan(scan_outcome))
             }
 
@@ -158,10 +175,35 @@ mod tests {
 
     #[cfg(not(target_os = "linux"))]
     #[test]
+    fn returns_invalid_interface_name_when_interface_name_is_empty_on_non_linux_even_with_target() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let command = ApplicationCommand::Scan {
+            interface_name: Some(String::new()),
+            target_ipv4_address: Some(Ipv4Addr::new(1, 1, 1, 1)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InvalidInterfaceName { .. })),
+            "empty interface name should be rejected before platform checks even with a target, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
     fn returns_invalid_interface_name_when_interface_name_is_empty_on_non_linux() {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some(String::new()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -183,6 +225,7 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -204,6 +247,7 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
             timeout: std::time::Duration::from_secs(60),
             pacing: std::time::Duration::from_millis(999),
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -216,6 +260,30 @@ mod tests {
         assert!(
             matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
             "custom scan timing must not bypass unsupported platform handling, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn returns_unsupported_platform_when_scanning_on_non_linux_with_target_ipv4_address_set() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(9, 9, 9, 9)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
+            "non-linux hosts should reject scan before Linux-only probe dispatch, got: {outcome:?}"
         );
     }
 
@@ -241,6 +309,7 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: None,
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -262,6 +331,7 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("lo".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -283,6 +353,7 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("lo".to_string()),
+            target_ipv4_address: None,
             timeout: std::time::Duration::from_millis(1),
             pacing: std::time::Duration::from_millis(5),
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -306,6 +377,7 @@ mod tests {
 
         let command = ApplicationCommand::Scan {
             interface_name: Some("lo".to_string()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(99).expect("ninety-nine is non-zero"),
@@ -360,6 +432,7 @@ mod tests {
 
         let command = ApplicationCommand::Scan {
             interface_name: None,
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -398,6 +471,7 @@ mod tests {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some(String::new()),
+            target_ipv4_address: None,
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
@@ -410,6 +484,102 @@ mod tests {
         assert!(
             matches!(outcome, Err(AppError::InvalidInterfaceName { .. })),
             "empty interface name should be rejected before raw socket setup, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_rejection_when_scanning_loopback_on_linux_even_with_single_target_ipv4_address_set()
+    {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("lo".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InterfaceRejectedForScanning { .. })),
+            "loopback should be rejected before single-target validation, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_single_scan_target_rejected_when_probe_target_is_subnet_network_on_linux() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        use crate::linux_interface_discovery::enumerate_usable_arp_scan_interface_candidates;
+
+        let candidates = enumerate_usable_arp_scan_interface_candidates()
+            .expect("enumeration should succeed on Linux test hosts");
+        let Some(first) = candidates.first() else {
+            // No Ethernet+IPv4 usable interfaces in this environment (for example CI without a
+            // configured LAN): nothing to exercise against a real interface name.
+            return;
+        };
+        let mask_bits = first.ipv4_netmask.to_bits();
+        let network_ipv4_address =
+            Ipv4Addr::from_bits(first.source_ipv4_address.to_bits() & mask_bits);
+        let command = ApplicationCommand::Scan {
+            interface_name: Some(first.interface_name.clone()),
+            target_ipv4_address: Some(network_ipv4_address),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::SingleScanTargetRejected { .. })),
+            "network address as single target should be rejected before socket, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn returns_single_scan_target_rejected_when_probe_target_is_subnet_broadcast_on_linux() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        use crate::linux_interface_discovery::enumerate_usable_arp_scan_interface_candidates;
+
+        let candidates = enumerate_usable_arp_scan_interface_candidates()
+            .expect("enumeration should succeed on Linux test hosts");
+        let Some(first) = candidates.first() else {
+            // No usable interfaces in this environment: see network-address probe test.
+            return;
+        };
+        let mask_bits = first.ipv4_netmask.to_bits();
+        let network_bits = first.source_ipv4_address.to_bits() & mask_bits;
+        let broadcast_ipv4_address = Ipv4Addr::from_bits(network_bits | !mask_bits);
+        let command = ApplicationCommand::Scan {
+            interface_name: Some(first.interface_name.clone()),
+            target_ipv4_address: Some(broadcast_ipv4_address),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::SingleScanTargetRejected { .. })),
+            "broadcast address as single target should be rejected before socket, got: {outcome:?}"
         );
     }
 }

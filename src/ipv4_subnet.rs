@@ -100,11 +100,46 @@ pub fn ipv4_address_is_strictly_inside_subnet(
     candidate_bits > network_bits && candidate_bits < broadcast_bits
 }
 
+/// Ensures `target_ipv4_address` is a usable interior host on the subnet defined by the
+/// interface address and netmask (same rules as full-subnet scanning).
+///
+/// # Errors
+///
+/// Returns [`AppError::Ipv4NetmaskInvalid`] or [`AppError::Ipv4SubnetUnsupported`] from
+/// [`inclusive_host_address_range_excluding_edges`] when the subnet cannot be scanned.
+///
+/// Returns [`AppError::SingleScanTargetRejected`] when the target is not strictly between the
+/// network and broadcast addresses (for example network, broadcast, off-subnet, or the
+/// interface address when it lies on a subnet edge).
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn validate_strict_interior_scan_target_ipv4_address(
+    interface_name: &str,
+    target_ipv4_address: Ipv4Addr,
+    interface_ipv4_address: Ipv4Addr,
+    ipv4_netmask: Ipv4Addr,
+) -> Result<(), AppError> {
+    let (first_host_bits, last_host_bits) =
+        inclusive_host_address_range_excluding_edges(interface_ipv4_address, ipv4_netmask)?;
+    let target_bits = target_ipv4_address.to_bits();
+    if target_bits < first_host_bits || target_bits > last_host_bits {
+        return Err(AppError::SingleScanTargetRejected {
+            target_ipv4_address,
+            interface_name: interface_name.to_string(),
+            reason: "not a strictly interior host on the interface subnet".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::inclusive_host_address_range_excluding_edges;
     use super::ipv4_address_is_strictly_inside_subnet;
     use super::prefix_length_from_contiguous_netmask;
+    use super::validate_strict_interior_scan_target_ipv4_address;
     use crate::error::AppError;
     use std::net::Ipv4Addr;
 
@@ -291,6 +326,257 @@ mod tests {
         assert!(
             !broadcast_outcome,
             "broadcast address should not be strictly inside subnet"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_accepts_host_in_middle_of_slash_24() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 10);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            outcome.is_ok(),
+            "interior host should validate, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_rejects_network_address_on_slash_24() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 10);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = Ipv4Addr::new(192, 168, 1, 0);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("enp0s1", target, interface, netmask);
+
+        // Assert
+        match outcome {
+            Err(AppError::SingleScanTargetRejected {
+                target_ipv4_address,
+                interface_name,
+                reason,
+            }) => {
+                assert_eq!(
+                    target_ipv4_address,
+                    Ipv4Addr::new(192, 168, 1, 0),
+                    "error should carry the rejected target"
+                );
+                assert_eq!(
+                    interface_name, "enp0s1",
+                    "error should name the interface context"
+                );
+                assert!(
+                    reason.contains("strictly interior"),
+                    "reason should explain interior-host rule, got: {reason}"
+                );
+            }
+            other => {
+                panic!("expected SingleScanTargetRejected for network address, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn validate_strict_interior_rejects_broadcast_address_on_slash_24() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 10);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = Ipv4Addr::new(192, 168, 1, 255);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::SingleScanTargetRejected { .. })),
+            "broadcast address should be rejected, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_rejects_address_outside_subnet() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 10);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = Ipv4Addr::new(10, 0, 0, 1);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::SingleScanTargetRejected { .. })),
+            "off-subnet address should be rejected, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_propagates_subnet_unsupported_for_slash_31() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 0, 2, 0);
+        let netmask = Ipv4Addr::new(255, 255, 255, 254);
+        let target = Ipv4Addr::new(192, 0, 2, 1);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Ipv4SubnetUnsupported { .. })),
+            "/31 subnet should not support scanning host range, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_rejects_interface_address_on_subnet_edge() {
+        // Arrange: interface on .0 is not in the open host interval .1..=.254
+        let interface = Ipv4Addr::new(192, 168, 1, 0);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = interface;
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::SingleScanTargetRejected { .. })),
+            "subnet-edge interface address should not count as interior host, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_propagates_ipv4_netmask_invalid_when_netmask_is_non_contiguous() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 1);
+        let non_contiguous_netmask = Ipv4Addr::new(255, 0, 255, 0);
+        let target = Ipv4Addr::new(192, 168, 1, 2);
+
+        // Act
+        let outcome = validate_strict_interior_scan_target_ipv4_address(
+            "eth0",
+            target,
+            interface,
+            non_contiguous_netmask,
+        );
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Ipv4NetmaskInvalid { .. })),
+            "invalid netmask should surface from host-range helper, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_propagates_subnet_unsupported_for_slash_32() {
+        // Arrange
+        let interface = Ipv4Addr::new(203, 0, 113, 1);
+        let netmask = Ipv4Addr::BROADCAST;
+        let target = interface;
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Ipv4SubnetUnsupported { .. })),
+            "/32 subnet should not yield an interior scan range, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_accepts_first_interior_host_on_slash_24() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 10);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = Ipv4Addr::new(192, 168, 1, 1);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            outcome.is_ok(),
+            "first interior host should validate, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_accepts_last_interior_host_on_slash_24() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 10);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = Ipv4Addr::new(192, 168, 1, 254);
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            outcome.is_ok(),
+            "last interior host should validate, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_accepts_target_when_target_equals_strictly_interior_interface() {
+        // Arrange
+        let interface = Ipv4Addr::new(192, 168, 1, 100);
+        let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let target = interface;
+
+        // Act
+        let outcome =
+            validate_strict_interior_scan_target_ipv4_address("eth0", target, interface, netmask);
+
+        // Assert
+        assert!(
+            outcome.is_ok(),
+            "probing the interface’s own strictly interior address should validate, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_strict_interior_accepts_each_interior_host_on_slash_30() {
+        // Arrange: /30 yields two interior hosts .5 and .6 (see inclusive_host_range test)
+        let interface = Ipv4Addr::new(192, 168, 1, 5);
+        let netmask = Ipv4Addr::new(255, 255, 255, 252);
+        let first_interior = Ipv4Addr::new(192, 168, 1, 5);
+        let second_interior = Ipv4Addr::new(192, 168, 1, 6);
+
+        // Act
+        let first_outcome = validate_strict_interior_scan_target_ipv4_address(
+            "eth0",
+            first_interior,
+            interface,
+            netmask,
+        );
+        let second_outcome = validate_strict_interior_scan_target_ipv4_address(
+            "eth0",
+            second_interior,
+            interface,
+            netmask,
+        );
+
+        // Assert
+        assert!(
+            first_outcome.is_ok() && second_outcome.is_ok(),
+            "both /30 interior hosts should validate, got first={first_outcome:?} second={second_outcome:?}"
         );
     }
 }

@@ -130,6 +130,15 @@ pub enum AppError {
         /// Names of interfaces that were all considered usable.
         interface_names: Vec<String>,
     },
+    /// The IPv4 address supplied for single-target scanning is not allowed on the interface subnet.
+    SingleScanTargetRejected {
+        /// Target address that was rejected.
+        target_ipv4_address: std::net::Ipv4Addr,
+        /// Interface name used for discovery context.
+        interface_name: String,
+        /// Human-readable explanation for operators.
+        reason: String,
+    },
 }
 
 fn try_write_early_app_error_variants(
@@ -262,6 +271,14 @@ fn write_late_app_error_variants(
         AppError::RawPacketReceiveFailed { source } => {
             write!(formatter, "failed to receive raw Ethernet frame: {source}")
         }
+        AppError::SingleScanTargetRejected {
+            target_ipv4_address,
+            interface_name,
+            reason,
+        } => write!(
+            formatter,
+            "single-target scan rejected {target_ipv4_address} on interface `{interface_name}`: {reason}"
+        ),
         _ => write!(
             formatter,
             "unexpected application error variant during display formatting"
@@ -1035,6 +1052,50 @@ mod tests {
         assert!(
             source.is_none(),
             "ambiguous automatic selection should not chain a source error"
+        );
+    }
+
+    #[test]
+    fn display_includes_target_interface_and_reason_for_single_scan_target_rejected() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let application_error = AppError::SingleScanTargetRejected {
+            target_ipv4_address: Ipv4Addr::new(192, 168, 1, 0),
+            interface_name: "enp0s1".to_string(),
+            reason: "not a strictly interior host on the interface subnet".to_string(),
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("192.168.1.0")
+                && displayed.contains("enp0s1")
+                && displayed.contains("strictly interior"),
+            "display should name target, interface, and reason, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_none_for_single_scan_target_rejected() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let application_error = AppError::SingleScanTargetRejected {
+            target_ipv4_address: Ipv4Addr::new(10, 0, 0, 0),
+            interface_name: "eth1".to_string(),
+            reason: "fixture".to_string(),
+        };
+
+        // Act
+        let source = application_error.source();
+
+        // Assert
+        assert!(
+            source.is_none(),
+            "single scan target rejection should not chain a source error"
         );
     }
 }

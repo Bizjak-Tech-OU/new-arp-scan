@@ -24,6 +24,7 @@ fn main() {
             Some(CliSubcommand::Scan(scan)) => {
                 match new_arp_scan::run(ApplicationCommand::Scan {
                     interface_name: scan.interface_name,
+                    target_ipv4_address: scan.host_ipv4_address,
                     timeout: Duration::from_millis(scan.timeout_milliseconds),
                     pacing: Duration::from_millis(scan.pacing_milliseconds),
                     attempts: std::num::NonZeroU64::new(scan.attempts).expect(

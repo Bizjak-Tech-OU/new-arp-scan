@@ -1,5 +1,7 @@
 //! Command-line interface definitions for the `new-arp-scan` binary.
 
+use std::net::Ipv4Addr;
+
 use clap::{Args, Parser, Subcommand};
 
 /// Help footer examples appended to `--help` output.
@@ -10,6 +12,9 @@ EXAMPLES:
 
   Scan the local IPv4 subnet on Linux (requires CAP_NET_RAW or equivalent):
     new-arp-scan scan --interface eth0
+
+  Probe a single strictly interior host on the subnet:
+    new-arp-scan scan --interface eth0 --host 192.168.1.50
 
   Scan using automatic interface selection when exactly one usable interface exists:
     new-arp-scan scan
@@ -48,6 +53,9 @@ pub struct ScanArguments {
     /// exist or automatic selection fails.
     #[arg(long = "interface", value_name = "NAME", visible_alias = "iface")]
     pub interface_name: Option<String>,
+    /// Probe only this IPv4 address (must be strictly interior on the interface subnet).
+    #[arg(long = "host", value_name = "IPv4")]
+    pub host_ipv4_address: Option<Ipv4Addr>,
     /// Milliseconds to wait for address resolution replies after the last request is sent.
     #[arg(
         long = "timeout-ms",
@@ -104,6 +112,10 @@ mod tests {
                     scan.attempts, 1,
                     "omitted attempts should use default count"
                 );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -141,6 +153,10 @@ mod tests {
                     scan.attempts, 1,
                     "omitted attempts should use default count"
                 );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -176,6 +192,10 @@ mod tests {
                 assert_eq!(
                     scan.attempts, 1,
                     "omitted attempts should use default count"
+                );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
                 );
             }
             super::CliSubcommand::Interfaces => {
@@ -262,6 +282,10 @@ mod tests {
                     scan.attempts, 1,
                     "omitted attempts should use default count"
                 );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -296,6 +320,10 @@ mod tests {
                 assert_eq!(scan.timeout_milliseconds, 4000);
                 assert_eq!(scan.pacing_milliseconds, 7);
                 assert_eq!(scan.attempts, 8);
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -390,6 +418,10 @@ mod tests {
             help.contains("EXAMPLES:") && help.contains("new-arp-scan scan"),
             "after_help should surface operator examples, got: {help}"
         );
+        assert!(
+            help.contains("--host"),
+            "root help examples should document single-host scan with --host, got: {help}"
+        );
     }
 
     #[test]
@@ -407,8 +439,9 @@ mod tests {
         assert!(
             help.contains("--timeout-ms")
                 && help.contains("--pacing-ms")
-                && help.contains("--attempts"),
-            "scan long help should name timing and attempts flags, got:\n{help}"
+                && help.contains("--attempts")
+                && help.contains("--host"),
+            "scan long help should name timing, attempts, and host flags, got:\n{help}"
         );
         assert!(
             help.contains("3000"),
@@ -449,6 +482,10 @@ mod tests {
                     scan.attempts, 1,
                     "omitted attempts should use default count"
                 );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -482,6 +519,10 @@ mod tests {
                 assert_eq!(
                     scan.attempts, 1,
                     "omitted attempts should use default count"
+                );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
                 );
             }
             super::CliSubcommand::Interfaces => {
@@ -560,6 +601,10 @@ mod tests {
                     scan.attempts, 1,
                     "omitted attempts should use default count"
                 );
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -588,6 +633,10 @@ mod tests {
         match subcommand {
             super::CliSubcommand::Scan(scan) => {
                 assert_eq!(scan.attempts, 4, "explicit attempts should parse");
+                assert!(
+                    scan.host_ipv4_address.is_none(),
+                    "omitted --host should yield None"
+                );
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");
@@ -667,6 +716,116 @@ mod tests {
         assert!(
             outcome.is_err(),
             "empty timeout token should fail parsing, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_host_ipv4_address() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--host",
+            "192.168.1.50",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.host_ipv4_address,
+                    Some(Ipv4Addr::new(192, 168, 1, 50)),
+                    "--host should parse as IPv4"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_host_alongside_timing_and_attempts_flags() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--host",
+            "10.0.0.7",
+            "--timeout-ms",
+            "100",
+            "--pacing-ms",
+            "5",
+            "--attempts",
+            "2",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.host_ipv4_address, Some(Ipv4Addr::new(10, 0, 0, 7)));
+                assert_eq!(scan.timeout_milliseconds, 100);
+                assert_eq!(scan.pacing_milliseconds, 5);
+                assert_eq!(scan.attempts, 2);
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_scan_subcommand_receives_duplicate_host_flags() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--host",
+            "192.168.1.1",
+            "--host",
+            "192.168.1.2",
+        ];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "duplicate --host flags should be rejected to avoid ambiguous operator intent, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_scan_subcommand_receives_invalid_host_ipv4_token() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--host", "not-an-ipv4-address"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "invalid --host token should fail parsing, got: {outcome:?}"
         );
     }
 }
