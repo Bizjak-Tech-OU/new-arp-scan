@@ -6,7 +6,6 @@ use clap::CommandFactory;
 use clap::Parser;
 
 use new_arp_scan::application_command::ApplicationCommand;
-use new_arp_scan::application_outcome::ApplicationOutcome;
 use new_arp_scan::cli::{CliRoot, CliSubcommand};
 
 fn main() {
@@ -32,7 +31,13 @@ fn main() {
                     ),
                 }) {
                     Ok(outcome) => {
-                        print_application_outcome(outcome);
+                        let mut standard_output = std::io::stdout().lock();
+                        let mut standard_error = std::io::stderr().lock();
+                        outcome
+                            .write_operator_streams(&mut standard_output, &mut standard_error)
+                            .expect(
+                                "writing operator output to standard streams should succeed for a CLI binary",
+                            );
                     }
                     Err(error) => {
                         eprintln!("{error}");
@@ -43,7 +48,13 @@ fn main() {
             Some(CliSubcommand::Interfaces) => {
                 match new_arp_scan::run(ApplicationCommand::UsableInterfacesList) {
                     Ok(outcome) => {
-                        print_application_outcome(outcome);
+                        let mut standard_output = std::io::stdout().lock();
+                        let mut standard_error = std::io::stderr().lock();
+                        outcome
+                            .write_operator_streams(&mut standard_output, &mut standard_error)
+                            .expect(
+                                "writing operator output to standard streams should succeed for a CLI binary",
+                            );
                     }
                     Err(error) => {
                         eprintln!("{error}");
@@ -59,32 +70,6 @@ fn main() {
             }
         },
         Err(error) => error.exit(),
-    }
-}
-
-fn print_application_outcome(outcome: ApplicationOutcome) {
-    match outcome {
-        ApplicationOutcome::Scan(scan_outcome) => {
-            for warning in &scan_outcome.warnings {
-                eprintln!("warning: {warning}");
-            }
-
-            if scan_outcome.discovered_hosts.is_empty() {
-                println!("no hosts found");
-                return;
-            }
-
-            for host in &scan_outcome.discovered_hosts {
-                println!(
-                    "{} {}",
-                    host.ipv4_address, host.media_access_control_address
-                );
-            }
-        }
-        ApplicationOutcome::UsableInterfacesList(listing_outcome) => {
-            let table = listing_outcome.format_plain_columns_table();
-            print!("{table}");
-        }
     }
 }
 

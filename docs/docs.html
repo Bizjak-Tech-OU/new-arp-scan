@@ -99,6 +99,7 @@
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#examples">Examples</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#scan-behavior">Scan behavior</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#output">Output</a></li>
+            <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#exit-codes">Exit codes</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#library">Library API</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#verification">Verification</a></li>
             <li><a class="underline-offset-2 hover:text-zinc-900 hover:underline dark:hover:text-zinc-100" href="#requirements">Requirements &amp; development</a></li>
@@ -262,8 +263,37 @@ new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10 --attempts 3
               <span class="font-mono text-zinc-800 dark:text-zinc-200">warning: ...</span> on standard error.
             </li>
             <li>
-              No responses: prints <span class="font-mono text-zinc-800 dark:text-zinc-200">no hosts found</span> and
-              exits successfully.
+              After the scan’s standard output lines, the binary prints one timing summary line on standard error with
+              the stable template
+              <span class="font-mono text-zinc-800 dark:text-zinc-200"
+                >scan complete: interface &lt;NAME&gt;, &lt;N&gt; host(s), &lt;R&gt; round(s), &lt;MS&gt; ms</span
+              >
+              (singular <span class="font-mono">host</span> / <span class="font-mono">round</span> when the count is one).
+            </li>
+            <li>
+              No responses: prints <span class="font-mono text-zinc-800 dark:text-zinc-200">no hosts found</span> on
+              standard output, still prints the timing summary on standard error, and exits successfully.
+            </li>
+          </ul>
+        </section>
+
+        <section id="exit-codes" class="mt-12 scroll-mt-20">
+          <h2 class="font-mono text-lg font-semibold">Exit codes</h2>
+          <ul class="mt-3 list-inside list-disc space-y-2 text-zinc-600 dark:text-zinc-400">
+            <li>
+              <span class="font-mono text-zinc-800 dark:text-zinc-200">0</span> — successful command, including
+              <span class="font-mono">no hosts found</span>, <span class="font-mono">no usable interfaces found</span>,
+              printing help with no arguments, and successful <span class="font-mono">--help</span> invocations.
+            </li>
+            <li>
+              <span class="font-mono text-zinc-800 dark:text-zinc-200">1</span> — any operational failure from the
+              library (<span class="font-mono">AppError</span>), including unsupported platform, invalid interface or
+              target, and raw socket errors (including missing <span class="font-mono">CAP_NET_RAW</span> when reported
+              as permission denied).
+            </li>
+            <li>
+              <span class="font-mono text-zinc-800 dark:text-zinc-200">2</span> — command-line usage or parse errors
+              (typically unknown flags or invalid flag values).
             </li>
           </ul>
         </section>
@@ -290,7 +320,9 @@ new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10 --attempts 3
               <span class="font-mono">ScanOutcome::discovered_hosts</span> contains
               <span class="font-mono">DiscoveredHost</span> values sorted by IPv4 address. Each host stores the MAC in
               <span class="font-mono">DiscoveredHost::media_access_control_address</span> as a typed
-              <span class="font-mono">MacAddress</span>.
+              <span class="font-mono">MacAddress</span>. On Linux, <span class="font-mono">run</span> sets
+              <span class="font-mono">ScanOutcome::timing_summary</span> after a successful scan; direct calls to
+              <span class="font-mono">perform_arp_probe</span> leave it unset unless callers attach one.
             </li>
             <li>
               <span class="font-mono">UsableInterfacesListOutcome</span> exposes the same interface rows printed by

@@ -105,3 +105,11 @@ Lightweight records of architectural choices. Each entry follows the same shape.
 **Reason:** GitHub issue #24 requires an end-to-end single-address flow without duplicating packet logic; strict-interior validation matches full-scan interior rules and avoids ambiguous probes of network or broadcast addresses.
 
 **Consequences:** Operators and library callers can probe one interior host with the same `--timeout-ms`, `--pacing-ms`, and `--attempts` semantics as subnet scans. README, static docs, and CLI examples describe `--host` and the new error variant.
+
+## 2026-05-26 — Scan timing summary on standard error and minimal exit codes
+
+**Decision:** After a successful Linux `scan`, populate [`ScanOutcome::timing_summary`](src/application_outcome.rs) in [`run`](src/lib.rs) and have the binary print one stable standard-error line via [`ScanTimingSummary::format_stderr_timing_summary_line`](src/application_outcome.rs) after standard output. Document a minimal exit contract: `0` success (including empty results and help-only paths), `1` any [`AppError`](src/error.rs) from [`run`](src/lib.rs), `2` command-line parse or usage errors from `clap` (`error.exit()`). Do not assign distinct exit codes per [`AppError`](src/error.rs) variant (for example capability versus interface rejection).
+
+**Reason:** Milestone issues #18–#19 call for readable timing context and deterministic operator-visible exit semantics without expanding the error surface into sysexits-style matrices.
+
+**Consequences:** README and [`docs/docs.html`](docs/docs.html) describe the timing line template and exit table; integration tests assert parse failures exit `2` where the toolchain maps `clap` usage errors to that code.

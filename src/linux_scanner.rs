@@ -322,6 +322,7 @@ pub fn perform_arp_scan(
     Ok(ScanOutcome {
         discovered_hosts: hosts,
         warnings,
+        timing_summary: None,
     })
 }
 
@@ -421,6 +422,7 @@ pub fn perform_arp_probe(
     Ok(ScanOutcome {
         discovered_hosts: hosts,
         warnings,
+        timing_summary: None,
     })
 }
 
