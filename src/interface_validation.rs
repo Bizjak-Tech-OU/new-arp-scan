@@ -48,7 +48,7 @@ pub fn validate_interface_name_for_linux_packet_socket(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 /// Copies `interface_name` into [`libc::ifreq::ifr_name`] for `ioctl(2)` requests.
 ///
 /// Callers must invoke [`validate_interface_name_for_linux_packet_socket`] first when the name
@@ -186,7 +186,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod copy_interface_name_to_ifreq_linux_tests {
     use super::INTERFACE_NAME_BUFFER_SIZE;
     use super::copy_interface_name_to_ifreq;
