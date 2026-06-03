@@ -7,9 +7,9 @@ use new_arp_scan::{
     run,
 };
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn run_scan_returns_unsupported_platform_on_non_linux() {
+fn run_scan_returns_unsupported_platform_on_unsupported_os() {
     // Arrange
     let command = ApplicationCommand::Scan {
         interface_name: Some("eth0".to_string()),
@@ -37,6 +37,39 @@ fn run_scan_returns_unsupported_platform_on_non_linux() {
         Err(other) => {
             panic!("expected unsupported platform error, got: {other:?}");
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn run_scan_resolves_a_backend_and_fails_for_unknown_interface_on_macos() {
+    // Arrange
+    let command = ApplicationCommand::Scan {
+        interface_name: Some("narp_absent0".to_string()),
+        target_ipv4_address: None,
+        timeout: DEFAULT_SCAN_TIMEOUT,
+        pacing: DEFAULT_SCAN_PACING,
+        attempts: DEFAULT_SCAN_ATTEMPTS,
+    };
+
+    // Act
+    let outcome = run(command);
+
+    // Assert
+    match outcome {
+        Err(AppError::InterfaceLookupFailed { interface_name, .. }) => {
+            assert_eq!(
+                interface_name, "narp_absent0",
+                "macOS scan should fail to find the unknown interface it was asked to scan"
+            );
+        }
+        Ok(value) => {
+            panic!("expected lookup failure for an unknown interface, got success: {value:?}")
+        }
+        Err(other) => panic!(
+            "macOS should resolve a backend (not report unsupported) and fail to find the unknown \
+             interface, got: {other:?}"
+        ),
     }
 }
 

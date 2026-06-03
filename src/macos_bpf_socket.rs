@@ -5,12 +5,6 @@
 //! behind the portable [`LinkLayerEndpoint`] surface so the shared scanner observes one Ethernet
 //! frame at a time, exactly as it does on Linux. All raw system calls live in
 //! [`crate::macos_system_call`]; the record-walking here is pure byte-slice arithmetic.
-//!
-//! The entire endpoint is exercised through the shared scan path, which `run()` dispatches to on
-//! macOS in #56. Until then nothing in a non-test build references it, so dead code is allowed here
-//! for non-test builds only (the test build exercises the endpoint API). Remove this allowance once
-//! #56 wires the macOS scan path and the endpoint is reachable from `run()`.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::mem::offset_of;
 use std::os::fd::OwnedFd;
@@ -18,10 +12,55 @@ use std::os::fd::OwnedFd;
 use crate::error::AppError;
 use crate::interface_validation;
 use crate::link_layer_backend::LinkLayerEndpoint;
-use crate::macos_system_call;
+use crate::macos_system_call::{self, BpfProgramInstruction};
 
 /// `BPF_ALIGNMENT` from `net/bpf.h`: each record is padded to this boundary.
 const BPF_RECORD_ALIGNMENT: usize = 4;
+
+/// `BPF_LD | BPF_H | BPF_ABS`: load the 16-bit halfword at a fixed frame offset into the accumulator.
+const BPF_LOAD_HALFWORD_ABSOLUTE: u16 = 0x28;
+/// `BPF_JMP | BPF_JEQ | BPF_K`: branch on accumulator equal to a constant.
+const BPF_JUMP_IF_EQUAL_CONSTANT: u16 = 0x15;
+/// `BPF_RET | BPF_K`: return a constant capture length (0 drops the frame).
+const BPF_RETURN_CONSTANT: u16 = 0x06;
+/// Offset of the `EtherType` field in an Ethernet II header.
+const ETHERNET_TYPE_FIELD_OFFSET: u32 = 12;
+/// `EtherType` for ARP (`ETH_P_ARP`).
+const ETHERNET_TYPE_ARP: u32 = 0x0806;
+/// Capture length that accepts the whole frame.
+const BPF_ACCEPT_WHOLE_FRAME: u32 = u32::MAX;
+
+/// Classic Berkeley Packet Filter program accepting only Ethernet II frames carrying ARP.
+///
+/// Unlike a Linux `AF_PACKET` socket bound to `ETH_P_ARP`, a BPF device delivers every frame on the
+/// interface by default, so this filter is what scopes reads to ARP and avoids flooding the scanner
+/// with unrelated traffic.
+const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 4] = [
+    BpfProgramInstruction {
+        code: BPF_LOAD_HALFWORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_FIELD_OFFSET,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 1,
+        operand: ETHERNET_TYPE_ARP,
+    },
+    BpfProgramInstruction {
+        code: BPF_RETURN_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: BPF_ACCEPT_WHOLE_FRAME,
+    },
+    BpfProgramInstruction {
+        code: BPF_RETURN_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: 0,
+    },
+];
 
 /// Mirror of the macOS userspace `struct bpf_hdr` used only for its field offsets.
 ///
@@ -103,6 +142,13 @@ pub fn open_macos_link_layer_endpoint(interface_name: &str) -> Result<MacosBpfEn
     interface_validation::copy_interface_name_to_ifreq(interface_name, &mut interface_request)?;
     macos_system_call::set_bpf_interface(&bpf_device, &interface_request)
         .map_err(|source| AppError::SocketBindFailed { source })?;
+
+    // Scope reads to ARP and stop the device from echoing back the requests we broadcast, matching
+    // the effect of a Linux ETH_P_ARP packet socket.
+    macos_system_call::set_bpf_filter(&bpf_device, &ARP_CAPTURE_FILTER)
+        .map_err(|source| AppError::RawSocketOpenFailed { source })?;
+    macos_system_call::set_bpf_see_sent(&bpf_device, false)
+        .map_err(|source| AppError::RawSocketOpenFailed { source })?;
 
     macos_system_call::set_bpf_immediate(&bpf_device, true)
         .map_err(|source| AppError::RawSocketOpenFailed { source })?;

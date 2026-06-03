@@ -275,6 +275,86 @@ const BIOCSHDRCMPLT: libc::c_ulong = encode_ioctl_request(
     std::mem::size_of::<libc::c_uint>(),
 );
 
+/// One classic Berkeley Packet Filter instruction (`struct bpf_insn` in `net/bpf.h`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BpfProgramInstruction {
+    /// Operation code (`BPF_*`).
+    pub code: u16,
+    /// Branch offset taken when a comparison is true.
+    pub jump_if_true: u8,
+    /// Branch offset taken when a comparison is false.
+    pub jump_if_false: u8,
+    /// Generic operand (offset, constant, or return length).
+    pub operand: u32,
+}
+
+/// A classic Berkeley Packet Filter program (`struct bpf_program` in `net/bpf.h`).
+#[repr(C)]
+struct BpfProgram {
+    instruction_count: libc::c_uint,
+    instructions: *mut BpfProgramInstruction,
+}
+
+/// `BIOCSETF`: install a classic Berkeley Packet Filter program on the device.
+const BIOCSETF: libc::c_ulong = encode_ioctl_request(
+    IOCTL_DIRECTION_IN,
+    BPF_IOCTL_GROUP,
+    103,
+    std::mem::size_of::<BpfProgram>(),
+);
+
+/// Installs a classic Berkeley Packet Filter program (`BIOCSETF`) limiting which frames the device
+/// delivers to reads.
+///
+/// # Errors
+///
+/// Returns the last operating system error when the `ioctl(2)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn set_bpf_filter(
+    bpf_device: &OwnedFd,
+    instructions: &[BpfProgramInstruction],
+) -> std::io::Result<()> {
+    let instruction_count = libc::c_uint::try_from(instructions.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Berkeley Packet Filter program is too long",
+        )
+    })?;
+    let mut program = BpfProgram {
+        instruction_count,
+        instructions: instructions.as_ptr().cast_mut(),
+    };
+
+    // SAFETY: `BIOCSETF` reads a `bpf_program` pointing at `instruction_count` valid instructions;
+    // `instructions` outlives the call and the kernel copies the program in.
+    let result = unsafe {
+        libc::ioctl(
+            bpf_device.as_raw_fd(),
+            BIOCSETF,
+            std::ptr::from_mut(&mut program),
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Controls whether the device also captures frames sent on the interface (`BIOCSSEESENT`).
+///
+/// Disabling this keeps the scanner from receiving the ARP requests it just broadcast.
+///
+/// # Errors
+///
+/// Returns the last operating system error when the `ioctl(2)` fails.
+pub fn set_bpf_see_sent(bpf_device: &OwnedFd, enabled: bool) -> std::io::Result<()> {
+    set_bpf_unsigned_option(bpf_device, libc::BIOCSSEESENT, libc::c_uint::from(enabled))
+}
+
 /// Opens the first available cloning Berkeley Packet Filter device (`/dev/bpfN`).
 ///
 /// Skips devices that are busy (`EBUSY`) and returns the underlying error otherwise (for example

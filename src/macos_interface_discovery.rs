@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 
 use crate::error::AppError;
 use crate::interface_validation;
-use crate::link_layer_backend::ArpScanInterfaceCandidate;
+use crate::link_layer_backend::{ArpScanInterfaceCandidate, InterfaceScanAddresses};
 use crate::mac_address::MacAddress;
 use crate::macos_packet::{
     INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, INTERFACE_TYPE_ETHERNET,
@@ -51,12 +51,12 @@ struct InterfaceAccumulator {
     link_layer: Option<(u8, [u8; 6])>,
 }
 
-/// Groups address records by interface name and keeps the usable ARP scan interfaces.
+/// Folds `getifaddrs(3)` records into one [`InterfaceAccumulator`] per interface name.
 ///
-/// Pure over its input so the usability rules can be exercised with fixture records.
-fn classify_usable_scan_interfaces(
+/// Names that fail the shared interface-name rules are skipped. Pure over its input.
+fn accumulate_interface_records(
     records: &[InterfaceAddressRecord],
-) -> Vec<ClassifiedScanInterface> {
+) -> BTreeMap<String, InterfaceAccumulator> {
     let mut interfaces_by_name: BTreeMap<String, InterfaceAccumulator> = BTreeMap::new();
 
     for record in records {
@@ -91,36 +91,81 @@ fn classify_usable_scan_interfaces(
         }
     }
 
-    let mut classified = Vec::new();
-    for (interface_name, accumulator) in interfaces_by_name {
-        if !interface_flags_allow_arp_scanning(accumulator.interface_flags) {
-            continue;
-        }
-        let (Some(source_ipv4_address), Some(ipv4_netmask)) =
-            (accumulator.source_ipv4_address, accumulator.ipv4_netmask)
-        else {
-            continue;
-        };
-        let Some((interface_type, octets)) = accumulator.link_layer else {
-            continue;
-        };
-        if interface_type != INTERFACE_TYPE_ETHERNET {
-            continue;
-        }
-        let source_mac_address = MacAddress::from_octets(octets);
-        if source_mac_address.is_zero() {
-            continue;
-        }
+    interfaces_by_name
+}
 
-        classified.push(ClassifiedScanInterface {
-            interface_name,
-            source_ipv4_address,
-            ipv4_netmask,
-            source_mac_address,
+/// Applies the ARP scan usability rules to one accumulated interface.
+///
+/// Returns the usable interface, or a specific [`AppError`] explaining why it was rejected, using
+/// the same operator-facing reasons as the Linux backend where the platforms agree.
+fn classify_accumulator(
+    interface_name: &str,
+    accumulator: &InterfaceAccumulator,
+) -> Result<ClassifiedScanInterface, AppError> {
+    if !interface_flags_allow_arp_scanning(accumulator.interface_flags) {
+        let reason = if (accumulator.interface_flags & INTERFACE_FLAG_LOOPBACK.cast_unsigned()) != 0
+        {
+            "loopback interface"
+        } else if (accumulator.interface_flags & INTERFACE_FLAG_NO_ARP.cast_unsigned()) != 0 {
+            "interface has NOARP set"
+        } else {
+            "interface is not UP"
+        };
+        return Err(AppError::InterfaceRejectedForScanning {
+            interface_name: interface_name.to_string(),
+            reason: reason.to_string(),
         });
     }
 
-    classified
+    let (Some(source_ipv4_address), Some(ipv4_netmask)) =
+        (accumulator.source_ipv4_address, accumulator.ipv4_netmask)
+    else {
+        return Err(AppError::InterfaceRejectedForScanning {
+            interface_name: interface_name.to_string(),
+            reason: "interface has no IPv4 address and netmask".to_string(),
+        });
+    };
+
+    let Some((interface_type, octets)) = accumulator.link_layer else {
+        return Err(AppError::InterfaceHardwareAddressUnsupported {
+            interface_name: interface_name.to_string(),
+            reason: "interface has no Ethernet hardware address".to_string(),
+        });
+    };
+    if interface_type != INTERFACE_TYPE_ETHERNET {
+        return Err(AppError::InterfaceHardwareAddressUnsupported {
+            interface_name: interface_name.to_string(),
+            reason: format!("link-layer type {interface_type} is not Ethernet"),
+        });
+    }
+    let source_mac_address = MacAddress::from_octets(octets);
+    if source_mac_address.is_zero() {
+        return Err(AppError::InterfaceHardwareAddressUnsupported {
+            interface_name: interface_name.to_string(),
+            reason: "hardware address is all zero".to_string(),
+        });
+    }
+
+    Ok(ClassifiedScanInterface {
+        interface_name: interface_name.to_string(),
+        source_ipv4_address,
+        ipv4_netmask,
+        source_mac_address,
+    })
+}
+
+/// Groups address records by interface name and keeps the usable ARP scan interfaces.
+///
+/// Pure over its input so the usability rules can be exercised with fixture records.
+fn classify_usable_scan_interfaces(
+    records: &[InterfaceAddressRecord],
+) -> Vec<ClassifiedScanInterface> {
+    accumulate_interface_records(records)
+        .into_iter()
+        .filter_map(|(interface_name, accumulator)| {
+            classify_accumulator(&interface_name, &accumulator).ok()
+        })
+        .collect()
 }
 
 /// Enumerates local interfaces that are usable for ARP scanning on macOS.
@@ -165,6 +210,78 @@ pub fn enumerate_usable_arp_scan_interface_candidates()
     });
 
     Ok(candidates)
+}
+
+/// Reads [`InterfaceScanAddresses`] for `interface_name` from `getifaddrs(3)`.
+///
+/// # Errors
+///
+/// Returns [`AppError::InvalidInterfaceName`] for an unusable name, [`AppError::InterfaceLookupFailed`]
+/// when the interface is not present, [`AppError::InterfaceRejectedForScanning`] when it is loopback,
+/// down, `NOARP`, or has no IPv4 address, or [`AppError::InterfaceHardwareAddressUnsupported`] when
+/// it has no usable Ethernet hardware address.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn discover_interface_scan_addresses(
+    interface_name: &str,
+) -> Result<InterfaceScanAddresses, AppError> {
+    interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
+
+    let records = macos_system_call::collect_interface_address_records()
+        .map_err(|source| AppError::InterfaceEnumerationFailed { source })?;
+    let accumulator = accumulate_interface_records(&records);
+    let Some(interface_accumulator) = accumulator.get(interface_name) else {
+        return Err(AppError::InterfaceLookupFailed {
+            interface_name: interface_name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "interface not present in getifaddrs output",
+            ),
+        });
+    };
+
+    let classified = classify_accumulator(interface_name, interface_accumulator)?;
+    Ok(InterfaceScanAddresses {
+        source_ipv4_address: classified.source_ipv4_address,
+        ipv4_netmask: classified.ipv4_netmask,
+        source_mac_address: classified.source_mac_address,
+    })
+}
+
+/// Resolves which interface name to use for scanning on macOS.
+///
+/// When `explicit_interface_name` is [`Some`], that name is validated the same way as a direct scan
+/// request. When it is [`None`], this function requires exactly one usable interface.
+///
+/// # Errors
+///
+/// Returns [`AppError`] for invalid names, interface rejection, discovery failures, or ambiguous
+/// automatic selection.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn resolve_scan_interface_name(
+    explicit_interface_name: Option<&str>,
+) -> Result<String, AppError> {
+    if let Some(interface_name) = explicit_interface_name {
+        discover_interface_scan_addresses(interface_name)?;
+        return Ok(interface_name.to_string());
+    }
+
+    let candidates = enumerate_usable_arp_scan_interface_candidates()?;
+    match candidates.len() {
+        0 => Err(AppError::AutomaticInterfaceSelectionNoneFound),
+        1 => Ok(candidates[0].interface_name.clone()),
+        _ => Err(AppError::AutomaticInterfaceSelectionAmbiguous {
+            interface_names: candidates
+                .into_iter()
+                .map(|candidate| candidate.interface_name)
+                .collect(),
+        }),
+    }
 }
 
 #[cfg(test)]
