@@ -4,13 +4,13 @@ use std::ffi::CString;
 use std::mem::zeroed;
 use std::os::fd::OwnedFd;
 
+use crate::address_resolution_protocol::ARP_HARDWARE_TYPE_ETHERNET;
 use crate::error::AppError;
 use crate::interface_validation;
 use crate::link_layer_backend::LinkLayerEndpoint;
 use crate::linux_packet::{
-    ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK,
-    INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SOCKET_ADDRESS_FAMILY_PACKET, SockAddressLinkLayer,
-    ethernet_protocol_host_to_network_order,
+    ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
+    SOCKET_ADDRESS_FAMILY_PACKET, SockAddressLinkLayer, ethernet_protocol_host_to_network_order,
 };
 use crate::linux_system_call;
 

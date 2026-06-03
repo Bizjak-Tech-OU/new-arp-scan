@@ -12,11 +12,6 @@ use crate::error::AppError;
 use crate::mac_address::MacAddress;
 
 /// IPv4 configuration and Ethernet hardware address discovered for scanning one interface.
-// Consumed by the scan path of each backend; the macOS scan path lands in #56.
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(dead_code, reason = "consumed by the macOS scan path in #56")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceScanAddresses {
     /// Primary IPv4 address selected for scanning (first address returned by the kernel).
@@ -47,15 +42,6 @@ pub struct ArpScanInterfaceCandidate {
 /// Implementations own the underlying operating system descriptor and close it on drop. The
 /// destination of an outgoing frame is the broadcast address already encoded in the frame, so the
 /// platform address structure (Linux `sockaddr_ll`, macOS none) stays inside the implementation.
-// On Linux the shared scanner calls these methods; on macOS the generic scan caller is wired in
-// #56, so off Linux the methods have no caller yet (the macOS BPF impl exists but is not driven).
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(
-        dead_code,
-        reason = "the macOS scan path that calls these is wired in #56"
-    )
-)]
 pub trait LinkLayerEndpoint {
     /// Sends one complete Ethernet II frame on the bound interface.
     ///

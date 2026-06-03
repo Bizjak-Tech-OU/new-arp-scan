@@ -5,20 +5,6 @@ pub const SOCKET_ADDRESS_FAMILY_PACKET: libc::c_ushort = 17;
 /// Ethernet protocol identifier for ARP (`ETH_P_ARP` in `linux/if_ether.h`).
 pub const ETHERNET_PROTOCOL_ARP: u16 = 0x0806;
 
-/// ARP hardware type for Ethernet (`ARPHRD_ETHER` in `linux/if_arp.h`).
-pub const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
-
-/// ARP opcode for a request (`ARPOP_REQUEST` in `linux/if_arp.h`).
-pub const ARP_OPERATION_REQUEST: u16 = 1;
-
-/// ARP opcode for a reply (`ARPOP_REPLY` in `linux/if_arp.h`).
-pub const ARP_OPERATION_REPLY: u16 = 2;
-
-const _: () = {
-    assert!(ARP_OPERATION_REQUEST == 1);
-    assert!(ARP_OPERATION_REPLY == 2);
-};
-
 /// `IFF_UP` from `linux/if.h` (interface is administratively up).
 pub const INTERFACE_FLAG_UP: i32 = 0x0001;
 
@@ -78,9 +64,11 @@ pub fn ethernet_protocol_host_to_network_order(
 mod tests {
     use super::SockAddressLinkLayer;
     use super::{
-        ARP_HARDWARE_TYPE_ETHERNET, ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST,
         ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
         SOCKET_ADDRESS_FAMILY_PACKET, ethernet_protocol_host_to_network_order,
+    };
+    use crate::address_resolution_protocol::{
+        ARP_HARDWARE_TYPE_ETHERNET, ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST,
     };
     use std::mem::offset_of;
 
