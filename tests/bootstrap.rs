@@ -1,8 +1,10 @@
 //! Integration smoke tests for repository bootstrap.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use new_arp_scan::ApplicationOutcome;
 use new_arp_scan::{
-    AppError, ApplicationCommand, ApplicationOutcome, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,
-    DEFAULT_SCAN_TIMEOUT, run,
+    AppError, ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
+    run,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -38,9 +40,9 @@ fn run_scan_returns_unsupported_platform_on_non_linux() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn run_usable_interfaces_list_returns_unsupported_platform_on_non_linux() {
+fn run_usable_interfaces_list_returns_unsupported_platform_on_unsupported_os() {
     // Arrange
     let command = ApplicationCommand::UsableInterfacesList;
 
@@ -61,6 +63,32 @@ fn run_usable_interfaces_list_returns_unsupported_platform_on_non_linux() {
         }
         Err(other) => {
             panic!("expected unsupported platform error, got: {other:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn run_usable_interfaces_list_returns_outcome_on_macos() {
+    // Arrange
+    let command = ApplicationCommand::UsableInterfacesList;
+
+    // Act
+    let outcome = run(command);
+
+    // Assert
+    let outcome = outcome.expect("usable interfaces listing should succeed on macOS");
+    match outcome {
+        ApplicationOutcome::UsableInterfacesList(listing) => {
+            let table = listing.format_plain_columns_table();
+            assert!(
+                table.contains("no usable interfaces found")
+                    || (table.contains("NAME") && table.contains("INDEX")),
+                "public listing should print either the empty-operator message or a header row, got:\n{table}"
+            );
+        }
+        ApplicationOutcome::Scan(_) => {
+            panic!("expected usable interfaces list outcome, got scan outcome");
         }
     }
 }
