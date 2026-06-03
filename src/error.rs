@@ -46,6 +46,11 @@ pub enum AppError {
         /// Underlying operating system error (typically `errno`).
         source: std::io::Error,
     },
+    /// Opening a macOS Berkeley Packet Filter device was denied for lack of privilege.
+    BpfDeviceAccessRequired {
+        /// Underlying operating system error (typically `errno`).
+        source: std::io::Error,
+    },
     /// Binding the raw `AF_PACKET` socket to the interface failed.
     SocketBindFailed {
         /// Underlying operating system error (typically `errno`).
@@ -182,6 +187,10 @@ fn try_write_early_app_error_variants(
             formatter,
             "opening a raw packet socket requires the Linux capability CAP_NET_RAW (or equivalent privileges); permission denied: {source}"
         ),
+        AppError::BpfDeviceAccessRequired { source } => write!(
+            formatter,
+            "opening a Berkeley Packet Filter device requires root or BPF access (try running with sudo); permission denied: {source}"
+        ),
         AppError::SocketBindFailed { source } => {
             write!(formatter, "failed to bind raw packet socket: {source}")
         }
@@ -303,6 +312,7 @@ impl std::error::Error for AppError {
             | AppError::InterfaceFlagsQueryFailed { source, .. }
             | AppError::RawSocketOpenFailed { source }
             | AppError::RawSocketCapabilityRequired { source }
+            | AppError::BpfDeviceAccessRequired { source }
             | AppError::SocketBindFailed { source }
             | AppError::InterfaceIpv4AddressQueryFailed { source, .. }
             | AppError::InterfaceIpv4NetmaskQueryFailed { source, .. }
@@ -604,6 +614,57 @@ mod tests {
         let source = application_error
             .source()
             .expect("capability denial should expose source");
+
+        // Assert
+        assert!(
+            !source.to_string().is_empty(),
+            "source should be non-empty, got: {source}"
+        );
+    }
+
+    #[test]
+    fn display_mentions_sudo_and_bpf_for_bpf_device_access_required() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(13);
+        let application_error = AppError::BpfDeviceAccessRequired { source: inner };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("Berkeley Packet Filter")
+                && displayed.to_ascii_lowercase().contains("sudo"),
+            "display should mention the BPF device and suggest sudo, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn display_for_bpf_device_access_required_does_not_leak_device_paths() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(13);
+        let application_error = AppError::BpfDeviceAccessRequired { source: inner };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            !displayed.contains("/dev/bpf"),
+            "operator message should not leak a device path, got: {displayed}"
+        );
+    }
+
+    #[test]
+    fn source_returns_underlying_error_for_bpf_device_access_required() {
+        // Arrange
+        let inner = std::io::Error::from_raw_os_error(13);
+        let application_error = AppError::BpfDeviceAccessRequired { source: inner };
+
+        // Act
+        let source = application_error
+            .source()
+            .expect("BPF access denial should expose source");
 
         // Assert
         assert!(
