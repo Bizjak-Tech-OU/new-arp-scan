@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS (format, lint, test)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install stable Rust toolchain
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint (clippy, warnings denied)
+        run: cargo clippy --all-targets -- -D warnings
+      # Hermetic tests only: privileged ARP scans on the wire stay manual (see CONTRIBUTING.md and
+      # docs/linux-platform.md), so this job never opens a Berkeley Packet Filter device for a live
+      # scan.
+      - name: Test
+        run: cargo test

@@ -9,6 +9,7 @@
 ## Learned Workspace Facts
 
 - The primary GitHub repository for this project is `Bizjak-Tech-OU/new-arp-scan`.
+- Continuous integration (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on `macos-latest` for every push and pull request to `master`; it never runs privileged ARP scans (those stay manual). The separate `static.yml` only deploys docs.
 - Roadmap and issue planning are driven from repository `issues.md` alongside GitHub issues and milestones.
 - The `Makefile` `lint` target runs `cargo fmt --all` and then `cargo clippy --all-targets -- -D warnings`.
 - The `Makefile` `test` target runs `cargo test` and then `cargo test --tests`.
