@@ -135,8 +135,13 @@ pub struct MacosBpfEndpoint {
 ///
 /// This function does not panic.
 pub fn open_macos_link_layer_endpoint(interface_name: &str) -> Result<MacosBpfEndpoint, AppError> {
-    let bpf_device = macos_system_call::open_bpf_device()
-        .map_err(|source| AppError::RawSocketOpenFailed { source })?;
+    let bpf_device = macos_system_call::open_bpf_device().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::PermissionDenied {
+            AppError::BpfDeviceAccessRequired { source }
+        } else {
+            AppError::RawSocketOpenFailed { source }
+        }
+    })?;
 
     let mut interface_request: libc::ifreq = unsafe { std::mem::zeroed() };
     interface_validation::copy_interface_name_to_ifreq(interface_name, &mut interface_request)?;
@@ -247,12 +252,13 @@ mod tests {
                 assert!(
                     matches!(
                         error,
-                        AppError::RawSocketOpenFailed { .. }
+                        AppError::BpfDeviceAccessRequired { .. }
+                            | AppError::RawSocketOpenFailed { .. }
                             | AppError::SocketBindFailed { .. }
                             | AppError::InvalidInterfaceName { .. }
                     ),
-                    "opening a BPF endpoint without privileges should report a socket/open \
-                     failure, got: {error:?}"
+                    "opening a BPF endpoint without privileges should report a BPF access or \
+                     socket/open failure, got: {error:?}"
                 );
             }
         }
