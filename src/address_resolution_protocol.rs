@@ -9,8 +9,21 @@ use crate::ethernet_frame::{
     ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, encode_ethernet_ii_frame,
     try_parse_ethernet_ii_frame,
 };
-use crate::linux_packet::{ARP_HARDWARE_TYPE_ETHERNET, ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST};
 use crate::mac_address::MacAddress;
+
+/// ARP hardware type for Ethernet (`ARPHRD_ETHER` in `linux/if_arp.h`).
+pub(crate) const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
+
+/// ARP opcode for a request (`ARPOP_REQUEST` in `linux/if_arp.h`).
+pub(crate) const ARP_OPERATION_REQUEST: u16 = 1;
+
+/// ARP opcode for a reply (`ARPOP_REPLY` in `linux/if_arp.h`).
+pub(crate) const ARP_OPERATION_REPLY: u16 = 2;
+
+const _: () = {
+    assert!(ARP_OPERATION_REQUEST == 1);
+    assert!(ARP_OPERATION_REPLY == 2);
+};
 
 /// Length of a minimal ARP packet for IPv4 over Ethernet (fixed field layout).
 pub const ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH: usize = 28;

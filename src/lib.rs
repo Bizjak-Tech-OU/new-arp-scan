@@ -6,15 +6,14 @@ pub mod cli;
 pub mod error;
 pub mod mac_address;
 
-#[cfg(target_os = "linux")]
+mod address_resolution_protocol;
 mod ethernet_frame;
 mod interface_validation;
 mod ipv4_cidr;
 mod ipv4_subnet;
 mod link_layer_backend;
+mod scanner;
 
-#[cfg(target_os = "linux")]
-mod address_resolution_protocol;
 #[cfg(target_os = "linux")]
 mod linux_interface_discovery;
 #[cfg(target_os = "linux")]
