@@ -27,6 +27,8 @@ mod linux_socket;
 mod linux_system_call;
 
 #[cfg(target_os = "macos")]
+mod macos_bpf_socket;
+#[cfg(target_os = "macos")]
 mod macos_interface_discovery;
 #[cfg(target_os = "macos")]
 mod macos_packet;

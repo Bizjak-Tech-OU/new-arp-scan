@@ -8,6 +8,7 @@
 
 use std::ffi::CStr;
 use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 /// One address entry reported by `getifaddrs(3)` for a named interface, lowered to safe values.
 ///
@@ -222,6 +223,304 @@ pub fn interface_index_from_name(interface_name: &CStr) -> std::io::Result<libc:
     Ok(index)
 }
 
+/// `ioctl(2)` direction flag for reading a value from the kernel (`IOC_OUT`).
+const IOCTL_DIRECTION_OUT: libc::c_ulong = 0x4000_0000;
+/// `ioctl(2)` direction flag for writing a value to the kernel (`IOC_IN`).
+const IOCTL_DIRECTION_IN: libc::c_ulong = 0x8000_0000;
+/// Mask limiting the encoded parameter length (`IOCPARM_MASK`).
+const IOCTL_PARAMETER_MASK: libc::c_ulong = 0x1fff;
+/// `ioctl(2)` group character for Berkeley Packet Filter requests (`'B'`).
+const BPF_IOCTL_GROUP: u8 = b'B';
+
+/// Encodes a BSD `ioctl(2)` request code the way the `_IOR`/`_IOW`/`_IO` macros in `sys/ioccom.h`
+/// do, so the Berkeley Packet Filter request constants can be derived rather than hard-coded.
+const fn encode_ioctl_request(
+    direction: libc::c_ulong,
+    group: u8,
+    number: u8,
+    parameter_length: usize,
+) -> libc::c_ulong {
+    direction
+        | (((parameter_length as libc::c_ulong) & IOCTL_PARAMETER_MASK) << 16)
+        | ((group as libc::c_ulong) << 8)
+        | (number as libc::c_ulong)
+}
+
+/// `BIOCGBLEN`: read the kernel's Berkeley Packet Filter read-buffer length.
+const BIOCGBLEN: libc::c_ulong = encode_ioctl_request(
+    IOCTL_DIRECTION_OUT,
+    BPF_IOCTL_GROUP,
+    102,
+    std::mem::size_of::<libc::c_uint>(),
+);
+/// `BIOCSETIF`: attach the Berkeley Packet Filter device to a named interface.
+const BIOCSETIF: libc::c_ulong = encode_ioctl_request(
+    IOCTL_DIRECTION_IN,
+    BPF_IOCTL_GROUP,
+    108,
+    std::mem::size_of::<libc::ifreq>(),
+);
+/// `BIOCIMMEDIATE`: return reads immediately as packets arrive rather than buffering.
+const BIOCIMMEDIATE: libc::c_ulong = encode_ioctl_request(
+    IOCTL_DIRECTION_IN,
+    BPF_IOCTL_GROUP,
+    112,
+    std::mem::size_of::<libc::c_uint>(),
+);
+/// `BIOCSHDRCMPLT`: send frames with the source address as written instead of overwriting it.
+const BIOCSHDRCMPLT: libc::c_ulong = encode_ioctl_request(
+    IOCTL_DIRECTION_IN,
+    BPF_IOCTL_GROUP,
+    117,
+    std::mem::size_of::<libc::c_uint>(),
+);
+
+/// Opens the first available cloning Berkeley Packet Filter device (`/dev/bpfN`).
+///
+/// Skips devices that are busy (`EBUSY`) and returns the underlying error otherwise (for example
+/// `EACCES` when the process lacks root, or `ENOENT` once the device range is exhausted).
+///
+/// # Errors
+///
+/// Returns the last operating system error when no Berkeley Packet Filter device can be opened.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn open_bpf_device() -> std::io::Result<OwnedFd> {
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no Berkeley Packet Filter device was available",
+    );
+    for minor_number in 0..256u32 {
+        let device_path = format!("/dev/bpf{minor_number}");
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&device_path)
+        {
+            Ok(file) => return Ok(OwnedFd::from(file)),
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                last_error = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error)
+}
+
+/// Attaches an opened Berkeley Packet Filter device to the interface named in `request` (`BIOCSETIF`).
+///
+/// # Errors
+///
+/// Returns the last operating system error when the `ioctl(2)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn set_bpf_interface(bpf_device: &OwnedFd, request: &libc::ifreq) -> std::io::Result<()> {
+    // SAFETY: `BIOCSETIF` reads a `struct ifreq` naming the interface to attach; `request` is a
+    // valid `ifreq` and lives for the duration of the call.
+    let result = unsafe {
+        libc::ioctl(
+            bpf_device.as_raw_fd(),
+            BIOCSETIF,
+            std::ptr::from_ref(request),
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Sets an unsigned-integer Berkeley Packet Filter option (`BIOCIMMEDIATE`, `BIOCSHDRCMPLT`).
+fn set_bpf_unsigned_option(
+    bpf_device: &OwnedFd,
+    request_code: libc::c_ulong,
+    value: libc::c_uint,
+) -> std::io::Result<()> {
+    let mut option_value = value;
+    // SAFETY: these BPF options read a single `c_uint`; `option_value` is a valid, writable
+    // `c_uint` for the call.
+    let result = unsafe {
+        libc::ioctl(
+            bpf_device.as_raw_fd(),
+            request_code,
+            std::ptr::from_mut(&mut option_value),
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enables immediate read delivery on a Berkeley Packet Filter device (`BIOCIMMEDIATE`).
+///
+/// # Errors
+///
+/// Returns the last operating system error when the `ioctl(2)` fails.
+pub fn set_bpf_immediate(bpf_device: &OwnedFd, enabled: bool) -> std::io::Result<()> {
+    set_bpf_unsigned_option(bpf_device, BIOCIMMEDIATE, libc::c_uint::from(enabled))
+}
+
+/// Enables complete-header sending on a Berkeley Packet Filter device (`BIOCSHDRCMPLT`).
+///
+/// With this set, the kernel sends frames exactly as written instead of overwriting the source
+/// hardware address, which preserves the source MAC the encoder placed in the frame.
+///
+/// # Errors
+///
+/// Returns the last operating system error when the `ioctl(2)` fails.
+pub fn set_bpf_header_complete(bpf_device: &OwnedFd, enabled: bool) -> std::io::Result<()> {
+    set_bpf_unsigned_option(bpf_device, BIOCSHDRCMPLT, libc::c_uint::from(enabled))
+}
+
+/// Reads the kernel read-buffer length for a Berkeley Packet Filter device (`BIOCGBLEN`).
+///
+/// Reads from the device must use a buffer of exactly this length.
+///
+/// # Errors
+///
+/// Returns the last operating system error when the `ioctl(2)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn get_bpf_buffer_length(bpf_device: &OwnedFd) -> std::io::Result<libc::c_uint> {
+    let mut buffer_length: libc::c_uint = 0;
+    // SAFETY: `BIOCGBLEN` writes a single `c_uint`; `buffer_length` is a valid, writable `c_uint`.
+    let result = unsafe {
+        libc::ioctl(
+            bpf_device.as_raw_fd(),
+            BIOCGBLEN,
+            std::ptr::from_mut(&mut buffer_length),
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(buffer_length)
+}
+
+/// Puts a file descriptor into non-blocking mode (`O_NONBLOCK`).
+///
+/// # Errors
+///
+/// Returns the last operating system error when `fcntl(2)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn set_file_descriptor_nonblocking(file_descriptor: &OwnedFd) -> std::io::Result<()> {
+    // SAFETY: `F_GETFL` takes no further argument and returns the current status flags.
+    let current_flags = unsafe { libc::fcntl(file_descriptor.as_raw_fd(), libc::F_GETFL) };
+    if current_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `F_SETFL` takes the new status flags as its argument.
+    let result = unsafe {
+        libc::fcntl(
+            file_descriptor.as_raw_fd(),
+            libc::F_SETFL,
+            current_flags | libc::O_NONBLOCK,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Writes one complete Ethernet frame to a Berkeley Packet Filter device with `write(2)`.
+///
+/// # Errors
+///
+/// Returns the last operating system error when `write(2)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn write_link_layer_frame(bpf_device: &OwnedFd, frame: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: `frame` is a valid readable slice; `write(2)` reads `frame.len()` bytes from it.
+    let sent = unsafe {
+        libc::write(
+            bpf_device.as_raw_fd(),
+            frame.as_ptr().cast::<libc::c_void>(),
+            frame.len(),
+        )
+    };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    usize::try_from(sent).map_err(|_| std::io::Error::other("write returned a negative byte count"))
+}
+
+/// Reads buffered Berkeley Packet Filter records into `buffer` with `read(2)`.
+///
+/// One read can return several `bpf_hdr`-prefixed records; de-aggregation happens in the endpoint.
+///
+/// # Errors
+///
+/// Returns the last operating system error when `read(2)` fails (including `EAGAIN` in non-blocking
+/// mode).
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn read_link_layer_frames(bpf_device: &OwnedFd, buffer: &mut [u8]) -> std::io::Result<usize> {
+    // SAFETY: `buffer` is a valid writable slice; `read(2)` writes at most `buffer.len()` bytes.
+    let received = unsafe {
+        libc::read(
+            bpf_device.as_raw_fd(),
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            buffer.len(),
+        )
+    };
+    if received < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    usize::try_from(received)
+        .map_err(|_| std::io::Error::other("read returned a negative byte count"))
+}
+
+/// Waits for readiness on `file_descriptor` using `poll(2)`.
+///
+/// # Errors
+///
+/// Returns the last operating system error when `poll(2)` fails.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn poll_readiness(
+    file_descriptor: &OwnedFd,
+    events: libc::c_short,
+    timeout_milliseconds: libc::c_int,
+) -> std::io::Result<libc::c_int> {
+    let mut poll_file_descriptor = libc::pollfd {
+        fd: file_descriptor.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+
+    // SAFETY: `poll_file_descriptor` points to one valid `pollfd` for the duration of the call.
+    let ready = unsafe {
+        libc::poll(
+            std::ptr::addr_of_mut!(poll_file_descriptor),
+            1,
+            timeout_milliseconds,
+        )
+    };
+
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(ready)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_ipv4_from_sockaddr, read_link_layer_address_from_sockaddr_dl};
@@ -336,6 +635,64 @@ mod tests {
             hardware_address, None,
             "a non-six-octet link-layer address should not be treated as Ethernet"
         );
+    }
+
+    #[test]
+    fn ioctl_request_encoder_matches_libc_bioseesent() {
+        // Arrange
+        // `BIOCSSEESENT` is the one Berkeley Packet Filter request `libc` exposes on macOS; deriving
+        // it with the encoder validates the `_IOW` encoding used for the other request codes.
+        let encoded = super::encode_ioctl_request(super::IOCTL_DIRECTION_IN, b'B', 119, 4);
+
+        // Act
+        // Assert
+        assert_eq!(
+            encoded,
+            libc::BIOCSSEESENT,
+            "encoded _IOW('B', 119, u_int) should match libc::BIOCSSEESENT"
+        );
+    }
+
+    #[test]
+    fn bioc_setif_matches_documented_macos_value() {
+        // Arrange
+        let expected: libc::c_ulong = 0x8020_426c;
+
+        // Act
+        // Assert
+        assert_eq!(
+            std::mem::size_of::<libc::ifreq>(),
+            32,
+            "macOS ifreq should be 32 bytes for the BIOCSETIF size encoding"
+        );
+        assert_eq!(
+            super::BIOCSETIF,
+            expected,
+            "BIOCSETIF should match the documented macOS request code 0x8020426c"
+        );
+    }
+
+    #[test]
+    fn open_bpf_device_returns_descriptor_or_permission_error() {
+        // Act
+        let outcome = super::open_bpf_device();
+
+        // Assert
+        match outcome {
+            Ok(_device) => {
+                // Running as root (or with BPF access): a device opened successfully.
+            }
+            Err(error) => {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                    ),
+                    "without privileges, opening a BPF device should fail with permission denied \
+                     or exhaust the device range, got: {error:?}"
+                );
+            }
+        }
     }
 
     #[test]

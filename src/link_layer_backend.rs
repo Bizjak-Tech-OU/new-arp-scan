@@ -47,10 +47,14 @@ pub struct ArpScanInterfaceCandidate {
 /// Implementations own the underlying operating system descriptor and close it on drop. The
 /// destination of an outgoing frame is the broadcast address already encoded in the frame, so the
 /// platform address structure (Linux `sockaddr_ll`, macOS none) stays inside the implementation.
-// The macOS BPF endpoint implements this trait in #54; until then nothing implements it off Linux.
+// On Linux the shared scanner calls these methods; on macOS the generic scan caller is wired in
+// #56, so off Linux the methods have no caller yet (the macOS BPF impl exists but is not driven).
 #[cfg_attr(
     not(target_os = "linux"),
-    expect(dead_code, reason = "implemented by the macOS BPF endpoint in #54")
+    expect(
+        dead_code,
+        reason = "the macOS scan path that calls these is wired in #56"
+    )
 )]
 pub trait LinkLayerEndpoint {
     /// Sends one complete Ethernet II frame on the bound interface.
