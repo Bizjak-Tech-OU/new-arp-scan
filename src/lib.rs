@@ -11,6 +11,7 @@ mod ethernet_frame;
 mod interface_validation;
 mod ipv4_cidr;
 mod ipv4_subnet;
+mod link_layer_backend;
 
 #[cfg(target_os = "linux")]
 mod address_resolution_protocol;

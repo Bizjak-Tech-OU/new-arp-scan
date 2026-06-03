@@ -6,36 +6,11 @@ use std::os::fd::OwnedFd;
 
 use crate::error::AppError;
 use crate::interface_validation;
+use crate::link_layer_backend::{ArpScanInterfaceCandidate, InterfaceScanAddresses};
 use crate::linux_packet::{INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP};
 use crate::linux_socket::validated_interface_index_for_arp_scanning;
 use crate::linux_system_call;
 use crate::mac_address::MacAddress;
-
-/// IPv4 configuration and Ethernet hardware address discovered for scanning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InterfaceScanAddresses {
-    /// Primary IPv4 address selected for scanning (first address returned by the kernel).
-    pub source_ipv4_address: Ipv4Addr,
-    /// IPv4 netmask associated with [`Self::source_ipv4_address`].
-    pub ipv4_netmask: Ipv4Addr,
-    /// Source Ethernet hardware address used in outgoing frames.
-    pub source_mac_address: MacAddress,
-}
-
-/// One local interface that satisfies ARP scan filtering rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArpScanInterfaceCandidate {
-    /// Operating system interface name (for example `eth0`).
-    pub interface_name: String,
-    /// Linux interface index (`ifindex`).
-    pub interface_index: u32,
-    /// Primary IPv4 address on this interface.
-    pub source_ipv4_address: Ipv4Addr,
-    /// IPv4 netmask associated with [`Self::source_ipv4_address`].
-    pub ipv4_netmask: Ipv4Addr,
-    /// Ethernet hardware address for this interface.
-    pub source_mac_address: MacAddress,
-}
 
 fn read_ipv4_from_sockaddr(
     sockaddr: &libc::sockaddr,
