@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::mem::zeroed;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::thread;
@@ -18,15 +17,11 @@ use crate::ipv4_cidr::Ipv4HostAddressIterator;
 use crate::ipv4_subnet::{
     ipv4_address_is_strictly_inside_subnet, validate_strict_interior_scan_target_ipv4_address,
 };
+use crate::link_layer_backend::LinkLayerEndpoint;
 use crate::linux_interface_discovery::discover_interface_scan_addresses;
-use crate::linux_packet::{
-    ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, SOCKET_ADDRESS_FAMILY_PACKET,
-    SockAddressLinkLayer, ethernet_protocol_host_to_network_order,
-};
 use crate::linux_socket::{
-    open_bound_raw_arp_packet_socket, validated_interface_index_for_arp_scanning,
+    open_linux_link_layer_endpoint, validated_interface_index_for_arp_scanning,
 };
-use crate::linux_system_call;
 use crate::mac_address::MacAddress;
 
 /// Converts remaining receive time to a `poll(2)` timeout in whole milliseconds, clamped to
@@ -151,31 +146,8 @@ impl ArpReplyAcceptance {
     }
 }
 
-fn link_layer_broadcast_destination_for_arp(
-    interface_name: &str,
-    interface_index: libc::c_uint,
-) -> Result<SockAddressLinkLayer, AppError> {
-    let mut link_layer_destination: SockAddressLinkLayer = unsafe { zeroed() };
-    link_layer_destination.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
-    link_layer_destination.link_layer_protocol =
-        ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
-    link_layer_destination.interface_index =
-        libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
-            interface_name: interface_name.to_string(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("interface index {interface_index} does not fit sockaddr_ll"),
-            ),
-        })?;
-    link_layer_destination.hardware_type = ARP_HARDWARE_TYPE_ETHERNET;
-    link_layer_destination.hardware_address_length = 6;
-    link_layer_destination.hardware_address[0..6].fill(0xFF);
-    Ok(link_layer_destination)
-}
-
 fn run_address_resolution_request_rounds(
-    packet_socket: &std::os::fd::OwnedFd,
-    link_layer_destination: &SockAddressLinkLayer,
+    endpoint: &impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
     source_identity: (MacAddress, Ipv4Addr),
     scan_round_count: NonZeroU64,
@@ -187,8 +159,7 @@ fn run_address_resolution_request_rounds(
     for round_index in 0..total_rounds {
         for target_ipv4_address in target_ipv4_addresses {
             send_one_address_resolution_request(
-                packet_socket,
-                link_layer_destination,
+                endpoint,
                 source_mac_address,
                 source_ipv4_address,
                 *target_ipv4_address,
@@ -206,7 +177,7 @@ fn run_address_resolution_request_rounds(
 }
 
 fn collect_address_resolution_replies_until_deadline(
-    packet_socket: &std::os::fd::OwnedFd,
+    endpoint: &mut impl LinkLayerEndpoint,
     receive_buffer: &mut [u8],
     deadline: Instant,
     reply_acceptance: &ArpReplyAcceptance,
@@ -217,25 +188,14 @@ fn collect_address_resolution_replies_until_deadline(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let timeout_milliseconds = poll_timeout_milliseconds_for_receive_wait(remaining);
 
-        match linux_system_call::poll_socket_readiness(
-            packet_socket,
-            libc::POLLIN,
-            timeout_milliseconds,
-        ) {
-            Ok(0) => {}
-            Ok(_) => {
-                drain_readable_packet_socket(
-                    packet_socket,
-                    receive_buffer,
-                    reply_acceptance,
-                    &mut discovered_hosts,
-                    warnings,
-                )?;
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(source) => {
-                return Err(AppError::PollWaitFailed { source });
-            }
+        if endpoint.wait_until_readable(timeout_milliseconds)? {
+            drain_buffered_reply_frames(
+                endpoint,
+                receive_buffer,
+                reply_acceptance,
+                &mut discovered_hosts,
+                warnings,
+            )?;
         }
     }
     Ok(discovered_hosts)
@@ -261,7 +221,9 @@ pub fn perform_arp_scan(
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
 ) -> Result<ScanOutcome, AppError> {
-    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
+    // Validate interface usability (loopback / down / NOARP rejection) before opening any socket;
+    // `open_linux_link_layer_endpoint` repeats this validation while acquiring the descriptor.
+    validated_interface_index_for_arp_scanning(interface_name)?;
     let addresses = discover_interface_scan_addresses(interface_name)?;
     let host_address_iterator = Ipv4HostAddressIterator::try_from_ipv4_address_on_subnet(
         addresses.source_ipv4_address,
@@ -272,9 +234,7 @@ pub fn perform_arp_scan(
     let network_bits = addresses.source_ipv4_address.to_bits() & mask_bits;
     let broadcast_bits = network_bits | !mask_bits;
 
-    let packet_socket = open_bound_raw_arp_packet_socket(interface_name)?;
-    let link_layer_destination =
-        link_layer_broadcast_destination_for_arp(interface_name, interface_index)?;
+    let mut endpoint = open_linux_link_layer_endpoint(interface_name)?;
 
     let mut warnings = Vec::new();
 
@@ -285,8 +245,7 @@ pub fn perform_arp_scan(
         broadcast_bits,
     );
     run_address_resolution_request_rounds(
-        &packet_socket,
-        &link_layer_destination,
+        &endpoint,
         &targets,
         (addresses.source_mac_address, addresses.source_ipv4_address),
         scan_round_count,
@@ -302,7 +261,7 @@ pub fn perform_arp_scan(
         broadcast_bits,
     };
     let discovered_hosts = collect_address_resolution_replies_until_deadline(
-        &packet_socket,
+        &mut endpoint,
         &mut receive_buffer,
         deadline,
         &reply_acceptance,
@@ -371,7 +330,10 @@ pub fn perform_arp_probe(
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
 ) -> Result<ScanOutcome, AppError> {
-    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
+    // Validate interface usability and the single target before opening any socket;
+    // `open_linux_link_layer_endpoint` repeats the interface validation while acquiring the
+    // descriptor.
+    validated_interface_index_for_arp_scanning(interface_name)?;
     let addresses = discover_interface_scan_addresses(interface_name)?;
     validate_strict_interior_scan_target_ipv4_address(
         interface_name,
@@ -380,15 +342,12 @@ pub fn perform_arp_probe(
         addresses.ipv4_netmask,
     )?;
 
-    let packet_socket = open_bound_raw_arp_packet_socket(interface_name)?;
-    let link_layer_destination =
-        link_layer_broadcast_destination_for_arp(interface_name, interface_index)?;
+    let mut endpoint = open_linux_link_layer_endpoint(interface_name)?;
 
     let mut warnings = Vec::new();
     let targets = [target_ipv4_address];
     run_address_resolution_request_rounds(
-        &packet_socket,
-        &link_layer_destination,
+        &endpoint,
         &targets,
         (addresses.source_mac_address, addresses.source_ipv4_address),
         scan_round_count,
@@ -402,7 +361,7 @@ pub fn perform_arp_probe(
         target_ipv4_address,
     };
     let discovered_hosts = collect_address_resolution_replies_until_deadline(
-        &packet_socket,
+        &mut endpoint,
         &mut receive_buffer,
         deadline,
         &reply_acceptance,
@@ -427,8 +386,7 @@ pub fn perform_arp_probe(
 }
 
 fn send_one_address_resolution_request(
-    packet_socket: &std::os::fd::OwnedFd,
-    link_layer_destination: &SockAddressLinkLayer,
+    endpoint: &impl LinkLayerEndpoint,
     source_mac_address: MacAddress,
     source_ipv4_address: Ipv4Addr,
     target_ipv4_address: Ipv4Addr,
@@ -439,64 +397,35 @@ fn send_one_address_resolution_request(
         source_ipv4_address,
         target_ipv4_address,
     );
-    match linux_system_call::send_to_link_layer(
-        packet_socket,
-        frame.as_ref(),
-        link_layer_destination.as_libc_sockaddr_link_layer(),
-    ) {
-        Ok(_) => {}
-        Err(source) => {
-            warnings.push(format!(
-                "failed to send ARP request to {target_ipv4_address}: {source}"
-            ));
-        }
+    if let Err(source) = endpoint.send_ethernet_frame(frame.as_ref()) {
+        warnings.push(format!(
+            "failed to send ARP request to {target_ipv4_address}: {source}"
+        ));
     }
 }
 
-fn drain_readable_packet_socket(
-    packet_socket: &std::os::fd::OwnedFd,
+fn drain_buffered_reply_frames(
+    endpoint: &mut impl LinkLayerEndpoint,
     receive_buffer: &mut [u8],
     reply_acceptance: &ArpReplyAcceptance,
     discovered_hosts: &mut BTreeMap<Ipv4Addr, MacAddress>,
     warnings: &mut Vec<String>,
 ) -> Result<(), AppError> {
-    loop {
-        match linux_system_call::receive_from_link_layer(
-            packet_socket,
-            receive_buffer,
-            libc::MSG_DONTWAIT,
-            None,
-        ) {
-            Ok(0) => {
-                break;
-            }
-            Ok(bytes_received) => {
-                let frame_slice = &receive_buffer[..bytes_received];
-                match try_parse_address_resolution_reply_ipv4_over_ethernet(frame_slice) {
-                    Ok((sender_ipv4_address, sender_mac_address)) => {
-                        if reply_acceptance.accepts_sender_ipv4_address(sender_ipv4_address) {
-                            merge_address_resolution_reply_sender_into_discovered_hosts(
-                                discovered_hosts,
-                                sender_ipv4_address,
-                                sender_mac_address,
-                                warnings,
-                            );
-                        }
-                    }
-                    Err(reason) => {
-                        warnings.push(format!("received malformed Ethernet/ARP frame: {reason}"));
-                    }
+    while let Some(bytes_received) = endpoint.try_receive_ethernet_frame(receive_buffer)? {
+        let frame_slice = &receive_buffer[..bytes_received];
+        match try_parse_address_resolution_reply_ipv4_over_ethernet(frame_slice) {
+            Ok((sender_ipv4_address, sender_mac_address)) => {
+                if reply_acceptance.accepts_sender_ipv4_address(sender_ipv4_address) {
+                    merge_address_resolution_reply_sender_into_discovered_hosts(
+                        discovered_hosts,
+                        sender_ipv4_address,
+                        sender_mac_address,
+                        warnings,
+                    );
                 }
             }
-            Err(source)
-                if source.raw_os_error() == Some(libc::EAGAIN)
-                    || source.raw_os_error() == Some(libc::EWOULDBLOCK) =>
-            {
-                break;
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(source) => {
-                return Err(AppError::RawPacketReceiveFailed { source });
+            Err(reason) => {
+                warnings.push(format!("received malformed Ethernet/ARP frame: {reason}"));
             }
         }
     }

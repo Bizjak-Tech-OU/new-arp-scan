@@ -6,40 +6,13 @@ use std::os::fd::OwnedFd;
 
 use crate::error::AppError;
 use crate::interface_validation;
+use crate::link_layer_backend::LinkLayerEndpoint;
 use crate::linux_packet::{
     ARP_HARDWARE_TYPE_ETHERNET, ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK,
     INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SOCKET_ADDRESS_FAMILY_PACKET, SockAddressLinkLayer,
     ethernet_protocol_host_to_network_order,
 };
 use crate::linux_system_call;
-
-/// Opens a raw `AF_PACKET` socket, binds it to `interface_name`, and returns the socket for ARP
-/// scanning.
-///
-/// # Errors
-///
-/// Returns [`AppError::InvalidInterfaceName`] when the interface name is not usable.
-///
-/// Returns [`AppError::InterfaceLookupFailed`] when the interface cannot be resolved.
-///
-/// Returns [`AppError::InterfaceFlagsQueryFailed`] when interface flags cannot be read.
-///
-/// Returns [`AppError::InterfaceRejectedForScanning`] when the interface is loopback,
-/// administratively down, or has `NOARP` set.
-///
-/// Returns [`AppError::RawSocketOpenFailed`], [`AppError::RawSocketCapabilityRequired`], or
-/// [`AppError::SocketBindFailed`] when the underlying syscalls fail (for example missing
-/// `CAP_NET_RAW`).
-///
-/// # Panics
-///
-/// This function does not panic.
-pub fn open_bound_raw_arp_packet_socket(interface_name: &str) -> Result<OwnedFd, AppError> {
-    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
-    let packet_socket = open_raw_packet_socket()?;
-    bind_packet_socket_to_interface(&packet_socket, interface_name, interface_index)?;
-    Ok(packet_socket)
-}
 
 /// Validates that `interface_name` is usable for ARP scanning and returns its Linux interface
 /// index.
@@ -158,6 +131,109 @@ fn bind_packet_socket_to_interface(
         address.as_libc_sockaddr_link_layer(),
     )
     .map_err(|source| AppError::SocketBindFailed { source })
+}
+
+/// Builds the broadcast `sockaddr_ll` destination used to send ARP requests on `interface_index`.
+fn link_layer_broadcast_destination_for_arp(
+    interface_name: &str,
+    interface_index: libc::c_uint,
+) -> Result<SockAddressLinkLayer, AppError> {
+    let mut link_layer_destination: SockAddressLinkLayer = unsafe { zeroed() };
+    link_layer_destination.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
+    link_layer_destination.link_layer_protocol =
+        ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+    link_layer_destination.interface_index =
+        libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
+            interface_name: interface_name.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("interface index {interface_index} does not fit sockaddr_ll"),
+            ),
+        })?;
+    link_layer_destination.hardware_type = ARP_HARDWARE_TYPE_ETHERNET;
+    link_layer_destination.hardware_address_length = 6;
+    link_layer_destination.hardware_address[0..6].fill(0xFF);
+    Ok(link_layer_destination)
+}
+
+/// A Linux `AF_PACKET` raw socket bound to one interface, used to send and receive ARP frames.
+///
+/// Owns the bound socket (closed on drop) and the precomputed broadcast `sockaddr_ll` destination.
+pub struct LinuxLinkLayerEndpoint {
+    packet_socket: OwnedFd,
+    link_layer_destination: SockAddressLinkLayer,
+}
+
+/// Opens a raw `AF_PACKET` socket bound to `interface_name` and returns a link-layer endpoint for
+/// ARP scanning.
+///
+/// # Errors
+///
+/// Returns [`AppError`] when the interface name is invalid or unusable, when the raw socket cannot
+/// be opened or bound (for example missing `CAP_NET_RAW`), or when the interface index does not fit
+/// the link-layer address.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn open_linux_link_layer_endpoint(
+    interface_name: &str,
+) -> Result<LinuxLinkLayerEndpoint, AppError> {
+    let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
+    let packet_socket = open_raw_packet_socket()?;
+    bind_packet_socket_to_interface(&packet_socket, interface_name, interface_index)?;
+    let link_layer_destination =
+        link_layer_broadcast_destination_for_arp(interface_name, interface_index)?;
+    Ok(LinuxLinkLayerEndpoint {
+        packet_socket,
+        link_layer_destination,
+    })
+}
+
+impl LinkLayerEndpoint for LinuxLinkLayerEndpoint {
+    fn send_ethernet_frame(&self, frame: &[u8]) -> std::io::Result<()> {
+        linux_system_call::send_to_link_layer(
+            &self.packet_socket,
+            frame,
+            self.link_layer_destination.as_libc_sockaddr_link_layer(),
+        )
+        .map(|_sent| ())
+    }
+
+    fn wait_until_readable(&self, timeout_milliseconds: libc::c_int) -> Result<bool, AppError> {
+        match linux_system_call::poll_socket_readiness(
+            &self.packet_socket,
+            libc::POLLIN,
+            timeout_milliseconds,
+        ) {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+            Err(source) => Err(AppError::PollWaitFailed { source }),
+        }
+    }
+
+    fn try_receive_ethernet_frame(&mut self, buffer: &mut [u8]) -> Result<Option<usize>, AppError> {
+        loop {
+            match linux_system_call::receive_from_link_layer(
+                &self.packet_socket,
+                buffer,
+                libc::MSG_DONTWAIT,
+                None,
+            ) {
+                Ok(0) => return Ok(None),
+                Ok(bytes_received) => return Ok(Some(bytes_received)),
+                Err(source)
+                    if source.raw_os_error() == Some(libc::EAGAIN)
+                        || source.raw_os_error() == Some(libc::EWOULDBLOCK) =>
+                {
+                    return Ok(None);
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) => return Err(AppError::RawPacketReceiveFailed { source }),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
