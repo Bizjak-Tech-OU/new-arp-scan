@@ -14,15 +14,14 @@ Tracked for release documentation: [GitHub issue #33](https://github.com/Bizjak-
 | **Application surface** | `lib.rs`, `application_command.rs`, `application_outcome.rs` | Public `run(ApplicationCommand)` contract, outcomes, operator output layout, timing summary attachment after successful Linux scans. |
 | **Operator parsing** | `cli.rs` | Command-line types and validation (delegated from `main.rs`). |
 | **Errors** | `error.rs` | Single [`AppError`](../src/error.rs) enum; `Display` / `Error` for operators and tests. |
-| **Pure IPv4 logic** | `ipv4_subnet.rs`, `ipv4_cidr.rs` | Subnet math and CIDR parsing; built on every target for CI without Linux sockets. |
-| **Name / shape checks** | `interface_validation.rs` | Interface name rules and Linux `ifreq` name packing helpers. |
-| **Link and ARP encoding** | `mac_address.rs`, `ethernet_frame.rs`, `address_resolution_protocol.rs` | Types and on-wire framing for Ethernet II + ARP. |
-| **Linux discovery** | `linux_interface_discovery.rs`, `linux_socket.rs` | Usable-interface classification, `ioctl` address and flag reads, raw socket open/bind. |
-| **Linux syscalls** | `linux_system_call.rs` | Centralized `libc` calls (`socket`, `poll`, `if_nameindex`, …) with small safe wrappers where possible. |
-| **Scan orchestration** | `linux_scanner.rs` | Target iteration, send/receive scheduling, merge duplicate replies, warnings. |
-| **Packet layout** | `linux_packet.rs` | `sockaddr_ll` and related layout checks shared with tests. |
+| **Pure IPv4 logic** | `ipv4_subnet.rs`, `ipv4_cidr.rs` | Subnet math and CIDR parsing; built on every target. |
+| **Name / shape checks** | `interface_validation.rs` | Interface name rules and `ifreq` name packing helpers (shared by both backends). |
+| **Link and ARP encoding** | `mac_address.rs`, `ethernet_frame.rs`, `address_resolution_protocol.rs` | Types and on-wire framing for Ethernet II + ARP; built on every target. |
+| **Portable link layer** | `link_layer_backend.rs`, `scanner.rs` | The `LinkLayerEndpoint` trait and shared interface/address value types; the backend-generic scan engine (target iteration, send/receive scheduling, merge duplicate replies, warnings). |
+| **Linux backend** | `linux_scanner.rs`, `linux_interface_discovery.rs`, `linux_socket.rs`, `linux_system_call.rs`, `linux_packet.rs` | `AF_PACKET` raw socket, `ioctl`/`if_nameindex` discovery, `sockaddr_ll`, and the Linux scan entry points. |
+| **macOS backend** | `macos_scanner.rs`, `macos_interface_discovery.rs`, `macos_bpf_socket.rs`, `macos_system_call.rs`, `macos_packet.rs` | Berkeley Packet Filter device (`/dev/bpf*`), `getifaddrs(3)` discovery, BPF ioctls/filter, and the macOS scan entry points. |
 
-Linux-only modules live behind `#[cfg(target_os = "linux")]` in [`lib.rs`](../src/lib.rs). Non-Linux builds compile pure logic and return [`AppError::UnsupportedPlatform`](../src/error.rs) from `run()` for scan and list commands.
+The pure logic, ARP/Ethernet encoders, portable boundary, and scan engine compile on **every** target. The Linux and macOS backend modules live behind `#[cfg(target_os = "linux")]` / `#[cfg(target_os = "macos")]` in [`lib.rs`](../src/lib.rs). On operating systems without a backend, `run()` returns [`AppError::UnsupportedPlatform`](../src/error.rs) for scan and list commands.
 
 ---
 
@@ -35,7 +34,10 @@ Typical clusters:
 - **`linux_system_call.rs`** — `libc` sockets, `ioctl`, `poll`, `if_nameindex` / `if_freenameindex`, send/receive on file descriptors. Each block should carry a **`// SAFETY:`** comment per project rules.
 - **`linux_interface_discovery.rs`**, **`linux_socket.rs`**, **`interface_validation.rs`** — `ifreq` and `sockaddr` manipulation, reading kernel-populated fields.
 - **`linux_packet.rs`** — casting a known layout to `sockaddr_ll` for interpretation.
-- **`linux_scanner.rs`** — zeroed link-layer address structures where the kernel fills fields after sends.
+- **`macos_system_call.rs`** — all macOS `libc` calls (`getifaddrs`, `if_nametoindex`, BPF `ioctl`s, `read`/`write`/`poll`/`fcntl`) plus `sockaddr` / `sockaddr_dl` field reads. macOS `unsafe` is centralized here.
+- **`macos_bpf_socket.rs`** — zeroed `ifreq` for `BIOCSETIF`; the BPF record de-aggregation itself is **safe** byte-slice arithmetic.
+
+The portable `scanner.rs` and the pure encoders contain **no** `unsafe`.
 
 **Rule of thumb:** treat new `unsafe` as a **last resort**, document invariants beside the block, and add a **DECISIONS.md** entry if the change is non-obvious.
 
@@ -47,14 +49,18 @@ Typical clusters:
 CLI / library caller
        │
        ▼
-  run() ──► resolve interface, validate, build target list (IPv4 subnet or single --host)
+  run() ──► resolve interface + discover addresses (linux_/macos_interface_discovery)
        │
        ▼
-linux_scanner: open AF_PACKET SOCK_RAW, bind to interface + ETH_P_ARP
+  open a LinkLayerEndpoint:
+     Linux  → AF_PACKET SOCK_RAW bound to interface + ETH_P_ARP (linux_socket)
+     macOS  → /dev/bpf* attached to interface + ARP-only filter   (macos_bpf_socket)
        │
-       ├──► For each round: build Ethernet II ARP request frames → send on raw socket
+       ▼
+  scanner (shared, backend-generic):
+       ├──► For each round: build Ethernet II ARP request frames → endpoint.send
        │
-       └──► Receive loop (poll + recv): parse Ethernet II + ARP replies
+       └──► Receive loop (wait_until_readable + try_receive): parse Ethernet II + ARP replies
                  │
                  ▼
             Merge into DiscoveredHost map, collect warnings
@@ -94,9 +100,10 @@ Privileged **full-subnet** scans are validated manually (for example with `tcpdu
 | Goal | Start here |
 |------|----------------|
 | New CLI flag | `cli.rs`, `application_command.rs`, `main.rs` dispatch only |
-| New scan semantics | `linux_scanner.rs`, possibly `ipv4_subnet.rs` |
+| New scan semantics (both platforms) | `scanner.rs`, possibly `ipv4_subnet.rs` |
 | New operator output | `application_outcome.rs` (`write_operator_streams`, formatting) |
 | New `AppError` variant | `error.rs`, then every `Display` / `source` path and matching tests |
-| New syscall wrapper | `linux_system_call.rs` first |
+| New syscall wrapper | `linux_system_call.rs` (Linux) or `macos_system_call.rs` (macOS) |
+| New link-layer backend operation | `link_layer_backend.rs` trait, then each backend endpoint |
 
 When in doubt, open a small pull request and point reviewers to this file for orientation.
