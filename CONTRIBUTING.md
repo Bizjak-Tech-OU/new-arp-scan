@@ -57,6 +57,35 @@ If you believe `unsafe` is required, record the architectural justification in `
 - Fix issues rather than silencing them.
 - Undocumented `#[allow(...)]` attributes are not acceptable unless paired with a comment explaining why the suppression is correct **and** a `DECISIONS.md` entry.
 
+## Platform testing
+
+The crate supports **Linux** (`AF_PACKET` raw sockets) and **macOS** (Berkeley Packet Filter). Continuous integration runs the hermetic gate on **`macos-latest`** on every push and pull request to `master` (`.github/workflows/ci.yml`):
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+These are the same checks as `make lint` / `make test`, except CI uses `cargo fmt --all -- --check` (verify only, never rewrite).
+
+**Privileged live scans stay manual** — CI never opens a packet socket or BPF device for a real scan. To acceptance-test on hardware you control:
+
+- **macOS** (needs root / BPF access):
+
+  ```sh
+  cargo build
+  sudo ./target/debug/new-arp-scan interfaces
+  sudo ./target/debug/new-arp-scan scan --interface en0
+  sudo ./target/debug/new-arp-scan scan --interface en0 --host 192.168.1.50
+  ```
+
+  `interfaces` needs no privileges; `scan` opens `/dev/bpf*` and fails with a "run with sudo" error otherwise. Verify frames with `tcpdump -ni en0 arp` in another terminal.
+
+- **Linux** (needs `CAP_NET_RAW`, typically via `sudo`): use the same commands with the appropriate interface (for example `eth0`). See [docs/linux-platform.md](docs/linux-platform.md).
+
+When you change the developer workflow commands, update the `Makefile`, this file, and the CI workflow together so they stay aligned.
+
 ## Licensing
 
 By contributing, you agree that your contributions are licensed under the **GNU Affero General Public License v3.0 only**, the same license as the project (`LICENSE`).
