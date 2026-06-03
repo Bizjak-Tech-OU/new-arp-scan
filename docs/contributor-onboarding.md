@@ -79,11 +79,12 @@ Summary:
 
 ---
 
-## Linux-only and documentation depth
+## Platform paths and documentation depth
 
-If you work on packet paths or CI behavior on Linux, read:
+If you work on packet paths or CI behavior, read:
 
 - [Linux platform support](linux-platform.md) — `AF_PACKET`, capabilities, namespaces (optional).
+- [macOS platform support](macos-platform.md) — Berkeley Packet Filter, root requirements, interface naming, validation.
 - [Architecture overview](architecture.md) — module map and packet flow.
 
 ---

@@ -63,4 +63,5 @@ Additional notes live under [docs/](docs/):
 | [Contributor onboarding](docs/contributor-onboarding.md) | First-time build, lint, test, and pull-request checklist |
 | [Architecture overview](docs/architecture.md) | Module map, `unsafe` boundaries, packet flow, testing strategy |
 | [Linux platform support](docs/linux-platform.md) | `AF_PACKET` / raw sockets, capabilities, CI vs local testing, namespaces |
+| [macOS platform support](docs/macos-platform.md) | Berkeley Packet Filter, root requirements, interface naming, `tcpdump` validation |
 | [Operator reference (HTML)](docs/docs.html) | CLI behavior, output, and library overview (static site) |
