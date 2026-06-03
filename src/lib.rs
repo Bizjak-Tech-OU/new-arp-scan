@@ -32,6 +32,8 @@ mod macos_interface_discovery;
 #[cfg(target_os = "macos")]
 mod macos_packet;
 #[cfg(target_os = "macos")]
+mod macos_scanner;
+#[cfg(target_os = "macos")]
 mod macos_system_call;
 
 pub use application_command::{
@@ -91,12 +93,15 @@ pub use linux_scanner::perform_arp_probe;
 ///     attempts: DEFAULT_SCAN_ATTEMPTS,
 /// });
 ///
-/// # #[cfg(not(target_os = "linux"))]
+/// // On Linux and macOS this attempts a real scan (which may fail without privileges or for an
+/// // unknown interface); only operating systems without a raw link-layer backend report
+/// // `UnsupportedPlatform`.
+/// # #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 /// assert!(
 ///     matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-///     "expected unsupported platform off Linux, got: {outcome:?}"
+///     "expected unsupported platform on operating systems without a backend, got: {outcome:?}"
 /// );
-/// # #[cfg(target_os = "linux")]
+/// # #[cfg(any(target_os = "linux", target_os = "macos"))]
 /// # {
 /// #     let _ = outcome;
 /// # }
@@ -146,10 +151,40 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                 Ok(ApplicationOutcome::Scan(scan_outcome))
             }
 
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
             {
-                // macOS scan dispatch (over the Berkeley Packet Filter backend) lands in #56;
-                // until then the timing and target parameters are intentionally unused here.
+                let resolved_interface_name =
+                    macos_interface_discovery::resolve_scan_interface_name(
+                        interface_name.as_deref(),
+                    )?;
+                let scan_wall_clock_started = std::time::Instant::now();
+                let scan_outcome = match target_ipv4_address {
+                    Some(target_ipv4_address) => macos_scanner::perform_arp_probe(
+                        &resolved_interface_name,
+                        target_ipv4_address,
+                        timeout,
+                        pacing,
+                        attempts,
+                    )?,
+                    None => macos_scanner::perform_arp_scan(
+                        &resolved_interface_name,
+                        timeout,
+                        pacing,
+                        attempts,
+                    )?,
+                };
+                let scan_outcome = scan_outcome.with_scan_timing_summary(
+                    resolved_interface_name,
+                    scan_wall_clock_started.elapsed(),
+                    attempts,
+                );
+                Ok(ApplicationOutcome::Scan(scan_outcome))
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                // No raw link-layer backend on this operating system; the timing and target
+                // parameters are intentionally unused on the unsupported path.
                 let _ = (&target_ipv4_address, &timeout, &pacing, &attempts);
                 Err(AppError::UnsupportedPlatform {
                     operating_system: std::env::consts::OS.to_string(),
@@ -258,9 +293,9 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn returns_unsupported_platform_when_scanning_on_non_linux() {
+    fn returns_unsupported_platform_when_scanning_on_unsupported_os() {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -276,13 +311,13 @@ mod tests {
         // Assert
         assert!(
             matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-            "non-linux hosts should report unsupported platform, got: {outcome:?}"
+            "unsupported hosts should report unsupported platform, got: {outcome:?}"
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn returns_unsupported_platform_when_scanning_on_non_linux_even_with_custom_scan_timing() {
+    fn returns_unsupported_platform_when_scanning_on_unsupported_os_even_with_custom_scan_timing() {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -302,9 +337,9 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn returns_unsupported_platform_when_scanning_on_non_linux_with_target_ipv4_address_set() {
+    fn returns_unsupported_platform_when_scanning_on_unsupported_os_with_target_ipv4_address_set() {
         // Arrange
         use std::net::Ipv4Addr;
 
@@ -322,7 +357,7 @@ mod tests {
         // Assert
         assert!(
             matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-            "non-linux hosts should reject scan before Linux-only probe dispatch, got: {outcome:?}"
+            "unsupported hosts should reject scan before backend dispatch, got: {outcome:?}"
         );
     }
 
@@ -361,9 +396,9 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn returns_unsupported_platform_when_scanning_without_interface_name_on_non_linux() {
+    fn returns_unsupported_platform_when_scanning_without_interface_name_on_unsupported_os() {
         // Arrange
         let command = ApplicationCommand::Scan {
             interface_name: None,
@@ -379,7 +414,55 @@ mod tests {
         // Assert
         assert!(
             matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-            "automatic selection should still hit unsupported platform off Linux, got: {outcome:?}"
+            "automatic selection should still hit unsupported platform on unsupported OSes, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn returns_lookup_failure_when_scanning_unknown_interface_on_macos() {
+        // Arrange
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("narp_absent0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InterfaceLookupFailed { .. })),
+            "macOS should resolve a real backend (not report unsupported) and fail to find an \
+             unknown interface, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn returns_lookup_failure_when_probing_unknown_interface_on_macos() {
+        // Arrange
+        use std::net::Ipv4Addr;
+
+        let command = ApplicationCommand::Scan {
+            interface_name: Some("narp_absent0".to_string()),
+            target_ipv4_address: Some(Ipv4Addr::new(192, 168, 1, 2)),
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+        };
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::InterfaceLookupFailed { .. })),
+            "macOS single-target scan of an unknown interface should fail to find it, not report \
+             unsupported, got: {outcome:?}"
         );
     }
 

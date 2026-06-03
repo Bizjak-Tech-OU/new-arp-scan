@@ -4,10 +4,6 @@
 //! reply merging, and warning collection are all platform-neutral. They are parameterized over the
 //! [`LinkLayerEndpoint`] backend, so Linux (`AF_PACKET`) and macOS (Berkeley Packet Filter) share
 //! one scan engine and only differ in interface discovery and raw frame input/output.
-//!
-//! On macOS this engine is reached through the scan path `run()` wires in #56; until then it has no
-//! caller off Linux, so dead code is allowed for non-Linux builds and removed once #56 lands.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
