@@ -26,6 +26,13 @@ mod linux_socket;
 #[cfg(target_os = "linux")]
 mod linux_system_call;
 
+#[cfg(target_os = "macos")]
+mod macos_interface_discovery;
+#[cfg(target_os = "macos")]
+mod macos_packet;
+#[cfg(target_os = "macos")]
+mod macos_system_call;
+
 pub use application_command::{
     ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
 };
@@ -140,6 +147,9 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
 
             #[cfg(not(target_os = "linux"))]
             {
+                // macOS scan dispatch (over the Berkeley Packet Filter backend) lands in #56;
+                // until then the timing and target parameters are intentionally unused here.
+                let _ = (&target_ipv4_address, &timeout, &pacing, &attempts);
                 Err(AppError::UnsupportedPlatform {
                     operating_system: std::env::consts::OS.to_string(),
                 })
@@ -150,23 +160,17 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
             {
                 let candidates =
                     linux_interface_discovery::enumerate_usable_arp_scan_interface_candidates()?;
-                let entries = candidates
-                    .into_iter()
-                    .map(|candidate| application_outcome::UsableInterfaceListingRow {
-                        interface_name: candidate.interface_name,
-                        interface_index: candidate.interface_index,
-                        ipv4_address: candidate.source_ipv4_address,
-                        ipv4_netmask: candidate.ipv4_netmask,
-                        media_access_control_address: candidate.source_mac_address,
-                    })
-                    .collect();
-
-                Ok(ApplicationOutcome::UsableInterfacesList(
-                    application_outcome::UsableInterfacesListOutcome { entries },
-                ))
+                Ok(usable_interfaces_outcome_from_candidates(candidates))
             }
 
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            {
+                let candidates =
+                    macos_interface_discovery::enumerate_usable_arp_scan_interface_candidates()?;
+                Ok(usable_interfaces_outcome_from_candidates(candidates))
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 Err(AppError::UnsupportedPlatform {
                     operating_system: std::env::consts::OS.to_string(),
@@ -174,6 +178,28 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
             }
         }
     }
+}
+
+/// Builds a [`UsableInterfacesList`](ApplicationOutcome::UsableInterfacesList) outcome from the
+/// shared interface candidates produced by a platform discovery backend.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn usable_interfaces_outcome_from_candidates(
+    candidates: Vec<link_layer_backend::ArpScanInterfaceCandidate>,
+) -> ApplicationOutcome {
+    let entries = candidates
+        .into_iter()
+        .map(|candidate| application_outcome::UsableInterfaceListingRow {
+            interface_name: candidate.interface_name,
+            interface_index: candidate.interface_index,
+            ipv4_address: candidate.source_ipv4_address,
+            ipv4_netmask: candidate.ipv4_netmask,
+            media_access_control_address: candidate.source_mac_address,
+        })
+        .collect();
+
+    ApplicationOutcome::UsableInterfacesList(application_outcome::UsableInterfacesListOutcome {
+        entries,
+    })
 }
 
 #[cfg(test)]
@@ -260,7 +286,7 @@ mod tests {
         let command = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
             target_ipv4_address: None,
-            timeout: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_mins(1),
             pacing: std::time::Duration::from_millis(999),
             attempts: DEFAULT_SCAN_ATTEMPTS,
         };
@@ -299,9 +325,9 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn returns_unsupported_platform_when_listing_interfaces_on_non_linux() {
+    fn returns_unsupported_platform_when_listing_interfaces_on_unsupported_os() {
         // Arrange
         let command = ApplicationCommand::UsableInterfacesList;
 
@@ -311,7 +337,26 @@ mod tests {
         // Assert
         assert!(
             matches!(outcome, Err(AppError::UnsupportedPlatform { .. })),
-            "non-linux hosts should report unsupported platform, got: {outcome:?}"
+            "unsupported hosts should report unsupported platform, got: {outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lists_usable_interfaces_without_error_on_macos() {
+        // Arrange
+        let command = ApplicationCommand::UsableInterfacesList;
+
+        // Act
+        let outcome = run(command);
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Ok(super::ApplicationOutcome::UsableInterfacesList(_))
+            ),
+            "macOS should enumerate usable interfaces without privileges, got: {outcome:?}"
         );
     }
 

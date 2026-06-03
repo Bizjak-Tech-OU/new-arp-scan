@@ -91,6 +91,12 @@ pub fn inclusive_host_address_range_excluding_edges(
 /// # Panics
 ///
 /// This function does not panic.
+// Used by the scan path of each backend; the macOS scan path lands in #56. Excludes `test` so the
+// in-module unit tests still exercise it on macOS.
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "consumed by the macOS scan path in #56")
+)]
 pub fn ipv4_address_is_strictly_inside_subnet(
     candidate: Ipv4Addr,
     network_bits: u32,
@@ -115,6 +121,12 @@ pub fn ipv4_address_is_strictly_inside_subnet(
 /// # Panics
 ///
 /// This function does not panic.
+// Used by the single-target scan path of each backend; the macOS scan path lands in #56. Excludes
+// `test` so the in-module unit tests still exercise it on macOS.
+#[cfg_attr(
+    all(not(target_os = "linux"), not(test)),
+    expect(dead_code, reason = "consumed by the macOS scan path in #56")
+)]
 pub fn validate_strict_interior_scan_target_ipv4_address(
     interface_name: &str,
     target_ipv4_address: Ipv4Addr,

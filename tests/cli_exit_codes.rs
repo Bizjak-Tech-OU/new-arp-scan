@@ -71,9 +71,9 @@ fn binary_exits_with_usage_error_code_for_unknown_subcommand() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn binary_interfaces_exits_with_operational_failure_on_non_linux() {
+fn binary_interfaces_exits_with_operational_failure_on_unsupported_os() {
     // Arrange
     let binary_path = new_arp_scan_binary_path();
     assert!(
@@ -92,13 +92,39 @@ fn binary_interfaces_exits_with_operational_failure_on_non_linux() {
     assert_eq!(
         output.status.code(),
         Some(1),
-        "interfaces on non-Linux should exit with operational failure code 1, stderr: {}",
+        "interfaces on an unsupported OS should exit with operational failure code 1, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("unsupported") || stderr.contains("Unsupported"),
         "stderr should describe unsupported platform, got: {stderr}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn binary_interfaces_exits_successfully_on_macos() {
+    // Arrange
+    let binary_path = new_arp_scan_binary_path();
+    assert!(
+        binary_path.is_file(),
+        "expected binary at {}, set CARGO_BIN_EXE or run `cargo test` from the crate root",
+        binary_path.display()
+    );
+
+    // Act
+    let output = std::process::Command::new(&binary_path)
+        .arg("interfaces")
+        .output()
+        .expect("spawning interfaces subcommand should succeed");
+
+    // Assert
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "interfaces enumeration on macOS needs no privileges and should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
