@@ -195,8 +195,19 @@ Resolved fields are encoded through [`AddressResolutionRequestLayout`](src/addre
 **Decision:** Operators can complete the remaining original `arp-scan` outgoing packet option and the rest of the IEEE 802.1Q TCI on `scan`:
 
 - **`--padding <HEX>`** matches original `arp-scan`: hex-encoded binary with an even number of digits and **no** `0x` prefix, appended after the 28-octet ARP PDU. The Ethernet frame is still zero-padded to 60 octets without FCS when shorter. With `--llc`, custom padding is included in the IEEE 802.3 length (MAC client data = LLC + SNAP + ARP + padding). Padding that would make MAC client data exceed 1500 octets is rejected (Ethernet II maximum 1472 padding octets; SNAP maximum 1464). Oversize payloads are not silently truncated.
-- **`--pcp <0..=7>`** and **`--dei`** require `--vlan`. They encode the IEEE 802.1Q TCI as `(PCP << 13) | (DEI << 12) | VID`. Omitted PCP is 0 and omitted DEI is 0, matching the previous VID-only send. VID 0 remains legal (priority tagging). Receive still exposes only the 12-bit VID.
+- **`--pcp <0..=7>`** and **`--dei`** require `--vlan`. They encode the IEEE 802.1Q TCI as `(PCP << 13) | (DEI << 12) | VID`. Omitted PCP is 0 and omitted DEI is 0, matching the previous VID-only send. VID 0 remains legal (priority tagging). Receive-side TCI decoding is superseded below.
 
 **Reason:** `--vlan` left PCP and DEI stuck at zero, so tagged frames could not express IEEE 802.1Q class of service. Custom `--padding` was the last original `arp-scan` outgoing packet option that still needed a `Vec` encode path once the 60-octet buffer was no longer a hard ceiling.
 
 **Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and `--prototype` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA, PCP 0, DEI 0, and no custom padding.
+
+## 2026-08-15 — Non-reply ARP is not malformed; receive decodes 802.1Q PCP/DEI
+
+**Decision:** Scan receive treats well-formed IPv4-over-Ethernet ARP that is not opcode 2 as LAN noise, not a parse failure, and Ethernet receive exposes the full IEEE 802.1Q TCI:
+
+- A crate-internal parser accepts any non-reserved RFC 826 opcode. The scanner records opcode 2 (`ares_op$REPLY`) only. Requests, RARP, and other well-formed opcodes are ignored without a `warning: received malformed Ethernet/ARP frame` line, matching original `arp-scan`. The public reply parser still rejects non-replies so library callers that asked for a reply keep that contract. RFC 5494 reserved `ar$op` values 0 and 65535 still warn as malformed.
+- `try_parse_ethernet_frame` now returns PCP, DEI, and VID for a single customer tag (TCI `0xF044` is PCP 7, DEI 1, VID `0x044`). `vlan_identifier` remains the low 12 bits for existing tests.
+
+**Reason:** Calling the reply parser on every ARP frame turned RFC 826 requests — including possible copies of our own transmitted requests — into operator-facing malformation warnings. Send-side `--pcp` / `--dei` without receive TCI decode left IEEE 802.1Q incomplete on the inbound path.
+
+**Consequences:** Inbound requests are not recorded as discovered hosts (a self-echo would map every target to the scanning MAC). Full RFC 5227 conflict-from-request / passive ACD remains deferred, as do QinQ / IEEE 802.1ad receive, bundled IEEE OUI data, `libpcap`, JSON output, adaptive pacing, and `--prototype`.

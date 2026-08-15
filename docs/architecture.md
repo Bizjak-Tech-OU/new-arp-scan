@@ -61,7 +61,8 @@ CLI / library caller
   scanner (shared, backend-generic):
        ├──► For each round: build ARP request frames (optional 802.1Q TCI, LLC/SNAP, dest/src MAC, ar$* overrides, --padding) → endpoint.send
        │
-       └──► Receive loop (wait_until_readable + try_receive): parse Ethernet II + ARP replies
+       └──► Receive loop (wait_until_readable + try_receive): parse Ethernet II + ARP;
+            record opcode 2 replies; ignore well-formed non-reply ARP; warn on malformed frames
                  │
                  ▼
             Merge into DiscoveredHost map, collect warnings

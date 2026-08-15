@@ -11,7 +11,7 @@ Tracked for release documentation: [GitHub issue #32](https://github.com/Bizjak-
 On Linux, `new-arp-scan` sends and receives **Ethernet II frames** carrying **IPv4 ARP** directly on a chosen interface. That requires:
 
 - A **packet socket** created with `AF_PACKET` and `SOCK_RAW` (see Linux `packet(7)`).
-- Binding that socket to the **link layer** (specific interface index) and filtering for **`ETH_P_ARP`** so the kernel delivers ARP frames to userspace. When **`--vlan`** or **`--llc`** is set, the socket is opened with **`ETH_P_ALL`** instead so IEEE 802.1Q-tagged replies (`EtherType 0x8100`) and IEEE 802.3 RFC 1042 SNAP frames (length field, not `0x0806`) are not dropped before the parser; non-ARP frames are ignored in userspace. Untagged SNAP transmit uses **`ETH_P_802_2`** as the `sockaddr_ll` protocol.
+- Binding that socket to the **link layer** (specific interface index) and filtering for **`ETH_P_ARP`** so the kernel delivers ARP frames to userspace. When **`--vlan`** or **`--llc`** is set, the socket is opened with **`ETH_P_ALL`** instead so IEEE 802.1Q-tagged replies (`EtherType 0x8100`) and IEEE 802.3 RFC 1042 SNAP frames (length field, not `0x0806`) are not dropped before the parser; non-ARP frames and well-formed non-reply ARP are ignored in userspace. Untagged SNAP transmit uses **`ETH_P_802_2`** as the `sockaddr_ll` protocol.
 
 This path bypasses the normal UDP/TCP stack for the probe traffic itself. The crate still uses conventional **IPv4 datagram sockets** in a few places for **portable** operations (for example interface enumeration helpers), but **subnet scanning and reply collection** depend on raw packet access.
 

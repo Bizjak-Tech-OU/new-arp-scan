@@ -13,8 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::address_resolution_protocol::{
-    encode_address_resolution_request_from_layout,
-    try_parse_address_resolution_reply_ipv4_over_ethernet,
+    ARP_OPERATION_REPLY, encode_address_resolution_request_from_layout,
+    try_parse_address_resolution_ipv4_over_ethernet,
 };
 use crate::application_command::ScanWireOptions;
 use crate::application_outcome::{DiscoveredHost, ScanOutcome};
@@ -242,16 +242,20 @@ fn drain_buffered_reply_frames(
         if ethernet_frame_is_not_address_resolution_protocol(frame_slice) {
             continue;
         }
-        match try_parse_address_resolution_reply_ipv4_over_ethernet(frame_slice) {
-            Ok((sender_ipv4_address, sender_mac_address)) => {
-                if reply_acceptance.accepts_sender_ipv4_address(sender_ipv4_address) {
+        match try_parse_address_resolution_ipv4_over_ethernet(frame_slice) {
+            Ok(parsed) if parsed.opcode == ARP_OPERATION_REPLY => {
+                if reply_acceptance.accepts_sender_ipv4_address(parsed.sender_protocol) {
                     merge_address_resolution_reply_sender_into_discovered_hosts(
                         discovered_hosts,
-                        sender_ipv4_address,
-                        sender_mac_address,
+                        parsed.sender_protocol,
+                        parsed.sender_hardware,
                         warnings,
                     );
                 }
+            }
+            Ok(_) => {
+                // Well-formed ARP that is not a reply (request, RARP, and so on) is expected LAN
+                // noise, including possible copies of our own requests. It is not a malformation.
             }
             Err(reason) => {
                 warnings.push(format!("received malformed Ethernet/ARP frame: {reason}"));
@@ -264,7 +268,8 @@ fn drain_buffered_reply_frames(
 
 /// Returns whether `frame_slice` is Ethernet that is not IPv4 ARP (including frames that cannot be
 /// parsed as Ethernet). Those arrivals are expected when the capture socket is bound to every
-/// protocol, and they are not operator-facing malformation warnings.
+/// protocol, and they are not operator-facing malformation warnings. Well-formed ARP that is not a
+/// reply is filtered after this check and is also not treated as malformed.
 fn ethernet_frame_is_not_address_resolution_protocol(frame_slice: &[u8]) -> bool {
     match try_parse_ethernet_frame(frame_slice) {
         Ok(parsed) => parsed.ether_type != ETHERNET_PROTOCOL_ARP,
@@ -1132,11 +1137,14 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
     use super::ArpReplyAcceptance;
     use super::ScanTransmitContext;
     use super::collect_scan_over_endpoint;
+    use crate::address_resolution_protocol::{
+        ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST, build_address_resolution_request_ethernet_frame,
+    };
     use crate::application_command::{ArpSenderProtocolAddress, ScanWireOptions};
     use crate::error::AppError;
     use crate::ethernet_frame::{
-        ETHERNET_PROTOCOL_IPV4, ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qPriorityCodePoint,
-        Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
+        ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_IPV4, ETHERNET_PROTOCOL_VLAN_TAG,
+        Ieee8021qPriorityCodePoint, Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
     };
     use crate::link_layer_backend::LinkLayerEndpoint;
     use crate::mac_address::MacAddress;
@@ -1174,6 +1182,21 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
             buffer[..frame.len()].copy_from_slice(&frame);
             Ok(Some(frame.len()))
         }
+    }
+
+    fn ipv4_ethernet_arp_frame_with_opcode(
+        opcode: u16,
+        sender_mac: MacAddress,
+        sender_ip: Ipv4Addr,
+    ) -> Vec<u8> {
+        let mut frame = build_address_resolution_request_ethernet_frame(
+            sender_mac,
+            sender_ip,
+            Ipv4Addr::new(192, 168, 1, 1),
+        );
+        let opcode_offset = ETHERNET_II_HEADER_LENGTH + 6;
+        frame[opcode_offset..opcode_offset + 2].copy_from_slice(&opcode.to_be_bytes());
+        frame
     }
 
     #[test]
@@ -1405,6 +1428,139 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         assert!(
             outcome.warnings.is_empty(),
             "non-ARP capture noise should not produce malformed-frame warnings, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_inbound_arp_request_without_malformed_warning_or_host() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let request =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REQUEST, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![request],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "ARP requests must not be recorded as discovered hosts"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "well-formed ARP requests should not produce malformed-frame warnings, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn records_inbound_arp_reply_sender() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let reply = ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![reply],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "a well-formed reply should not warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn warns_when_inbound_arp_opcode_is_reserved_by_rfc_5494() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let reserved = ipv4_ethernet_arp_frame_with_opcode(65535, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![reserved],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(outcome.discovered_hosts.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("reserved by RFC 5494"),
+            "reserved opcode should remain a malformed-frame warning, got: {:?}",
             outcome.warnings
         );
     }

@@ -3,7 +3,9 @@
 //! Request frames are built with an explicit Ethernet II header, a 28-byte ARP payload matching
 //! RFC 826, then zero-filled padding to the IEEE 802.3 minimum frame length without the frame
 //! check sequence. Parsers accept Ethernet II, a single IEEE 802.1Q tag, and RFC 1042 LLC/SNAP,
-//! and they reject RFC 5494 reserved hardware-type and opcode values.
+//! and they reject RFC 5494 reserved hardware-type and opcode values. The public reply parser
+//! still requires opcode 2; a crate-internal parser accepts any non-reserved opcode so the scanner
+//! can ignore well-formed requests without treating them as malformed frames.
 
 use std::net::Ipv4Addr;
 
@@ -409,23 +411,38 @@ pub(crate) fn maximum_arp_request_padding_octet_count(llc_snap: bool) -> usize {
     usize::from(IEEE_8023_MAXIMUM_LENGTH).saturating_sub(reserved)
 }
 
-/// Parses an IPv4 ARP reply from a raw Ethernet frame buffer.
+/// Parsed IPv4-over-Ethernet ARP packet after Ethernet, optional 802.1Q, and SNAP decoding.
+///
+/// Opcode 2 is an RFC 826 reply. Other non-reserved opcodes (request, RARP, and so on) are still
+/// well-formed ARP; RFC 5494 reserved values 0 and 65535 never appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParsedIpv4EthernetArp {
+    /// RFC 826 `ar$op`.
+    pub opcode: u16,
+    /// RFC 826 `ar$spa`.
+    pub sender_protocol: Ipv4Addr,
+    /// RFC 826 `ar$sha`.
+    pub sender_hardware: MacAddress,
+}
+
+/// Parses an IPv4 ARP packet from a raw Ethernet frame buffer.
 ///
 /// Trailing padding beyond the ARP payload is ignored once the fixed ARP fields are validated.
 /// A single IEEE 802.1Q tag and RFC 1042 LLC/SNAP encapsulation are accepted. Sender hardware and
-/// protocol addresses (`ar$sha`, `ar$spa`) are the values returned, matching RFC 826.
+/// protocol addresses (`ar$sha`, `ar$spa`) are the values returned, matching RFC 826. Any
+/// non-reserved opcode is accepted, including requests.
 ///
 /// # Errors
 ///
 /// Returns a static message when the Ethernet header, `EtherType`, or ARP fields are invalid, when
-/// the opcode is not a reply, or when the buffer is too short.
+/// `ar$hrd` or `ar$op` is reserved by RFC 5494, or when the buffer is too short.
 ///
 /// # Panics
 ///
 /// This function does not panic.
-pub fn try_parse_address_resolution_reply_ipv4_over_ethernet(
+pub(crate) fn try_parse_address_resolution_ipv4_over_ethernet(
     frame: &[u8],
-) -> Result<(Ipv4Addr, MacAddress), &'static str> {
+) -> Result<ParsedIpv4EthernetArp, &'static str> {
     let parsed = try_parse_ethernet_frame(frame)?;
     if parsed.ether_type != ETHERNET_PROTOCOL_ARP {
         return Err("EtherType is not address resolution protocol");
@@ -465,15 +482,6 @@ pub fn try_parse_address_resolution_reply_ipv4_over_ethernet(
     if opcode == ARP_RESERVED_FIELD_ZERO || opcode == ARP_RESERVED_FIELD_ALL_ONES {
         return Err("address resolution opcode is reserved by RFC 5494");
     }
-    match opcode {
-        ARP_OPERATION_REPLY => {}
-        ARP_OPERATION_REQUEST => {
-            return Err("address resolution opcode is a request, not a reply");
-        }
-        _ => {
-            return Err("address resolution opcode is not a recognized reply");
-        }
-    }
 
     let mut sender_mac_octets = [0u8; 6];
     sender_mac_octets
@@ -485,12 +493,42 @@ pub fn try_parse_address_resolution_reply_ipv4_over_ethernet(
         arp[ARP_SENDER_PROTOCOL_OFFSET + 3],
     );
 
-    Ok((sender_ipv4, MacAddress::from_octets(sender_mac_octets)))
+    Ok(ParsedIpv4EthernetArp {
+        opcode,
+        sender_protocol: sender_ipv4,
+        sender_hardware: MacAddress::from_octets(sender_mac_octets),
+    })
+}
+
+/// Parses an IPv4 ARP reply from a raw Ethernet frame buffer.
+///
+/// Trailing padding beyond the ARP payload is ignored once the fixed ARP fields are validated.
+/// A single IEEE 802.1Q tag and RFC 1042 LLC/SNAP encapsulation are accepted. Sender hardware and
+/// protocol addresses (`ar$sha`, `ar$spa`) are the values returned, matching RFC 826.
+///
+/// # Errors
+///
+/// Returns a static message when the Ethernet header, `EtherType`, or ARP fields are invalid, when
+/// the opcode is not a reply, or when the buffer is too short.
+///
+/// # Panics
+///
+/// This function does not panic.
+pub fn try_parse_address_resolution_reply_ipv4_over_ethernet(
+    frame: &[u8],
+) -> Result<(Ipv4Addr, MacAddress), &'static str> {
+    let parsed = try_parse_address_resolution_ipv4_over_ethernet(frame)?;
+    match parsed.opcode {
+        ARP_OPERATION_REPLY => Ok((parsed.sender_protocol, parsed.sender_hardware)),
+        ARP_OPERATION_REQUEST => Err("address resolution opcode is a request, not a reply"),
+        _ => Err("address resolution opcode is not a recognized reply"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+    use super::ARP_OPERATION_REQUEST;
     use super::MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE;
     use super::MINIMUM_ETHERNET_MAC_CLIENT_DATA_LENGTH;
     use super::build_address_resolution_announcement_ethernet_frame;
@@ -498,6 +536,7 @@ mod tests {
     use super::build_address_resolution_request_ethernet_frame;
     use super::build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag;
     use super::build_address_resolution_request_ethernet_frame_with_wire_options;
+    use super::try_parse_address_resolution_ipv4_over_ethernet;
     use super::try_parse_address_resolution_reply_ipv4_over_ethernet;
     use crate::ethernet_frame::ETHERNET_II_HEADER_LENGTH;
     use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
@@ -878,6 +917,51 @@ mod tests {
         assert_eq!(
             outcome.expect_err("request opcode should not parse as reply"),
             "address resolution opcode is a request, not a reply"
+        );
+    }
+
+    #[test]
+    fn parses_rfc_826_request_as_ipv4_over_ethernet_arp() {
+        // Arrange
+        let source_mac = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let source_ip = Ipv4Addr::new(192, 168, 0, 1);
+        let frame = build_address_resolution_request_ethernet_frame(
+            source_mac,
+            source_ip,
+            Ipv4Addr::new(192, 168, 0, 2),
+        );
+
+        // Act
+        let parsed = try_parse_address_resolution_ipv4_over_ethernet(&frame)
+            .expect("RFC 826 request should parse as well-formed ARP");
+
+        // Assert
+        assert_eq!(parsed.opcode, ARP_OPERATION_REQUEST);
+        assert_eq!(parsed.sender_protocol, source_ip);
+        assert_eq!(parsed.sender_hardware, source_mac);
+    }
+
+    #[test]
+    fn parses_non_reserved_non_reply_opcode_as_ipv4_over_ethernet_arp() {
+        // Arrange
+        let source_mac = MacAddress::from_octets([9; 6]);
+        let source_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let mut frame = reply_fixture(source_mac, source_ip);
+        let arp_start = ETHERNET_II_HEADER_LENGTH;
+        frame[arp_start + 6..arp_start + 8].copy_from_slice(&3u16.to_be_bytes());
+
+        // Act
+        let parsed = try_parse_address_resolution_ipv4_over_ethernet(&frame)
+            .expect("RARP request opcode should parse as well-formed ARP");
+
+        // Assert
+        assert_eq!(parsed.opcode, 3);
+        assert_eq!(parsed.sender_protocol, source_ip);
+        assert_eq!(parsed.sender_hardware, source_mac);
+        assert_eq!(
+            try_parse_address_resolution_reply_ipv4_over_ethernet(&frame)
+                .expect_err("RARP must not parse as an ARP reply"),
+            "address resolution opcode is not a recognized reply"
         );
     }
 

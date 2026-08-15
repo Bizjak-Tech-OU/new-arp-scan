@@ -2,8 +2,8 @@
 //!
 //! Encoders return exactly 14 octets of header plus the caller-supplied payload with no automatic
 //! minimum-frame padding. Parsers distinguish IEEE 802.3 length fields from Ethernet II `EtherType`
-//! values, decode a single IEEE 802.1Q tag, accept RFC 1042 LLC/SNAP ARP encapsulation, and reject
-//! stacked VLAN tags so higher layers never misread a shifted layout.
+//! values, decode a single IEEE 802.1Q tag (PCP, DEI, and VID), accept RFC 1042 LLC/SNAP ARP
+//! encapsulation, and reject stacked VLAN tags so higher layers never misread a shifted layout.
 
 use crate::mac_address::MacAddress;
 
@@ -108,6 +108,12 @@ impl Ieee8021qPriorityCodePoint {
     pub const fn as_u8(self) -> u8 {
         self.0
     }
+
+    /// Masks `tag_control_information` down to the 3-bit PCP.
+    #[must_use]
+    pub const fn from_tag_control_information(tag_control_information: u16) -> Self {
+        Self(((tag_control_information >> IEEE_8021Q_PRIORITY_CODE_POINT_SHIFT) & 0b111) as u8)
+    }
 }
 
 /// Full IEEE 802.1Q Tag Control Information: PCP (3 bits), DEI (1 bit), and VID (12 bits).
@@ -158,6 +164,22 @@ impl Ieee8021qTagControlInformation {
         };
         priority | drop_eligible | self.vlan_identifier.as_u16()
     }
+
+    /// Decodes a 16-bit TCI into PCP, DEI, and VID.
+    #[must_use]
+    pub const fn from_tag_control_information(tag_control_information: u16) -> Self {
+        Self {
+            priority_code_point: Ieee8021qPriorityCodePoint::from_tag_control_information(
+                tag_control_information,
+            ),
+            drop_eligible_indicator: (tag_control_information
+                & IEEE_8021Q_DROP_ELIGIBLE_INDICATOR_BIT)
+                != 0,
+            vlan_identifier: Ieee8021qVlanIdentifier::from_tag_control_information(
+                tag_control_information,
+            ),
+        }
+    }
 }
 
 impl From<Ieee8021qVlanIdentifier> for Ieee8021qTagControlInformation {
@@ -199,7 +221,9 @@ pub struct ParsedEthernetFrame<'a> {
     pub source: MacAddress,
     /// Inner `EtherType` in host byte order (after stripping one 802.1Q tag and/or SNAP).
     pub ether_type: u16,
-    /// IEEE 802.1Q VLAN identifier when a single customer tag was present.
+    /// IEEE 802.1Q Tag Control Information when a single customer tag was present.
+    pub vlan_tag: Option<Ieee8021qTagControlInformation>,
+    /// IEEE 802.1Q VLAN identifier when a single customer tag was present (low 12 TCI bits).
     pub vlan_identifier: Option<u16>,
     /// Framing used to reach [`Self::ether_type`].
     pub framing: EthernetFraming,
@@ -335,7 +359,7 @@ pub fn try_parse_ethernet_frame(
     source_octets.copy_from_slice(&frame_slice[6..12]);
     let type_or_length = u16::from_be_bytes([frame_slice[12], frame_slice[13]]);
 
-    let (vlan_identifier, inner_type_or_length, payload_start) =
+    let (vlan_tag, inner_type_or_length, payload_start) =
         decode_optional_ieee_8021q_tag(frame_slice, type_or_length)?;
     let (ether_type, payload_start, framing) =
         decode_ethertype_or_ieee_8023_snap(frame_slice, inner_type_or_length, payload_start)?;
@@ -344,7 +368,8 @@ pub fn try_parse_ethernet_frame(
         destination: MacAddress::from_octets(destination_octets),
         source: MacAddress::from_octets(source_octets),
         ether_type,
-        vlan_identifier,
+        vlan_tag,
+        vlan_identifier: vlan_tag.map(|tag| tag.vlan_identifier.as_u16()),
         framing,
         payload: &frame_slice[payload_start..],
     })
@@ -353,7 +378,7 @@ pub fn try_parse_ethernet_frame(
 fn decode_optional_ieee_8021q_tag(
     frame_slice: &[u8],
     type_or_length: u16,
-) -> Result<(Option<u16>, u16, usize), &'static str> {
+) -> Result<(Option<Ieee8021qTagControlInformation>, u16, usize), &'static str> {
     if is_unsupported_vlan_tpid(type_or_length) {
         return Err(
             "Ethernet frame uses IEEE 802.1ad or QinQ tagging; a single IEEE 802.1Q tag is required here",
@@ -370,7 +395,6 @@ fn decode_optional_ieee_8021q_tag(
     }
 
     let tag_control_information = u16::from_be_bytes([frame_slice[14], frame_slice[15]]);
-    let vlan_identifier = tag_control_information & IEEE_8021Q_VLAN_IDENTIFIER_MASK;
     let inner_type_or_length = u16::from_be_bytes([frame_slice[16], frame_slice[17]]);
 
     if inner_type_or_length == ETHERNET_PROTOCOL_VLAN_TAG
@@ -382,7 +406,7 @@ fn decode_optional_ieee_8021q_tag(
     }
 
     Ok((
-        Some(vlan_identifier),
+        Some(Ieee8021qTagControlInformation::from_tag_control_information(tag_control_information)),
         inner_type_or_length,
         tagged_header_length,
     ))
@@ -501,6 +525,11 @@ mod tests {
             vid_only, 0x0044,
             "VID-only TCI should leave PCP and DEI zero"
         );
+        assert_eq!(
+            Ieee8021qTagControlInformation::from_tag_control_information(tci),
+            tag,
+            "TCI 0xF044 should decode back to PCP 7, DEI 1, VID 0x044"
+        );
         assert!(
             Ieee8021qPriorityCodePoint::new(8).is_none(),
             "PCP 8 is outside the 3-bit field"
@@ -538,6 +567,7 @@ mod tests {
         assert_eq!(&frame[18..], payload.as_slice());
         let parsed = try_parse_ethernet_frame(&frame).expect("tagged encoding should parse");
         assert_eq!(parsed.vlan_identifier, Some(10));
+        assert_eq!(parsed.vlan_tag.map(|tag| tag.as_u16()), Some(10));
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.payload, payload.as_slice());
     }
@@ -569,6 +599,7 @@ mod tests {
         assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.vlan_identifier, None);
+        assert_eq!(parsed.vlan_tag, None);
         assert_eq!(parsed.payload, payload.as_slice());
     }
 
@@ -603,6 +634,12 @@ mod tests {
         assert_eq!(parsed.vlan_identifier, Some(10));
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.payload, payload.as_slice());
+        let vlan_tag = parsed.vlan_tag.expect("tagged SNAP should expose TCI");
+        assert_eq!(
+            vlan_tag.priority_code_point,
+            Ieee8021qPriorityCodePoint::ZERO
+        );
+        assert!(!vlan_tag.drop_eligible_indicator);
     }
 
     #[test]
@@ -659,6 +696,7 @@ mod tests {
         assert_eq!(parsed.source, source);
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.vlan_identifier, None);
+        assert_eq!(parsed.vlan_tag, None);
         assert_eq!(parsed.framing, EthernetFraming::EthernetIi);
         assert_eq!(parsed.payload, payload.as_slice());
     }
@@ -701,6 +739,40 @@ mod tests {
         assert_eq!(parsed.payload, &[0xAA]);
         assert_eq!(parsed.destination, destination);
         assert_eq!(parsed.source, source);
+        let vlan_tag = parsed
+            .vlan_tag
+            .expect("single 802.1Q tag should expose TCI");
+        assert_eq!(vlan_tag.priority_code_point.as_u8(), 1);
+        assert!(!vlan_tag.drop_eligible_indicator);
+        assert_eq!(vlan_tag.vlan_identifier.as_u16(), 0x00A);
+    }
+
+    #[test]
+    fn parse_decodes_ieee_8021q_priority_code_point_and_drop_eligible_indicator() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let tci: u16 = 0xF044;
+        let mut payload = Vec::from(tci.to_be_bytes());
+        payload.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+        payload.push(0x99);
+        let frame =
+            encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_VLAN_TAG, &payload);
+
+        // Act
+        let parsed = try_parse_ethernet_frame(&frame).expect("802.1Q frame should parse");
+
+        // Assert
+        assert_eq!(parsed.vlan_identifier, Some(0x044));
+        let vlan_tag = parsed
+            .vlan_tag
+            .expect("tagged frame should expose Tag Control Information");
+        assert_eq!(vlan_tag.priority_code_point.as_u8(), 7);
+        assert!(vlan_tag.drop_eligible_indicator);
+        assert_eq!(vlan_tag.vlan_identifier.as_u16(), 0x044);
+        assert_eq!(vlan_tag.as_u16(), 0xF044);
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.payload, &[0x99]);
     }
 
     #[test]
@@ -784,6 +856,7 @@ mod tests {
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
         assert_eq!(parsed.vlan_identifier, None);
+        assert_eq!(parsed.vlan_tag, None);
         assert_eq!(parsed.payload, &[0x11, 0x22]);
     }
 
