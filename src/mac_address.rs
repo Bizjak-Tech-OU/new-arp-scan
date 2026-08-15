@@ -177,6 +177,111 @@ impl MacAddress {
     pub fn is_zero(self) -> bool {
         self.0 == [0u8; 6]
     }
+
+    /// Returns `true` when the IEEE 802 Individual/Group bit is clear (unicast).
+    ///
+    /// The I/G bit is the least-significant bit of the first octet on the wire.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::from_octets([0x00, 0, 0, 0, 0, 1]).is_unicast());
+    /// assert!(!MacAddress::BROADCAST.is_unicast());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_unicast(self) -> bool {
+        self.0[0] & 0x01 == 0
+    }
+
+    /// Returns `true` when the IEEE 802 Individual/Group bit is set (multicast / group).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::BROADCAST.is_multicast());
+    /// assert!(!MacAddress::from_octets([0x00, 0, 0, 0, 0, 1]).is_multicast());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_multicast(self) -> bool {
+        !self.is_unicast()
+    }
+
+    /// Returns `true` when the IEEE 802 Universal/Local bit is clear (universally administered).
+    ///
+    /// The U/L bit is the second least-significant bit of the first octet on the wire. IEEE MA-L,
+    /// MA-M, and MA-S assignments are universally administered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::from_octets([0x00, 0x1A, 0x2B, 0, 0, 1]).is_universally_administered());
+    /// assert!(MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]).is_locally_administered());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_universally_administered(self) -> bool {
+        self.0[0] & 0x02 == 0
+    }
+
+    /// Returns `true` when the IEEE 802 Universal/Local bit is set (locally administered).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]).is_locally_administered());
+    /// assert!(!MacAddress::from_octets([0x00, 0x1A, 0x2B, 0, 0, 1]).is_locally_administered());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_locally_administered(self) -> bool {
+        !self.is_universally_administered()
+    }
+
+    /// Returns the 24-bit IEEE MA-L (OUI) prefix: the first three octets.
+    ///
+    /// MA-M (28-bit) and MA-S (36-bit) assignments are longer; use [`crate::MacVendorRegistry`]
+    /// for longest-prefix vendor matching across those registries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert_eq!(
+    ///     MacAddress::from_octets([0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E]).mal_prefix(),
+    ///     [0x00, 0x1A, 0x2B]
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn mal_prefix(self) -> [u8; 3] {
+        [self.0[0], self.0[1], self.0[2]]
+    }
 }
 
 impl fmt::Display for MacAddress {
@@ -412,5 +517,46 @@ mod tests {
 
         // Assert
         assert_eq!(address.octets(), octets, "octets should round-trip");
+    }
+
+    #[test]
+    fn ieee_802_individual_group_bit_is_least_significant_bit_of_first_octet() {
+        // Arrange
+        let unicast = MacAddress::from_octets([0x00, 1, 2, 3, 4, 5]);
+        let multicast = MacAddress::from_octets([0x01, 1, 2, 3, 4, 5]);
+
+        // Act
+        // Assert
+        assert!(unicast.is_unicast());
+        assert!(!unicast.is_multicast());
+        assert!(multicast.is_multicast());
+        assert!(!multicast.is_unicast());
+        assert!(MacAddress::BROADCAST.is_multicast());
+    }
+
+    #[test]
+    fn ieee_802_universal_local_bit_is_second_least_significant_bit_of_first_octet() {
+        // Arrange
+        let universal = MacAddress::from_octets([0x00, 0x1A, 0x2B, 0, 0, 1]);
+        let local = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+
+        // Act
+        // Assert
+        assert!(universal.is_universally_administered());
+        assert!(!universal.is_locally_administered());
+        assert!(local.is_locally_administered());
+        assert!(!local.is_universally_administered());
+    }
+
+    #[test]
+    fn mal_prefix_returns_first_three_octets() {
+        // Arrange
+        let address = MacAddress::from_octets([0xF4, 0xA4, 0x75, 0x01, 0x02, 0x03]);
+
+        // Act
+        let prefix = address.mal_prefix();
+
+        // Assert
+        assert_eq!(prefix, [0xF4, 0xA4, 0x75]);
     }
 }

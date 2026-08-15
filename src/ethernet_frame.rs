@@ -1,16 +1,45 @@
 //! Ethernet II frame encoding and defensive parsing.
 //!
 //! Encoders return exactly 14 octets of header plus the caller-supplied payload with no automatic
-//! minimum-frame padding. Parsers reject undersized buffers and outer IEEE 802.1Q tags so ARP
-//! handling does not mis-parse VLAN-shifted layouts.
+//! minimum-frame padding. Parsers distinguish IEEE 802.3 length fields from Ethernet II `EtherType`
+//! values, decode a single IEEE 802.1Q tag, accept RFC 1042 LLC/SNAP ARP encapsulation, and reject
+//! stacked VLAN tags so higher layers never misread a shifted layout.
 
 use crate::mac_address::MacAddress;
 
-/// Length of an Ethernet II header (destination, source, `EtherType`).
+/// Length of an untagged Ethernet II header (destination, source, `EtherType`).
 pub const ETHERNET_II_HEADER_LENGTH: usize = 14;
+
+/// Extra octets added by a single IEEE 802.1Q tag (TPID + TCI).
+pub const IEEE_8021Q_TAG_LENGTH: usize = 4;
+
+/// Length of an IEEE 802.2 LLC header plus RFC 1042 SNAP header (DSAP, SSAP, control, OUI, type).
+pub const IEEE_8023_LLC_SNAP_HEADER_LENGTH: usize = 8;
+
+/// IEEE 802.3 maximum MAC client data length; values in `0..=1500` in the length/type field are
+/// lengths, not `EtherType` values.
+pub const IEEE_8023_MAXIMUM_LENGTH: u16 = 1500;
+
+/// Smallest length/type value that is an Ethernet II `EtherType` (IEEE 802.3 / RFC 5342).
+pub const MINIMUM_ETHERNET_II_ETHERTYPE: u16 = 1536;
 
 /// `EtherType` for IEEE 802.1Q VLAN tagging (`ETH_P_8021Q` in `linux/if_ether.h`).
 pub const ETHERNET_PROTOCOL_VLAN_TAG: u16 = 0x8100;
+
+/// `EtherType` for IEEE 802.1ad service VLAN tagging (`ETH_P_8021AD`).
+pub const ETHERNET_PROTOCOL_VLAN_TAG_SERVICE: u16 = 0x88A8;
+
+/// Unofficial stacked-VLAN TPID `0x9100` still seen on some switches.
+const ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100: u16 = 0x9100;
+
+/// Unofficial stacked-VLAN TPID `0x9200` still seen on some switches.
+const ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9200: u16 = 0x9200;
+
+/// Unofficial stacked-VLAN TPID `0x9300` still seen on some switches.
+const ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300: u16 = 0x9300;
+
+/// IEEE 802.1Q VLAN identifier mask (12 bits) applied to the TCI.
+pub const IEEE_8021Q_VLAN_IDENTIFIER_MASK: u16 = 0x0FFF;
 
 /// `EtherType` for IPv4 (`ETH_P_IP`).
 pub const ETHERNET_PROTOCOL_IPV4: u16 = 0x0800;
@@ -18,16 +47,38 @@ pub const ETHERNET_PROTOCOL_IPV4: u16 = 0x0800;
 /// `EtherType` for address resolution protocol (`ETH_P_ARP`).
 pub const ETHERNET_PROTOCOL_ARP: u16 = 0x0806;
 
-/// A borrowed view of a parsed Ethernet II frame (no VLAN stacking interpretation).
+/// RFC 1042 LLC DSAP/SSAP value identifying SNAP (`0xAA`).
+const LLC_SNAP_ADDRESS: u8 = 0xAA;
+
+/// IEEE 802.2 unnumbered-information control value used with SNAP (`0x03`).
+const LLC_UNNUMBERED_INFORMATION: u8 = 0x03;
+
+/// RFC 1042 SNAP organizationally unique identifier (encoded `EtherType` follows).
+const RFC_1042_SNAP_ORGANIZATIONALLY_UNIQUE_IDENTIFIER: [u8; 3] = [0, 0, 0];
+
+/// How the payload following the MAC addresses is framed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParsedEthernetIiFrame<'a> {
+pub enum EthernetFraming {
+    /// Ethernet II: length/type field is an `EtherType` (`>= 1536`).
+    EthernetIi,
+    /// IEEE 802.3 length field plus RFC 1042 LLC/SNAP.
+    Ieee8023LlcSnap,
+}
+
+/// A borrowed view of a parsed Ethernet frame after optional 802.1Q and LLC/SNAP decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedEthernetFrame<'a> {
     /// Destination hardware address.
     pub destination: MacAddress,
     /// Source hardware address.
     pub source: MacAddress,
-    /// `EtherType` in host byte order (big-endian on the wire).
+    /// Inner `EtherType` in host byte order (after stripping one 802.1Q tag and/or SNAP).
     pub ether_type: u16,
-    /// Payload following the 14-byte header (may be empty).
+    /// IEEE 802.1Q VLAN identifier when a single customer tag was present.
+    pub vlan_identifier: Option<u16>,
+    /// Framing used to reach [`Self::ether_type`].
+    pub framing: EthernetFraming,
+    /// Payload following the decoded headers (may be empty).
     pub payload: &'a [u8],
 }
 
@@ -53,21 +104,24 @@ pub fn encode_ethernet_ii_frame(
     frame
 }
 
-/// Parses a leading Ethernet II header and returns the payload slice.
+/// Parses destination, source, and the payload after Ethernet II, optional IEEE 802.1Q, and
+/// optional RFC 1042 LLC/SNAP headers.
 ///
-/// VLAN-tagged frames whose outer `EtherType` is [`ETHERNET_PROTOCOL_VLAN_TAG`] are rejected so higher layers
-/// do not misinterpret the inner `EtherType` as the outer frame type.
+/// Stacked VLAN tags (IEEE 802.1ad / double IEEE 802.1Q) are rejected so the inner `EtherType` is
+/// never read from the wrong offset. IEEE 802.3 length values that are not RFC 1042 SNAP are
+/// rejected.
 ///
 /// # Errors
 ///
-/// Returns a static message when `frame_slice` is too short or when VLAN tagging is present.
+/// Returns a static message when `frame_slice` is too short, when tagging is stacked or uses an
+/// unsupported TPID, or when a length field does not introduce RFC 1042 SNAP.
 ///
 /// # Panics
 ///
 /// This function does not panic.
-pub fn try_parse_ethernet_ii_frame(
+pub fn try_parse_ethernet_frame(
     frame_slice: &[u8],
-) -> Result<ParsedEthernetIiFrame<'_>, &'static str> {
+) -> Result<ParsedEthernetFrame<'_>, &'static str> {
     if frame_slice.len() < ETHERNET_II_HEADER_LENGTH {
         return Err("frame is shorter than Ethernet II header");
     }
@@ -76,20 +130,109 @@ pub fn try_parse_ethernet_ii_frame(
     destination_octets.copy_from_slice(&frame_slice[0..6]);
     let mut source_octets = [0u8; 6];
     source_octets.copy_from_slice(&frame_slice[6..12]);
-    let ether_type = u16::from_be_bytes([frame_slice[12], frame_slice[13]]);
+    let type_or_length = u16::from_be_bytes([frame_slice[12], frame_slice[13]]);
 
-    if ether_type == ETHERNET_PROTOCOL_VLAN_TAG {
-        return Err(
-            "Ethernet frame uses IEEE 802.1Q tagging; plain untagged Ethernet II is required here",
-        );
-    }
+    let (vlan_identifier, inner_type_or_length, payload_start) =
+        decode_optional_ieee_8021q_tag(frame_slice, type_or_length)?;
+    let (ether_type, payload_start, framing) =
+        decode_ethertype_or_ieee_8023_snap(frame_slice, inner_type_or_length, payload_start)?;
 
-    Ok(ParsedEthernetIiFrame {
+    Ok(ParsedEthernetFrame {
         destination: MacAddress::from_octets(destination_octets),
         source: MacAddress::from_octets(source_octets),
         ether_type,
-        payload: &frame_slice[ETHERNET_II_HEADER_LENGTH..],
+        vlan_identifier,
+        framing,
+        payload: &frame_slice[payload_start..],
     })
+}
+
+fn decode_optional_ieee_8021q_tag(
+    frame_slice: &[u8],
+    type_or_length: u16,
+) -> Result<(Option<u16>, u16, usize), &'static str> {
+    if is_unsupported_vlan_tpid(type_or_length) {
+        return Err(
+            "Ethernet frame uses IEEE 802.1ad or QinQ tagging; a single IEEE 802.1Q tag is required here",
+        );
+    }
+
+    if type_or_length != ETHERNET_PROTOCOL_VLAN_TAG {
+        return Ok((None, type_or_length, ETHERNET_II_HEADER_LENGTH));
+    }
+
+    let tagged_header_length = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
+    if frame_slice.len() < tagged_header_length {
+        return Err("IEEE 802.1Q tag is truncated");
+    }
+
+    let tag_control_information = u16::from_be_bytes([frame_slice[14], frame_slice[15]]);
+    let vlan_identifier = tag_control_information & IEEE_8021Q_VLAN_IDENTIFIER_MASK;
+    let inner_type_or_length = u16::from_be_bytes([frame_slice[16], frame_slice[17]]);
+
+    if inner_type_or_length == ETHERNET_PROTOCOL_VLAN_TAG
+        || is_unsupported_vlan_tpid(inner_type_or_length)
+    {
+        return Err(
+            "Ethernet frame uses stacked VLAN tagging; a single IEEE 802.1Q tag is required here",
+        );
+    }
+
+    Ok((
+        Some(vlan_identifier),
+        inner_type_or_length,
+        tagged_header_length,
+    ))
+}
+
+fn is_unsupported_vlan_tpid(type_or_length: u16) -> bool {
+    type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_SERVICE
+        || type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100
+        || type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9200
+        || type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300
+}
+
+fn decode_ethertype_or_ieee_8023_snap(
+    frame_slice: &[u8],
+    type_or_length: u16,
+    payload_start: usize,
+) -> Result<(u16, usize, EthernetFraming), &'static str> {
+    if type_or_length >= MINIMUM_ETHERNET_II_ETHERTYPE {
+        return Ok((type_or_length, payload_start, EthernetFraming::EthernetIi));
+    }
+
+    if type_or_length > IEEE_8023_MAXIMUM_LENGTH {
+        return Err(
+            "length/type field is neither an IEEE 802.3 length nor an Ethernet II EtherType",
+        );
+    }
+
+    decode_rfc_1042_llc_snap(frame_slice, payload_start)
+}
+
+fn decode_rfc_1042_llc_snap(
+    frame_slice: &[u8],
+    payload_start: usize,
+) -> Result<(u16, usize, EthernetFraming), &'static str> {
+    let snap_end = payload_start.saturating_add(IEEE_8023_LLC_SNAP_HEADER_LENGTH);
+    let header = frame_slice
+        .get(payload_start..snap_end)
+        .ok_or("IEEE 802.3 LLC/SNAP header is truncated")?;
+
+    if header[0] != LLC_SNAP_ADDRESS
+        || header[1] != LLC_SNAP_ADDRESS
+        || header[2] != LLC_UNNUMBERED_INFORMATION
+    {
+        return Err("IEEE 802.3 frame is not RFC 1042 LLC/SNAP");
+    }
+
+    let organizationally_unique_identifier = [header[3], header[4], header[5]];
+    if organizationally_unique_identifier != RFC_1042_SNAP_ORGANIZATIONALLY_UNIQUE_IDENTIFIER {
+        return Err("SNAP organizationally unique identifier is not RFC 1042 Ethernet");
+    }
+
+    let ether_type = u16::from_be_bytes([header[6], header[7]]);
+    Ok((ether_type, snap_end, EthernetFraming::Ieee8023LlcSnap))
 }
 
 #[cfg(test)]
@@ -98,8 +241,12 @@ mod tests {
     use super::ETHERNET_PROTOCOL_ARP;
     use super::ETHERNET_PROTOCOL_IPV4;
     use super::ETHERNET_PROTOCOL_VLAN_TAG;
+    use super::ETHERNET_PROTOCOL_VLAN_TAG_SERVICE;
+    use super::EthernetFraming;
+    use super::IEEE_8023_MAXIMUM_LENGTH;
+    use super::MINIMUM_ETHERNET_II_ETHERTYPE;
     use super::encode_ethernet_ii_frame;
-    use super::try_parse_ethernet_ii_frame;
+    use super::try_parse_ethernet_frame;
     use crate::mac_address::MacAddress;
 
     #[test]
@@ -149,12 +296,14 @@ mod tests {
         let wire = encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_ARP, &payload);
 
         // Act
-        let parsed = try_parse_ethernet_ii_frame(&wire).expect("encoded frame should parse");
+        let parsed = try_parse_ethernet_frame(&wire).expect("encoded frame should parse");
 
         // Assert
         assert_eq!(parsed.destination, destination);
         assert_eq!(parsed.source, source);
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.vlan_identifier, None);
+        assert_eq!(parsed.framing, EthernetFraming::EthernetIi);
         assert_eq!(parsed.payload, payload.as_slice());
     }
 
@@ -164,7 +313,7 @@ mod tests {
         let frame = [0u8; 10];
 
         // Act
-        let outcome = try_parse_ethernet_ii_frame(&frame);
+        let outcome = try_parse_ethernet_frame(&frame);
 
         // Assert
         assert_eq!(
@@ -174,23 +323,154 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_vlan_tagged_outer_header() {
+    fn parse_decodes_ieee_8021q_tagged_ethernet_ii_arp() {
         // Arrange
         let destination = MacAddress::BROADCAST;
         let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
-        let inner = [0x81, 0x00, 0x00, 0x01, 0x08, 0x06];
-        let wire =
-            encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_VLAN_TAG, &inner);
+        let payload = [0x08, 0x06, 0xAA];
+        let tagged = encode_ethernet_ii_frame(
+            destination,
+            source,
+            ETHERNET_PROTOCOL_VLAN_TAG,
+            &[0x20, 0x0A, payload[0], payload[1], payload[2]],
+        );
 
         // Act
-        let outcome = try_parse_ethernet_ii_frame(&wire);
+        let parsed = try_parse_ethernet_frame(&tagged).expect("single 802.1Q tag should parse");
+
+        // Assert
+        assert_eq!(parsed.vlan_identifier, Some(0x00A));
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.framing, EthernetFraming::EthernetIi);
+        assert_eq!(parsed.payload, &[0xAA]);
+        assert_eq!(parsed.destination, destination);
+        assert_eq!(parsed.source, source);
+    }
+
+    #[test]
+    fn parse_rejects_ieee_8021ad_service_tag() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let inner = [0x00, 0x01, 0x08, 0x06];
+        let wire = encode_ethernet_ii_frame(
+            destination,
+            source,
+            ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+            &inner,
+        );
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&wire);
 
         // Assert
         assert!(
             outcome
-                .expect_err("VLAN tag should be rejected")
-                .contains("802.1Q"),
-            "error should mention VLAN tagging, got: {outcome:?}"
+                .expect_err("802.1ad should be rejected")
+                .contains("802.1ad"),
+            "error should mention 802.1ad, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_stacked_ieee_8021q_tags() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let inner = [0x00, 0x01, 0x81, 0x00, 0x00, 0x02, 0x08, 0x06];
+        let wire =
+            encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_VLAN_TAG, &inner);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&wire);
+
+        // Assert
+        assert!(
+            outcome
+                .expect_err("QinQ customer stack should be rejected")
+                .contains("stacked VLAN"),
+            "error should mention stacked VLAN, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_ieee_8023_length_that_is_not_llc_snap() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let payload = [0xE0, 0xE0, 0x03, 0x00];
+        let wire =
+            encode_ethernet_ii_frame(destination, source, IEEE_8023_MAXIMUM_LENGTH, &payload);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&wire);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("non-SNAP 802.3 should fail"),
+            "IEEE 802.3 frame is not RFC 1042 LLC/SNAP"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_rfc_1042_llc_snap_arp() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let mut payload = vec![0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06];
+        payload.extend_from_slice(&[0x11, 0x22]);
+        let wire = encode_ethernet_ii_frame(destination, source, 46, &payload);
+
+        // Act
+        let parsed = try_parse_ethernet_frame(&wire).expect("RFC 1042 SNAP ARP should parse");
+
+        // Assert
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
+        assert_eq!(parsed.vlan_identifier, None);
+        assert_eq!(parsed.payload, &[0x11, 0x22]);
+    }
+
+    #[test]
+    fn parse_rejects_length_type_gap_between_8023_and_ethertype() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let gap_value = IEEE_8023_MAXIMUM_LENGTH + 1;
+        assert!(
+            gap_value < MINIMUM_ETHERNET_II_ETHERTYPE,
+            "fixture must sit in the undefined gap"
+        );
+        let wire = encode_ethernet_ii_frame(destination, source, gap_value, &[]);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&wire);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("undefined length/type gap should fail"),
+            "length/type field is neither an IEEE 802.3 length nor an Ethernet II EtherType"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_truncated_ieee_8021q_tag() {
+        // Arrange
+        let mut frame = encode_ethernet_ii_frame(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+            ETHERNET_PROTOCOL_VLAN_TAG,
+            &[0x00],
+        );
+        frame.truncate(ETHERNET_II_HEADER_LENGTH + 1);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("truncated 802.1Q should fail"),
+            "IEEE 802.1Q tag is truncated"
         );
     }
 }

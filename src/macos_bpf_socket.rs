@@ -27,20 +27,42 @@ const BPF_RETURN_CONSTANT: u16 = 0x06;
 const ETHERNET_TYPE_FIELD_OFFSET: u32 = 12;
 /// `EtherType` for ARP (`ETH_P_ARP`).
 const ETHERNET_TYPE_ARP: u32 = 0x0806;
+/// `EtherType` for IEEE 802.1Q VLAN tagging (`ETH_P_8021Q`).
+const ETHERNET_TYPE_VLAN_TAG: u32 = 0x8100;
 /// Capture length that accepts the whole frame.
 const BPF_ACCEPT_WHOLE_FRAME: u32 = u32::MAX;
 
-/// Classic Berkeley Packet Filter program accepting only Ethernet II frames carrying ARP.
+/// Classic Berkeley Packet Filter program accepting Ethernet II ARP and a single IEEE 802.1Q tag
+/// whose inner EtherType is ARP.
 ///
 /// Unlike a Linux `AF_PACKET` socket bound to `ETH_P_ARP`, a BPF device delivers every frame on the
 /// interface by default, so this filter is what scopes reads to ARP and avoids flooding the scanner
-/// with unrelated traffic.
-const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 4] = [
+/// with unrelated traffic. VLAN-tagged ARP is included so tagged replies are not dropped before the
+/// shared parser.
+const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 7] = [
     BpfProgramInstruction {
         code: BPF_LOAD_HALFWORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
         operand: ETHERNET_TYPE_FIELD_OFFSET,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 3,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_ARP,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 3,
+        operand: ETHERNET_TYPE_VLAN_TAG,
+    },
+    BpfProgramInstruction {
+        code: BPF_LOAD_HALFWORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_FIELD_OFFSET + 4,
     },
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
@@ -231,8 +253,8 @@ impl LinkLayerEndpoint for MacosBpfEndpoint {
 #[cfg(test)]
 mod tests {
     use super::{
-        BPF_RECORD_ALIGNMENT, BpfPacketHeaderLayout, bpf_word_align, next_bpf_record,
-        open_macos_link_layer_endpoint,
+        ARP_CAPTURE_FILTER, BPF_RECORD_ALIGNMENT, BpfPacketHeaderLayout, bpf_word_align,
+        next_bpf_record, open_macos_link_layer_endpoint,
     };
     use crate::error::AppError;
     use std::mem::offset_of;
@@ -405,5 +427,43 @@ mod tests {
             outcome.is_none(),
             "a capture length past the buffer end should be rejected, got: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn arp_capture_filter_accepts_untagged_arp_and_ieee_8021q_tagged_arp() {
+        // Arrange
+        let filter = ARP_CAPTURE_FILTER;
+
+        // Act
+        // Assert
+        assert_eq!(
+            filter.len(),
+            7,
+            "filter should include the VLAN inner-type path"
+        );
+        assert_eq!(
+            filter[0].operand, 12,
+            "first load is the Ethernet length/type field"
+        );
+        assert_eq!(filter[1].operand, 0x0806, "first compare is EtherType ARP");
+        assert_eq!(
+            filter[1].jump_if_true, 3,
+            "ARP should skip to the accept return"
+        );
+        assert_eq!(
+            filter[2].operand, 0x8100,
+            "second compare is IEEE 802.1Q TPID"
+        );
+        assert_eq!(
+            filter[3].operand, 16,
+            "VLAN path loads the inner EtherType after the 4-octet tag"
+        );
+        assert_eq!(filter[4].operand, 0x0806, "inner compare is EtherType ARP");
+        assert_eq!(
+            filter[5].operand,
+            u32::MAX,
+            "accept returns the whole frame"
+        );
+        assert_eq!(filter[6].operand, 0, "drop returns zero");
     }
 }

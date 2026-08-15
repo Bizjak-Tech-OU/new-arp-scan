@@ -1,0 +1,189 @@
+//! Spec-facing tests that lock RFC 826, RFC 5227, RFC 5494, IEEE 802.3, IEEE 802.1Q, and
+//! IEEE MA-L / MA-M / MA-S behaviour to named requirements.
+
+use crate::address_resolution_protocol::{
+    ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH,
+    MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE,
+    build_address_resolution_announcement_ethernet_frame,
+    build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
+    try_parse_address_resolution_reply_ipv4_over_ethernet,
+};
+use crate::ethernet_frame::{
+    ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG, EthernetFraming,
+    IEEE_8023_MAXIMUM_LENGTH, MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame,
+    try_parse_ethernet_frame,
+};
+use crate::mac_address::MacAddress;
+use crate::mac_vendor_registry::MacVendorRegistry;
+use std::net::Ipv4Addr;
+
+fn rfc_826_arp_field(frame: &[u8], offset: usize, length: usize) -> &[u8] {
+    let start = ETHERNET_II_HEADER_LENGTH + offset;
+    &frame[start..start + length]
+}
+
+#[test]
+fn rfc_826_request_uses_ethernet_hardware_ipv4_protocol_request_opcode_and_zero_target_hardware() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let target_ip = Ipv4Addr::new(192, 168, 1, 2);
+
+    // Act
+    let frame = build_address_resolution_request_ethernet_frame(source_mac, source_ip, target_ip);
+
+    // Assert
+    assert_eq!(rfc_826_arp_field(&frame, 0, 2), 1u16.to_be_bytes());
+    assert_eq!(rfc_826_arp_field(&frame, 2, 2), 0x0800u16.to_be_bytes());
+    assert_eq!(rfc_826_arp_field(&frame, 4, 1), [6]);
+    assert_eq!(rfc_826_arp_field(&frame, 5, 1), [4]);
+    assert_eq!(rfc_826_arp_field(&frame, 6, 2), 1u16.to_be_bytes());
+    assert_eq!(rfc_826_arp_field(&frame, 8, 6), source_mac.octets());
+    assert_eq!(rfc_826_arp_field(&frame, 14, 4), source_ip.octets());
+    assert_eq!(rfc_826_arp_field(&frame, 18, 6), [0u8; 6]);
+    assert_eq!(rfc_826_arp_field(&frame, 24, 4), target_ip.octets());
+}
+
+#[test]
+fn rfc_5227_probe_sender_protocol_address_is_all_zeros() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let target_ip = Ipv4Addr::new(10, 0, 0, 5);
+
+    // Act
+    let frame = build_address_resolution_probe_ethernet_frame(source_mac, target_ip);
+
+    // Assert
+    assert_eq!(rfc_826_arp_field(&frame, 14, 4), [0, 0, 0, 0]);
+    assert_eq!(rfc_826_arp_field(&frame, 24, 4), target_ip.octets());
+    assert_eq!(rfc_826_arp_field(&frame, 6, 2), 1u16.to_be_bytes());
+}
+
+#[test]
+fn rfc_5227_announcement_sender_and_target_protocol_addresses_are_equal() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let claimed = Ipv4Addr::new(10, 0, 0, 5);
+
+    // Act
+    let frame = build_address_resolution_announcement_ethernet_frame(source_mac, claimed);
+
+    // Assert
+    assert_eq!(rfc_826_arp_field(&frame, 14, 4), claimed.octets());
+    assert_eq!(rfc_826_arp_field(&frame, 24, 4), claimed.octets());
+    assert_eq!(rfc_826_arp_field(&frame, 6, 2), 1u16.to_be_bytes());
+}
+
+#[test]
+fn rfc_5494_reserved_opcode_65535_is_rejected() {
+    // Arrange
+    let mut frame = build_address_resolution_request_ethernet_frame(
+        MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
+    let opcode_offset = ETHERNET_II_HEADER_LENGTH + 6;
+    frame[opcode_offset..opcode_offset + 2].copy_from_slice(&65535u16.to_be_bytes());
+
+    // Act
+    let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+    // Assert
+    assert_eq!(
+        outcome.expect_err("reserved opcode 65535 should fail"),
+        "address resolution opcode is reserved by RFC 5494"
+    );
+}
+
+#[test]
+fn ieee_8023_minimum_frame_without_fcs_is_sixty_octets_with_eighteen_zero_pad() {
+    // Arrange
+    let frame = build_address_resolution_request_ethernet_frame(
+        MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]),
+        Ipv4Addr::new(192, 168, 1, 1),
+        Ipv4Addr::new(192, 168, 1, 2),
+    );
+
+    // Act
+    let pad_start = ETHERNET_II_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+
+    // Assert
+    assert_eq!(
+        frame.len(),
+        MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE
+    );
+    assert_eq!(frame.len() - pad_start, 18);
+    assert!(frame[pad_start..].iter().all(|octet| *octet == 0));
+}
+
+#[test]
+fn ieee_8023_length_versus_ethertype_boundary_is_1536() {
+    // Arrange
+    assert_eq!(MINIMUM_ETHERNET_II_ETHERTYPE, 1536);
+    assert_eq!(IEEE_8023_MAXIMUM_LENGTH, 1500);
+    let destination = MacAddress::BROADCAST;
+    let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+    let arp_type = encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_ARP, &[]);
+    let min_ethertype =
+        encode_ethernet_ii_frame(destination, source, MINIMUM_ETHERNET_II_ETHERTYPE, &[]);
+
+    // Act
+    let arp_parsed = try_parse_ethernet_frame(&arp_type).expect("ARP EtherType should parse");
+    let min_parsed = try_parse_ethernet_frame(&min_ethertype)
+        .expect("EtherType 1536 should parse as Ethernet II");
+
+    // Assert
+    assert_eq!(arp_parsed.framing, EthernetFraming::EthernetIi);
+    assert_eq!(min_parsed.framing, EthernetFraming::EthernetIi);
+    assert_eq!(min_parsed.ether_type, 1536);
+}
+
+#[test]
+fn ieee_8021q_vid_is_the_low_twelve_tci_bits() {
+    // Arrange
+    let destination = MacAddress::BROADCAST;
+    let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+    let tci: u16 = 0xE044;
+    let mut payload = Vec::from(tci.to_be_bytes());
+    payload.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+    payload.push(0x99);
+    let frame = encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_VLAN_TAG, &payload);
+
+    // Act
+    let parsed = try_parse_ethernet_frame(&frame).expect("802.1Q frame should parse");
+
+    // Assert
+    assert_eq!(parsed.vlan_identifier, Some(0x044));
+    assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+    assert_eq!(parsed.payload, &[0x99]);
+}
+
+#[test]
+fn ieee_ma_l_ma_m_ma_s_longest_prefix_match_follows_registry_bit_lengths() {
+    // Arrange
+    let text = include_str!("../tests/fixtures/ieee-mac-registry.txt");
+    let registry = MacVendorRegistry::parse_ieee_oui_text(text).expect("fixture file should parse");
+    let twenty_four_bit = MacAddress::from_octets([0xF4, 0xA4, 0x75, 0xAA, 0x11, 0x22]);
+    let twenty_eight_bit = MacAddress::from_octets([0xF4, 0xA4, 0x75, 0x0A, 0x11, 0x22]);
+    let thirty_six_bit = MacAddress::from_octets([0xF4, 0xA4, 0x75, 0x00, 0x11, 0x22]);
+    let other_assignment = MacAddress::from_octets([0x00, 0x1A, 0x2B, 0x00, 0x00, 0x01]);
+
+    // Act
+    // Assert
+    assert_eq!(
+        registry.vendor_name_for(thirty_six_bit),
+        Some("Fixture MA-S")
+    );
+    assert_eq!(
+        registry.vendor_name_for(twenty_eight_bit),
+        Some("Fixture MA-M")
+    );
+    assert_eq!(
+        registry.vendor_name_for(twenty_four_bit),
+        Some("Fixture MA-L")
+    );
+    assert_eq!(
+        registry.vendor_name_for(other_assignment),
+        Some("Fixture other MA-L")
+    );
+}

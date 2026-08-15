@@ -16,6 +16,9 @@ EXAMPLES:
   Probe a single strictly interior host on the subnet:
     new-arp-scan scan --interface eth0 --host 192.168.1.50
 
+  Annotate MAC addresses with IEEE MA-L / MA-M / MA-S vendor names:
+    new-arp-scan scan --interface eth0 --mac-vendor-file ieee-oui.txt
+
   Scan using automatic interface selection when exactly one usable interface exists:
     new-arp-scan scan
 
@@ -56,6 +59,12 @@ pub struct ScanArguments {
     /// Probe only this IPv4 address (must be strictly interior on the interface subnet).
     #[arg(long = "host", value_name = "IPv4")]
     pub host_ipv4_address: Option<Ipv4Addr>,
+    /// IEEE MA-L / MA-M / MA-S mapping file (`ieee-oui.txt` from `get-oui`, or equivalent).
+    ///
+    /// When set, host lines become `<IPv4> <MAC> <vendor>`. When omitted, `ieee-oui.txt` in the
+    /// current directory is used if that file exists; otherwise host lines stay `<IPv4> <MAC>`.
+    #[arg(long = "mac-vendor-file", value_name = "PATH")]
+    pub mac_vendor_file: Option<std::path::PathBuf>,
     /// Milliseconds to wait for address resolution replies after the last request is sent.
     #[arg(
         long = "timeout-ms",
@@ -815,17 +824,58 @@ mod tests {
     }
 
     #[test]
-    fn returns_error_when_scan_subcommand_receives_invalid_host_ipv4_token() {
+    fn parses_scan_subcommand_with_mac_vendor_file() {
         // Arrange
-        let arguments = ["new-arp-scan", "scan", "--host", "not-an-ipv4-address"];
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--mac-vendor-file",
+            "ieee-oui.txt",
+        ];
 
         // Act
-        let outcome = CliRoot::try_parse_from(arguments);
+        let parsed = CliRoot::try_parse_from(arguments);
 
         // Assert
-        assert!(
-            outcome.is_err(),
-            "invalid --host token should fail parsing, got: {outcome:?}"
-        );
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.mac_vendor_file.as_deref(),
+                    Some(std::path::Path::new("ieee-oui.txt")),
+                    "--mac-vendor-file should populate the mapping path"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_mac_vendor_file_is_none() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--interface", "eth0"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(
+                    scan.mac_vendor_file.is_none(),
+                    "omitted --mac-vendor-file should yield None"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
     }
 }

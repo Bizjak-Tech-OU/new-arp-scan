@@ -136,3 +136,18 @@ Introduce a **narrow portable link-layer boundary** that both Linux and macOS im
 **Reason:** Milestone issues #18–#19 call for readable timing context and deterministic operator-visible exit semantics without expanding the error surface into sysexits-style matrices.
 
 **Consequences:** README and [`docs/docs.html`](docs/docs.html) describe the timing line template and exit table; integration tests assert parse failures exit `2` where the toolchain maps `clap` usage errors to that code.
+
+## 2026-08-15 — RFC and IEEE packet fidelity, 802.1Q receive, IEEE MAC registries
+
+**Decision:** Treat the on-wire Ethernet/ARP codecs as a standards contract, not a best-effort layout:
+
+- **RFC 826:** keep transmitting Ethernet II ARP requests with `ar$hrd=1`, `ar$pro=0x0800`, `ar$hln=6`, `ar$pln=4`, `ar$op=1`, `ar$tha=0`, interface `ar$sha`/`ar$spa`, and target `ar$tpa`. Record replies from `ar$spa`/`ar$sha` (not the Ethernet source, which may differ).
+- **RFC 5227:** add explicit ARP Probe (`ar$spa=0.0.0.0`) and ARP Announcement (`ar$spa=ar$tpa`) builders covered by tests. Default `scan` / `--host` remain RFC 826 requests using the interface IPv4 address (the same default as original `arp-scan`). `perform_arp_probe` keeps meaning “single-target scan”, not an RFC 5227 Probe.
+- **RFC 5494:** reject reserved `ar$hrd` and `ar$op` values 0 and 65535 on receive.
+- **IEEE 802.3:** pad transmitted ARP to 60 octets without FCS (46-octet MAC client data, 18 zero pad bytes). Parse length/type as a length when `<= 1500`, as an EtherType when `>= 1536`, and reject the undefined gap. Accept RFC 1042 LLC/SNAP ARP on receive.
+- **IEEE 802.1Q:** decode a single customer VLAN tag on receive (VID is the low 12 TCI bits) and accept the inner ARP payload. Reject IEEE 802.1ad / unofficial QinQ TPIDs and stacked 0x8100 tags so the inner EtherType is never read from the wrong offset. Transmit stays untagged Ethernet II. macOS BPF now accepts both untagged ARP and 0x8100-tagged ARP. Linux `ETH_P_ARP` still relies on kernel VLAN tag stripping for tagged frames on the parent interface.
+- **IEEE MA-L / MA-M / MA-S:** add [`MacVendorRegistry`](src/mac_vendor_registry.rs) with longest-prefix match over `arp-scan` `ieee-oui.txt` text (6 / 7 / 9 hex digits). CLI `--mac-vendor-file` loads an explicit file; `ieee-oui.txt` in the current directory is used when present. Host lines become `<IPv4> <MAC> <vendor>` only when a registry is loaded.
+
+**Reason:** The core product is an ARP scanner. Silent misparse of 802.3 lengths, stacked VLAN TPIDs, and reserved ARP fields, plus no IEEE registry lookup, made the tool unverifiable against the RFCs/IEEE documents and weaker than original `arp-scan` on receive-side 802.1Q and vendor identification.
+
+**Consequences:** Spec-facing tests live in [`src/protocol_conformance.rs`](src/protocol_conformance.rs) and the packet modules. Still deferred (send-side `--vlan`, LLC/SNAP transmit, bundling a full IEEE database, passive ACD / monitor mode, `libpcap`). Operators who want vendor names generate or copy an `ieee-oui.txt` (for example with original `arp-scan`'s `get-oui`).

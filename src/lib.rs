@@ -5,6 +5,7 @@ pub mod application_outcome;
 pub mod cli;
 pub mod error;
 pub mod mac_address;
+pub mod mac_vendor_registry;
 
 mod address_resolution_protocol;
 mod ethernet_frame;
@@ -13,6 +14,9 @@ mod ipv4_cidr;
 mod ipv4_subnet;
 mod link_layer_backend;
 mod scanner;
+
+#[cfg(test)]
+mod protocol_conformance;
 
 #[cfg(target_os = "linux")]
 mod linux_interface_discovery;
@@ -36,6 +40,10 @@ mod macos_scanner;
 #[cfg(target_os = "macos")]
 mod macos_system_call;
 
+pub use address_resolution_protocol::{
+    build_address_resolution_announcement_ethernet_frame,
+    build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
+};
 pub use application_command::{
     ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
 };
@@ -49,6 +57,10 @@ pub use error::AppError;
 pub use ipv4_cidr::Ipv4Cidr;
 pub use ipv4_cidr::Ipv4HostAddressIterator;
 pub use mac_address::{MacAddress, MacAddressParseError};
+pub use mac_vendor_registry::{
+    DEFAULT_MAC_VENDOR_FILE_NAME, MacVendorRegistry, MacVendorRegistryParseError,
+    UNKNOWN_MAC_VENDOR_NAME,
+};
 
 #[cfg(target_os = "linux")]
 pub use linux_scanner::perform_arp_probe;
