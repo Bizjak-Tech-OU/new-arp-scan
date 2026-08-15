@@ -16,7 +16,7 @@ Tracked for release documentation: [GitHub issue #33](https://github.com/Bizjak-
 | **Errors** | `error.rs` | Single [`AppError`](../src/error.rs) enum; `Display` / `Error` for operators and tests. |
 | **Pure IPv4 logic** | `ipv4_subnet.rs`, `ipv4_cidr.rs` | Subnet math and CIDR parsing; built on every target. |
 | **Name / shape checks** | `interface_validation.rs` | Interface name rules and `ifreq` name packing helpers (shared by both backends). |
-| **Link and ARP encoding** | `mac_address.rs`, `ethernet_frame.rs`, `address_resolution_protocol.rs` | Types and on-wire framing for Ethernet II + ARP; IEEE 802.1Q send (`--vlan`) and receive; RFC 1042 SNAP receive; RFC 5227 Probe/Announcement builders. |
+| **Link and ARP encoding** | `mac_address.rs`, `ethernet_frame.rs`, `address_resolution_protocol.rs` | Types and on-wire framing for Ethernet II + ARP; IEEE 802.1Q send (`--vlan`) and receive; RFC 1042 SNAP send (`--llc`) and receive; RFC 5227 Probe/Announcement (`--arpspa`). |
 | **IEEE MAC registries** | `mac_vendor_registry.rs` | Longest-prefix MA-L / MA-M / MA-S vendor lookup from `ieee-oui.txt`. |
 | **Portable link layer** | `link_layer_backend.rs`, `scanner.rs` | The `LinkLayerEndpoint` trait and shared interface/address value types; the backend-generic scan engine (target iteration, send/receive scheduling, merge duplicate replies, warnings). |
 | **Linux backend** | `linux_scanner.rs`, `linux_interface_discovery.rs`, `linux_socket.rs`, `linux_system_call.rs`, `linux_packet.rs` | `AF_PACKET` raw socket, `ioctl`/`if_nameindex` discovery, `sockaddr_ll`, and the Linux scan entry points. |
@@ -54,12 +54,12 @@ CLI / library caller
        │
        ▼
   open a LinkLayerEndpoint:
-     Linux  → AF_PACKET SOCK_RAW bound to interface + ETH_P_ARP, or ETH_P_ALL when --vlan is set
-     macOS  → /dev/bpf* attached to interface + ARP / 802.1Q-ARP filter   (macos_bpf_socket)
+     Linux  → AF_PACKET SOCK_RAW bound to interface + ETH_P_ARP, or ETH_P_ALL when --vlan or --llc is set
+     macOS  → /dev/bpf* attached to interface + ARP / 802.1Q / RFC 1042 SNAP filter   (macos_bpf_socket)
        │
        ▼
   scanner (shared, backend-generic):
-       ├──► For each round: build Ethernet II ARP request frames (optional 802.1Q tag) → endpoint.send
+       ├──► For each round: build ARP request frames (optional 802.1Q tag, optional LLC/SNAP, optional ar$spa override) → endpoint.send
        │
        └──► Receive loop (wait_until_readable + try_receive): parse Ethernet II + ARP replies
                  │

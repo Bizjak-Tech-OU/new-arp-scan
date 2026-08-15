@@ -8,8 +8,13 @@ pub const ETHERNET_PROTOCOL_ARP: u16 = 0x0806;
 /// Packet-socket protocol that delivers every Ethernet type (`ETH_P_ALL` in `linux/if_ether.h`).
 ///
 /// Used when transmitting IEEE 802.1Q-tagged ARP so replies can arrive tagged (`0x8100`) or with
-/// the tag stripped by the NIC or bridge.
+/// the tag stripped by the NIC or bridge, and when transmitting RFC 1042 LLC/SNAP so the length
+/// field is not mistaken for `ETH_P_ARP`.
 pub const ETHERNET_PROTOCOL_ALL: u16 = 0x0003;
+
+/// IEEE 802.2 frames (`ETH_P_802_2` in `linux/if_ether.h`), used as the send protocol for untagged
+/// RFC 1042 LLC/SNAP ARP.
+pub const ETHERNET_PROTOCOL_IEEE_802_2: u16 = 0x0004;
 
 /// `IFF_UP` from `linux/if.h` (interface is administratively up).
 pub const INTERFACE_FLAG_UP: i32 = 0x0001;
@@ -70,9 +75,9 @@ pub fn ethernet_protocol_host_to_network_order(
 mod tests {
     use super::SockAddressLinkLayer;
     use super::{
-        ETHERNET_PROTOCOL_ALL, ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK,
-        INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SOCKET_ADDRESS_FAMILY_PACKET,
-        ethernet_protocol_host_to_network_order,
+        ETHERNET_PROTOCOL_ALL, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IEEE_802_2,
+        INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
+        SOCKET_ADDRESS_FAMILY_PACKET, ethernet_protocol_host_to_network_order,
     };
     use crate::address_resolution_protocol::{
         ARP_HARDWARE_TYPE_ETHERNET, ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST,
@@ -171,6 +176,18 @@ mod tests {
             libc::c_int::from(ETHERNET_PROTOCOL_ALL),
             libc::ETH_P_ALL,
             "ETHERNET_PROTOCOL_ALL should match libc::ETH_P_ALL"
+        );
+    }
+
+    #[test]
+    fn ethernet_protocol_ieee_802_2_matches_libc() {
+        // Arrange
+        // Act
+        // Assert
+        assert_eq!(
+            libc::c_int::from(ETHERNET_PROTOCOL_IEEE_802_2),
+            libc::ETH_P_802_2,
+            "ETHERNET_PROTOCOL_IEEE_802_2 should match libc::ETH_P_802_2"
         );
     }
 

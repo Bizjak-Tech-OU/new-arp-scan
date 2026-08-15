@@ -7,12 +7,14 @@ use crate::address_resolution_protocol::{
     build_address_resolution_announcement_ethernet_frame,
     build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
     build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
+    build_address_resolution_request_ethernet_frame_with_wire_options,
     try_parse_address_resolution_reply_ipv4_over_ethernet,
 };
+use crate::application_command::ArpSenderProtocolAddress;
 use crate::ethernet_frame::{
     ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG, EthernetFraming,
-    IEEE_8023_MAXIMUM_LENGTH, Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE,
-    encode_ethernet_ii_frame, try_parse_ethernet_frame,
+    IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH, Ieee8021qVlanIdentifier,
+    MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame, try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
 use crate::mac_vendor_registry::MacVendorRegistry;
@@ -219,4 +221,81 @@ fn ieee_ma_l_ma_m_ma_s_longest_prefix_match_follows_registry_bit_lengths() {
         registry.vendor_name_for(other_assignment),
         Some("Fixture other MA-L")
     );
+}
+
+#[test]
+fn rfc_1042_llc_snap_request_uses_ieee_8023_length_of_llc_snap_plus_arp() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let target_ip = Ipv4Addr::new(192, 168, 1, 2);
+    let expected_length = u16::try_from(
+        IEEE_8023_LLC_SNAP_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH,
+    )
+    .expect("SNAP plus 28-octet ARP fits in an IEEE 802.3 length field");
+
+    // Act
+    let frame = build_address_resolution_request_ethernet_frame_with_wire_options(
+        source_mac, source_ip, target_ip, None, true,
+    );
+    let parsed = try_parse_ethernet_frame(&frame).expect("SNAP request should parse");
+
+    // Assert
+    assert_eq!(&frame[12..14], &expected_length.to_be_bytes());
+    assert_eq!(
+        expected_length, 36,
+        "MAC client data is LLC/SNAP (8) plus ARP (28), not an Ethernet-header-inclusive formula"
+    );
+    assert_eq!(&frame[14..17], &[0xAA, 0xAA, 0x03]);
+    assert_eq!(&frame[17..20], &[0, 0, 0]);
+    assert_eq!(&frame[20..22], &ETHERNET_PROTOCOL_ARP.to_be_bytes());
+    assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
+    assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+    assert_eq!(
+        frame.len(),
+        MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE
+    );
+}
+
+#[test]
+fn rfc_5227_probe_via_unspecified_sender_protocol_address_matches_probe_builder() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let interface_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+    let spa = ArpSenderProtocolAddress::Explicit(Ipv4Addr::UNSPECIFIED)
+        .ipv4_address_for_target(interface_ip, target_ip);
+
+    // Act
+    let from_wire = build_address_resolution_request_ethernet_frame_with_wire_options(
+        source_mac, spa, target_ip, None, false,
+    );
+    let from_builder = build_address_resolution_probe_ethernet_frame(source_mac, target_ip);
+
+    // Assert
+    assert_eq!(spa, Ipv4Addr::UNSPECIFIED);
+    assert_eq!(from_wire, from_builder);
+    assert_eq!(&from_wire[28..32], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn rfc_5227_announcement_via_destination_sender_protocol_address_matches_announcement_builder() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let interface_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let claimed = Ipv4Addr::new(192, 168, 1, 50);
+    let spa =
+        ArpSenderProtocolAddress::DestinationTarget.ipv4_address_for_target(interface_ip, claimed);
+
+    // Act
+    let from_wire = build_address_resolution_request_ethernet_frame_with_wire_options(
+        source_mac, spa, claimed, None, false,
+    );
+    let from_builder = build_address_resolution_announcement_ethernet_frame(source_mac, claimed);
+
+    // Assert
+    assert_eq!(spa, claimed);
+    assert_eq!(from_wire, from_builder);
+    assert_eq!(&from_wire[28..32], &claimed.octets());
+    assert_eq!(&from_wire[38..42], &claimed.octets());
 }

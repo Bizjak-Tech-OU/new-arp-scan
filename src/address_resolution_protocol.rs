@@ -9,7 +9,8 @@ use std::net::Ipv4Addr;
 
 use crate::ethernet_frame::{
     ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, Ieee8021qVlanIdentifier,
-    encode_ethernet_ii_frame_with_optional_ieee_8021q_tag, try_parse_ethernet_frame,
+    encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
+    encode_ieee_8023_rfc_1042_llc_snap_frame, try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
 
@@ -147,6 +148,35 @@ pub fn build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_
     target_ipv4_address: Ipv4Addr,
     vlan_identifier: Option<Ieee8021qVlanIdentifier>,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
+    build_address_resolution_request_ethernet_frame_with_wire_options(
+        source_mac_address,
+        source_ipv4_address,
+        target_ipv4_address,
+        vlan_identifier,
+        false,
+    )
+}
+
+/// Builds a minimum-length Ethernet frame carrying an IPv4 ARP request, with optional IEEE 802.1Q
+/// tagging and optional RFC 1042 LLC/SNAP encapsulation.
+///
+/// When `llc_snap` is false, this matches
+/// [`build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag`]. When it is
+/// true, the frame uses an IEEE 802.3 length field and RFC 1042 LLC/SNAP (`AA AA 03` plus OUI
+/// `00:00:00` plus EtherType `0x0806`) before the ARP payload. The buffer is still zero-padded to
+/// [`MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE`].
+///
+/// # Panics
+///
+/// This function does not panic.
+#[must_use]
+pub fn build_address_resolution_request_ethernet_frame_with_wire_options(
+    source_mac_address: MacAddress,
+    source_ipv4_address: Ipv4Addr,
+    target_ipv4_address: Ipv4Addr,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    llc_snap: bool,
+) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
     build_address_resolution_ethernet_frame(
         source_mac_address,
         source_ipv4_address,
@@ -154,6 +184,7 @@ pub fn build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_
         target_ipv4_address,
         ARP_OPERATION_REQUEST,
         vlan_identifier,
+        llc_snap,
     )
 }
 
@@ -190,6 +221,7 @@ pub fn build_address_resolution_probe_ethernet_frame(
         target_ipv4_address,
         ARP_OPERATION_REQUEST,
         None,
+        false,
     )
 }
 
@@ -226,6 +258,7 @@ pub fn build_address_resolution_announcement_ethernet_frame(
         claimed_ipv4_address,
         ARP_OPERATION_REQUEST,
         None,
+        false,
     )
 }
 
@@ -236,6 +269,7 @@ fn build_address_resolution_ethernet_frame(
     target_ipv4_address: Ipv4Addr,
     opcode: u16,
     vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    llc_snap: bool,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
     let mut address_resolution_payload = [0u8; ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
     address_resolution_payload[ARP_HARDWARE_TYPE_OFFSET..ARP_HARDWARE_TYPE_OFFSET + 2]
@@ -255,13 +289,23 @@ fn build_address_resolution_ethernet_frame(
     address_resolution_payload[ARP_TARGET_PROTOCOL_OFFSET..ARP_TARGET_PROTOCOL_OFFSET + 4]
         .copy_from_slice(&target_ipv4_address.octets());
 
-    let ethernet_body = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
-        MacAddress::BROADCAST,
-        source_mac_address,
-        vlan_identifier,
-        ETHERNET_PROTOCOL_ARP,
-        &address_resolution_payload,
-    );
+    let ethernet_body = if llc_snap {
+        encode_ieee_8023_rfc_1042_llc_snap_frame(
+            MacAddress::BROADCAST,
+            source_mac_address,
+            vlan_identifier,
+            ETHERNET_PROTOCOL_ARP,
+            &address_resolution_payload,
+        )
+    } else {
+        encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+            MacAddress::BROADCAST,
+            source_mac_address,
+            vlan_identifier,
+            ETHERNET_PROTOCOL_ARP,
+            &address_resolution_payload,
+        )
+    };
 
     let mut frame = [0u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE];
     let copy_length = ethernet_body.len();
@@ -358,10 +402,12 @@ mod tests {
     use super::build_address_resolution_probe_ethernet_frame;
     use super::build_address_resolution_request_ethernet_frame;
     use super::build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag;
+    use super::build_address_resolution_request_ethernet_frame_with_wire_options;
     use super::try_parse_address_resolution_reply_ipv4_over_ethernet;
     use crate::ethernet_frame::ETHERNET_II_HEADER_LENGTH;
     use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
     use crate::ethernet_frame::IEEE_8021Q_TAG_LENGTH;
+    use crate::ethernet_frame::IEEE_8023_LLC_SNAP_HEADER_LENGTH;
     use crate::ethernet_frame::Ieee8021qVlanIdentifier;
     use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
@@ -448,6 +494,44 @@ mod tests {
                 .iter()
                 .all(|octet| *octet == 0),
             "octets after the ARP payload should be zero padding"
+        );
+    }
+
+    #[test]
+    fn built_request_with_llc_snap_uses_ieee_8023_length_and_rfc_1042_header() {
+        // Arrange
+        let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 2);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let expected_length = u16::try_from(
+            IEEE_8023_LLC_SNAP_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH,
+        )
+        .expect("SNAP plus ARP fits in an IEEE 802.3 length");
+
+        // Act
+        let frame = build_address_resolution_request_ethernet_frame_with_wire_options(
+            source_mac, source_ip, target_ip, None, true,
+        );
+
+        // Assert
+        assert_eq!(&frame[12..14], &expected_length.to_be_bytes());
+        assert_eq!(&frame[14..17], &[0xAA, 0xAA, 0x03]);
+        assert_eq!(&frame[17..20], &[0, 0, 0]);
+        assert_eq!(&frame[20..22], &[0x08, 0x06]);
+        let arp_start = ETHERNET_II_HEADER_LENGTH + IEEE_8023_LLC_SNAP_HEADER_LENGTH;
+        assert_eq!(
+            &frame[arp_start + 14..arp_start + 18],
+            &source_ip.octets(),
+            "ar$spa should follow the SNAP header"
+        );
+        assert_eq!(
+            &frame[arp_start + 24..arp_start + 28],
+            &target_ip.octets(),
+            "ar$tpa should follow the SNAP header"
+        );
+        assert_eq!(
+            frame.len(),
+            MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE
         );
     }
 

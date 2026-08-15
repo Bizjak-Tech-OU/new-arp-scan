@@ -22,6 +22,15 @@ EXAMPLES:
   Send IEEE 802.1Q tagged ARP requests on VLAN 10:
     new-arp-scan scan --interface eth0 --vlan 10
 
+  RFC 5227 ARP Probe (sender protocol address 0.0.0.0):
+    new-arp-scan scan --interface eth0 --arpspa 0.0.0.0
+
+  RFC 5227 ARP Announcement (sender protocol address equals each target):
+    new-arp-scan scan --interface eth0 --arpspa dest
+
+  RFC 1042 LLC/SNAP framing instead of Ethernet II:
+    new-arp-scan scan --interface eth0 --llc
+
   Scan using automatic interface selection when exactly one usable interface exists:
     new-arp-scan scan
 
@@ -77,6 +86,15 @@ pub struct ScanArguments {
         value_parser = clap::value_parser!(u16).range(0..=4095)
     )]
     pub vlan_identifier: Option<u16>,
+    /// RFC 826 `ar$spa` (sender IPv4). Dotted quad, or `dest` to use each target address (RFC 5227
+    /// Announcement). `0.0.0.0` is an RFC 5227 ARP Probe. When omitted, the interface IPv4 address
+    /// is used.
+    #[arg(long = "arpspa", value_name = "IPv4|dest", value_parser = crate::application_command::ArpSenderProtocolAddress::parse_cli_token)]
+    pub sender_protocol_address: Option<crate::application_command::ArpSenderProtocolAddress>,
+    /// Send RFC 1042 LLC/SNAP (IEEE 802.3 length + `AA AA 03` + OUI `00:00:00` + EtherType)
+    /// instead of Ethernet II. Replies are decoded in either framing regardless of this flag.
+    #[arg(long = "llc", action = clap::ArgAction::SetTrue)]
+    pub llc_snap: bool,
     /// Milliseconds to wait for address resolution replies after the last request is sent.
     #[arg(
         long = "timeout-ms",
@@ -100,8 +118,10 @@ pub struct ScanArguments {
 #[cfg(test)]
 mod tests {
     use super::CliRoot;
+    use crate::application_command::ArpSenderProtocolAddress;
     use clap::CommandFactory;
     use clap::Parser;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn parses_scan_subcommand_with_interface_name() {
@@ -1004,6 +1024,242 @@ mod tests {
         assert!(
             outcome.is_err(),
             "VLAN identifier 4096 is outside the IEEE 802.1Q 12-bit field, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_arpspa_unspecified_as_rfc_5227_probe() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--arpspa",
+            "0.0.0.0",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.sender_protocol_address,
+                    Some(ArpSenderProtocolAddress::Explicit(Ipv4Addr::UNSPECIFIED)),
+                    "--arpspa 0.0.0.0 should be an RFC 5227 Probe"
+                );
+                assert!(!scan.llc_snap, "omitted --llc should stay false");
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_arpspa_dest_and_explicit_ipv4() {
+        // Arrange
+        let dest = ["new-arp-scan", "scan", "--arpspa", "dest"];
+        let dest_upper = ["new-arp-scan", "scan", "--arpspa", "DEST"];
+        let explicit = ["new-arp-scan", "scan", "--arpspa", "192.168.1.9"];
+
+        // Act
+        let parsed_dest = CliRoot::try_parse_from(dest);
+        let parsed_upper = CliRoot::try_parse_from(dest_upper);
+        let parsed_explicit = CliRoot::try_parse_from(explicit);
+
+        // Assert
+        match parsed_dest
+            .expect("dest should parse")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.sender_protocol_address,
+                    Some(ArpSenderProtocolAddress::DestinationTarget)
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+        match parsed_upper
+            .expect("DEST should parse")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.sender_protocol_address,
+                    Some(ArpSenderProtocolAddress::DestinationTarget)
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+        match parsed_explicit
+            .expect("dotted-quad should parse")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.sender_protocol_address,
+                    Some(ArpSenderProtocolAddress::Explicit(Ipv4Addr::new(
+                        192, 168, 1, 9
+                    )))
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_arpspa_is_none() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--interface", "eth0"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(
+                    scan.sender_protocol_address.is_none(),
+                    "omitted --arpspa should yield None so the interface IPv4 is used"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_arpspa_token_is_neither_ipv4_nor_dest() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--arpspa", "destination"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "unknown --arpspa tokens should fail parsing, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_scan_subcommand_receives_duplicate_arpspa_flags() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--arpspa",
+            "0.0.0.0",
+            "--arpspa",
+            "dest",
+        ];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "duplicate --arpspa flags should be rejected to avoid ambiguous operator intent, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_llc_flag() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--interface", "eth0", "--llc"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(scan.llc_snap, "--llc should enable RFC 1042 SNAP transmit");
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_llc_flag_is_false() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--interface", "eth0"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(!scan.llc_snap, "omitted --llc should yield false");
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_help_includes_arpspa_and_llc_examples() {
+        // Arrange
+        let mut command = CliRoot::command();
+
+        // Act
+        let help = command.render_help().to_string();
+
+        // Assert
+        assert!(
+            help.contains("--arpspa") && help.contains("--llc"),
+            "root help examples should document RFC 5227 Probe and RFC 1042 SNAP, got: {help}"
+        );
+    }
+
+    #[test]
+    fn renders_scan_subcommand_long_help_including_arpspa_and_llc() {
+        // Arrange
+        let mut root_command = CliRoot::command();
+        let scan_command = root_command
+            .find_subcommand_mut("scan")
+            .expect("scan subcommand should exist for operator help");
+
+        // Act
+        let help = scan_command.render_long_help().to_string();
+
+        // Assert
+        assert!(
+            help.contains("--arpspa") && help.contains("--llc") && help.contains("--vlan"),
+            "scan long help should name VLAN, arpspa, and llc flags, got:\n{help}"
+        );
+        let lower = help.to_lowercase();
+        assert!(
+            lower.contains("5227") || lower.contains("probe") || lower.contains("dest"),
+            "scan long help should describe RFC 5227 Probe / dest SPA, got:\n{help}"
         );
     }
 }

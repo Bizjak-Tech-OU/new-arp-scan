@@ -54,6 +54,8 @@ fn binary_scan_help_exits_successfully_and_mentions_interface_flag() {
             && stdout.contains("--host")
             && stdout.contains("--mac-vendor-file")
             && stdout.contains("--vlan")
+            && stdout.contains("--arpspa")
+            && stdout.contains("--llc")
             && lower.contains("millisecond")
             && lower.contains("round"),
         "scan help should document interface, host, timing, attempts flags with millisecond and inter-round pacing semantics, got: {stdout}"

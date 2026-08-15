@@ -172,6 +172,48 @@ pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
     frame
 }
 
+/// Builds an IEEE 802.3 frame with RFC 1042 LLC/SNAP encapsulation and an optional IEEE 802.1Q tag.
+///
+/// Layout is destination, source, optional TPID/TCI, a length field equal to LLC + SNAP +
+/// `payload` (the MAC client data following the length field), then `AA AA 03 00 00 00`, the inner
+/// `EtherType`, then `payload`. No minimum-frame padding is applied.
+///
+/// # Panics
+///
+/// This function does not panic. If LLC/SNAP plus `payload` exceeds an IEEE 802.3 length field, the
+/// length is clamped to [`IEEE_8023_MAXIMUM_LENGTH`].
+#[must_use]
+pub fn encode_ieee_8023_rfc_1042_llc_snap_frame(
+    destination: MacAddress,
+    source: MacAddress,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    ether_type: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mac_client_data_length = IEEE_8023_LLC_SNAP_HEADER_LENGTH.saturating_add(payload.len());
+    let length_field = u16::try_from(mac_client_data_length).unwrap_or(IEEE_8023_MAXIMUM_LENGTH);
+    let tagged_header_length = match vlan_identifier {
+        Some(_) => ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH,
+        None => ETHERNET_II_HEADER_LENGTH,
+    };
+    let mut frame =
+        Vec::with_capacity(tagged_header_length + IEEE_8023_LLC_SNAP_HEADER_LENGTH + payload.len());
+    frame.extend_from_slice(&destination.octets());
+    frame.extend_from_slice(&source.octets());
+    if let Some(vlan_identifier) = vlan_identifier {
+        frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        frame.extend_from_slice(&vlan_identifier.as_u16().to_be_bytes());
+    }
+    frame.extend_from_slice(&length_field.to_be_bytes());
+    frame.push(LLC_SNAP_ADDRESS);
+    frame.push(LLC_SNAP_ADDRESS);
+    frame.push(LLC_UNNUMBERED_INFORMATION);
+    frame.extend_from_slice(&RFC_1042_SNAP_ORGANIZATIONALLY_UNIQUE_IDENTIFIER);
+    frame.extend_from_slice(&ether_type.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// Parses destination, source, and the payload after Ethernet II, optional IEEE 802.1Q, and
 /// optional RFC 1042 LLC/SNAP headers.
 ///
@@ -312,11 +354,13 @@ mod tests {
     use super::ETHERNET_PROTOCOL_VLAN_TAG_SERVICE;
     use super::EthernetFraming;
     use super::IEEE_8021Q_TAG_LENGTH;
+    use super::IEEE_8023_LLC_SNAP_HEADER_LENGTH;
     use super::IEEE_8023_MAXIMUM_LENGTH;
     use super::Ieee8021qVlanIdentifier;
     use super::MINIMUM_ETHERNET_II_ETHERTYPE;
     use super::encode_ethernet_ii_frame;
     use super::encode_ethernet_ii_frame_with_optional_ieee_8021q_tag;
+    use super::encode_ieee_8023_rfc_1042_llc_snap_frame;
     use super::try_parse_ethernet_frame;
     use crate::mac_address::MacAddress;
 
@@ -369,6 +413,67 @@ mod tests {
         assert_eq!(&frame[16..18], &ETHERNET_PROTOCOL_ARP.to_be_bytes());
         assert_eq!(&frame[18..], payload.as_slice());
         let parsed = try_parse_ethernet_frame(&frame).expect("tagged encoding should parse");
+        assert_eq!(parsed.vlan_identifier, Some(10));
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.payload, payload.as_slice());
+    }
+
+    #[test]
+    fn encode_rfc_1042_llc_snap_uses_ieee_8023_length_and_round_trips() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([2, 0, 0, 0, 0, 1]);
+        let payload = [0xAAu8, 0xBB];
+        let expected_length =
+            u16::try_from(IEEE_8023_LLC_SNAP_HEADER_LENGTH + payload.len()).expect("fits u16");
+
+        // Act
+        let frame = encode_ieee_8023_rfc_1042_llc_snap_frame(
+            destination,
+            source,
+            None,
+            ETHERNET_PROTOCOL_ARP,
+            &payload,
+        );
+
+        // Assert
+        assert_eq!(&frame[12..14], &expected_length.to_be_bytes());
+        assert_eq!(&frame[14..17], &[0xAA, 0xAA, 0x03]);
+        assert_eq!(&frame[17..20], &[0, 0, 0]);
+        assert_eq!(&frame[20..22], &ETHERNET_PROTOCOL_ARP.to_be_bytes());
+        let parsed = try_parse_ethernet_frame(&frame).expect("RFC 1042 SNAP encoding should parse");
+        assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.vlan_identifier, None);
+        assert_eq!(parsed.payload, payload.as_slice());
+    }
+
+    #[test]
+    fn encode_rfc_1042_llc_snap_with_vlan_places_length_after_tci() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([2, 0, 0, 0, 0, 1]);
+        let payload = [0xAAu8, 0xBB];
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits in 12 bits");
+        let expected_length =
+            u16::try_from(IEEE_8023_LLC_SNAP_HEADER_LENGTH + payload.len()).expect("fits u16");
+
+        // Act
+        let frame = encode_ieee_8023_rfc_1042_llc_snap_frame(
+            destination,
+            source,
+            Some(vlan_identifier),
+            ETHERNET_PROTOCOL_ARP,
+            &payload,
+        );
+
+        // Assert
+        assert_eq!(&frame[12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(&frame[14..16], &10u16.to_be_bytes());
+        assert_eq!(&frame[16..18], &expected_length.to_be_bytes());
+        assert_eq!(&frame[18..21], &[0xAA, 0xAA, 0x03]);
+        let parsed = try_parse_ethernet_frame(&frame).expect("tagged SNAP encoding should parse");
+        assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
         assert_eq!(parsed.vlan_identifier, Some(10));
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.payload, payload.as_slice());

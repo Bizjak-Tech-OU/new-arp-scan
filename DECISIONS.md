@@ -150,7 +150,7 @@ Introduce a **narrow portable link-layer boundary** that both Linux and macOS im
 
 **Reason:** The core product is an ARP scanner. Silent misparse of 802.3 lengths, stacked VLAN TPIDs, and reserved ARP fields, plus no IEEE registry lookup, made the tool unverifiable against the RFCs/IEEE documents and weaker than original `arp-scan` on receive-side 802.1Q and vendor identification.
 
-**Consequences:** Spec-facing tests live in [`src/protocol_conformance.rs`](src/protocol_conformance.rs) and the packet modules. Still deferred at that time: send-side `--vlan` (superseded below), LLC/SNAP transmit, bundling a full IEEE database, passive ACD / monitor mode, `libpcap`. Operators who want vendor names generate or copy an `ieee-oui.txt` (for example with original `arp-scan`'s `get-oui`).
+**Consequences:** Spec-facing tests live in [`src/protocol_conformance.rs`](src/protocol_conformance.rs) and the packet modules. Send-side `--vlan` (superseded below), LLC/SNAP transmit and RFC 5227 Probe as CLI (superseded further below), bundling a full IEEE database, passive ACD / monitor mode, and `libpcap` were still deferred at that time. Operators who want vendor names generate or copy an `ieee-oui.txt` (for example with original `arp-scan`'s `get-oui`).
 
 ## 2026-08-15 — IEEE 802.1Q send-side `--vlan` and Linux tagged capture
 
@@ -158,4 +158,19 @@ Introduce a **narrow portable link-layer boundary** that both Linux and macOS im
 
 **Reason:** Receive-side 802.1Q parsing without a send path could not be claimed as IEEE 802.1Q fidelity, and Linux `ETH_P_ARP` silently dropped tagged replies on trunks that do not strip tags.
 
-**Consequences:** LLC/SNAP transmit, QinQ / IEEE 802.1ad, bundling a full IEEE database, RFC 5227 Probe as a CLI mode, passive ACD / monitor mode, and `libpcap` remain deferred. VID `4095` is reserved in IEEE 802.1Q but is accepted as a 12-bit TCI field, same as original `arp-scan`.
+**Consequences:** LLC/SNAP transmit and RFC 5227 Probe as a CLI mode are superseded below. QinQ / IEEE 802.1ad, bundling a full IEEE database, passive ACD / monitor mode, and `libpcap` remain deferred. VID `4095` is reserved in IEEE 802.1Q but is accepted as a 12-bit TCI field, same as original `arp-scan`.
+
+## 2026-08-15 — RFC 5227 `--arpspa` and RFC 1042 `--llc` transmit
+
+**Decision:** Operators can override RFC 826 `ar$spa` and IEEE 802.3 framing on `scan`:
+
+- **`--arpspa <IPv4|dest>`** matches original `arp-scan`. Omitted uses the interface IPv4 address (RFC 826 default). `0.0.0.0` is an RFC 5227 ARP Probe. `dest` (case-insensitive) is an RFC 5227 ARP Announcement (`ar$spa` equals each target `ar$tpa`). Any other dotted quad is a sender-protocol override. `--host` remains a single-target scan of one interior IPv4 address; it does not imply Probe semantics. Reply acceptance still uses the **interface** subnet (or the `--host` address), not the overridden SPA.
+- **`--llc`** transmits IEEE 802.3 with RFC 1042 LLC/SNAP (`AA AA 03`, OUI `00:00:00`, EtherType `0x0806`) instead of Ethernet II. The IEEE 802.3 length field is LLC + SNAP + ARP payload (**36** for IPv4 ARP), which is the MAC client data after the length field. That is **not** original `arp-scan`'s `packet_size+8` formula when `packet_size` already includes Ethernet header octets. Frames are still zero-padded to 60 octets without FCS. Replies are decoded in Ethernet II, 802.1Q, or SNAP regardless of `--llc`. `--vlan` and `--llc` may be combined (TPID, then length, then SNAP).
+- Linux opens `ETH_P_ALL` when `--vlan` **or** `--llc` is set so length-field SNAP and tagged replies are not dropped; untagged Ethernet II scans keep `ETH_P_ARP`. Untagged SNAP send uses `sockaddr_ll` protocol `ETH_P_802_2`; tagged send keeps `0x8100`.
+- macOS BPF capture expands to Ethernet II ARP, one 802.1Q tag, RFC 1042 SNAP, and 802.1Q+SNAP. The previous 7-instruction filter dropped IEEE 802.3 SNAP because a length of 36 is neither `0x0806` nor `0x8100`.
+
+Wire options are grouped in [`ScanWireOptions`](src/application_command.rs) on [`ApplicationCommand::Scan`](src/application_command.rs) so Linux/macOS scanners and the shared send path take one value instead of growing argument lists.
+
+**Reason:** Library Probe/Announcement builders and SNAP receive without CLI transmit could not be claimed as RFC 5227 / RFC 1042 fidelity. Original `arp-scan` exposes `--arpspa` and `--llc`; sending SNAP with a standards-correct length avoids copying a known length-field bug.
+
+**Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, and `libpcap` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA.
