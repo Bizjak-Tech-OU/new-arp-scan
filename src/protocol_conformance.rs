@@ -352,7 +352,7 @@ fn ieee_8021q_transmit_encodes_pcp_and_dei_in_tci() {
     let parsed = try_parse_ethernet_frame(&frame).expect("tagged request should parse");
 
     // Assert
-    assert_eq!(&frame[14..16], &0xE044u16.to_be_bytes());
+    assert_eq!(&frame[14..16], &0xF044u16.to_be_bytes());
     assert_eq!(parsed.vlan_identifier, Some(0x044));
 }
 

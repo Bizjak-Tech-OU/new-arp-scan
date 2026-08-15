@@ -494,8 +494,8 @@ mod tests {
 
         // Assert
         assert_eq!(
-            tci, 0xE044,
-            "PCP 7, DEI 1, VID 0x044 should encode as TCI 0xE044"
+            tci, 0xF044,
+            "PCP 7, DEI 1, VID 0x044 should encode as TCI 0xF044"
         );
         assert_eq!(
             vid_only, 0x0044,

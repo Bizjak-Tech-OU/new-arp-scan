@@ -52,7 +52,7 @@ pub fn perform_arp_scan(
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &plan.targets,
-        ScanTransmitContext {
+        &ScanTransmitContext {
             source_mac_address: addresses.source_mac_address,
             interface_ipv4_address: addresses.source_ipv4_address,
             wire,
@@ -130,7 +130,7 @@ pub fn perform_arp_probe(
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &[target_ipv4_address],
-        ScanTransmitContext {
+        &ScanTransmitContext {
             source_mac_address: addresses.source_mac_address,
             interface_ipv4_address: addresses.source_ipv4_address,
             wire,

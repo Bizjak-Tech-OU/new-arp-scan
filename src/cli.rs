@@ -109,9 +109,10 @@ pub struct ScanArguments {
     #[arg(
         long = "padding",
         value_name = "HEX",
+        num_args = 1,
         value_parser = crate::application_command::parse_ethernet_padding_hex
     )]
-    pub ethernet_padding: Option<Vec<u8>>,
+    pub ethernet_padding: Option<crate::application_command::EthernetPaddingOctets>,
     /// RFC 826 `ar$spa` (sender IPv4). Dotted quad, or `dest` to use each target address (RFC 5227
     /// Announcement). `0.0.0.0` is an RFC 5227 ARP Probe. When omitted, the interface IPv4 address
     /// is used.
@@ -1139,7 +1140,9 @@ mod tests {
                 assert_eq!(scan.vlan_priority_code_point, Some(5));
                 assert!(scan.vlan_drop_eligible_indicator);
                 assert_eq!(
-                    scan.ethernet_padding.as_deref(),
+                    scan.ethernet_padding
+                        .as_ref()
+                        .map(crate::application_command::EthernetPaddingOctets::as_slice),
                     Some([0xDE, 0xAD, 0xBE, 0xEF].as_slice())
                 );
             }

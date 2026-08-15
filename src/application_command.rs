@@ -222,6 +222,25 @@ impl ScanWireOptions {
     }
 }
 
+/// Hex-decoded `--padding` octets. A newtype so clap does not treat `Option<Vec<u8>>` as a list of
+/// `u8` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EthernetPaddingOctets(Vec<u8>);
+
+impl EthernetPaddingOctets {
+    /// Returns the decoded octets.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes the wrapper and returns the decoded octets.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
 /// Parses original `arp-scan` `--padding` hex: even number of digits, no `0x` prefix.
 ///
 /// # Errors
@@ -230,7 +249,7 @@ impl ScanWireOptions {
 /// contains a non-hexadecimal character, or decodes to more than 1472 octets (Ethernet II ARP
 /// maximum: IEEE 802.3 MAC client data 1500 minus the 28-octet ARP PDU). SNAP scans may still
 /// reject a shorter oversize payload in [`ScanWireOptions::validate_ieee_8023_mac_client_data`].
-pub fn parse_ethernet_padding_hex(token: &str) -> Result<Vec<u8>, String> {
+pub fn parse_ethernet_padding_hex(token: &str) -> Result<EthernetPaddingOctets, String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return Err(
@@ -240,7 +259,7 @@ pub fn parse_ethernet_padding_hex(token: &str) -> Result<Vec<u8>, String> {
     if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
         return Err("invalid --padding value: hex digits must not include a 0x prefix".to_string());
     }
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err(
             "invalid --padding value: expected an even number of hexadecimal digits".to_string(),
         );
@@ -269,7 +288,7 @@ pub fn parse_ethernet_padding_hex(token: &str) -> Result<Vec<u8>, String> {
         padding.push(octet);
         index += 2;
     }
-    Ok(padding)
+    Ok(EthernetPaddingOctets(padding))
 }
 
 /// Default global receive window after the last address resolution request is sent.
@@ -308,8 +327,8 @@ pub enum ApplicationCommand {
 mod tests {
     use super::{
         ApplicationCommand, ArpSenderProtocolAddress, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,
-        DEFAULT_SCAN_TIMEOUT, ScanWireOptions, parse_ethernet_padding_hex, parse_u8_cli_token,
-        parse_u16_cli_token,
+        DEFAULT_SCAN_TIMEOUT, EthernetPaddingOctets, ScanWireOptions, parse_ethernet_padding_hex,
+        parse_u8_cli_token, parse_u16_cli_token,
     };
     use crate::ethernet_frame::{Ieee8021qPriorityCodePoint, Ieee8021qVlanIdentifier};
     use crate::mac_address::MacAddress;
@@ -893,7 +912,10 @@ mod tests {
         let padding = parse_ethernet_padding_hex("deadBEEF");
 
         // Assert
-        assert_eq!(padding, Ok(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(
+            padding.map(EthernetPaddingOctets::into_vec),
+            Ok(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
     }
 
     #[test]

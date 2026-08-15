@@ -162,7 +162,7 @@ pub(crate) struct ScanTransmitContext {
 fn run_address_resolution_request_rounds(
     endpoint: &impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
-    transmit: ScanTransmitContext,
+    transmit: &ScanTransmitContext,
     scan_round_count: NonZeroU64,
     pacing_between_scan_rounds: Duration,
     warnings: &mut Vec<String>,
@@ -170,12 +170,7 @@ fn run_address_resolution_request_rounds(
     let total_rounds = scan_round_count.get();
     for round_index in 0..total_rounds {
         for target_ipv4_address in target_ipv4_addresses {
-            send_one_address_resolution_request(
-                endpoint,
-                &transmit,
-                *target_ipv4_address,
-                warnings,
-            );
+            send_one_address_resolution_request(endpoint, transmit, *target_ipv4_address, warnings);
         }
         if should_apply_pacing_after_scan_round(
             round_index,
@@ -346,7 +341,7 @@ pub(crate) fn full_subnet_scan_plan(
 pub(crate) fn collect_scan_over_endpoint(
     endpoint: &mut impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
-    transmit: ScanTransmitContext,
+    transmit: &ScanTransmitContext,
     acceptance: &ArpReplyAcceptance,
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
@@ -1200,7 +1195,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         let outcome = collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1247,7 +1242,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1294,7 +1289,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1337,7 +1332,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         let outcome = collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1390,7 +1385,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         let outcome = collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions::default(),
@@ -1432,7 +1427,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1477,7 +1472,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1520,7 +1515,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {
@@ -1575,7 +1570,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         collect_scan_over_endpoint(
             &mut endpoint,
             &[target_ip],
-            ScanTransmitContext {
+            &ScanTransmitContext {
                 source_mac_address: source_mac,
                 interface_ipv4_address: source_ip,
                 wire: ScanWireOptions {

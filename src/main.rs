@@ -8,9 +8,9 @@ use clap::Parser;
 use new_arp_scan::Ieee8021qPriorityCodePoint;
 use new_arp_scan::Ieee8021qVlanIdentifier;
 use new_arp_scan::application_command::{
-    ApplicationCommand, ArpSenderProtocolAddress, ScanWireOptions,
+    ApplicationCommand, ArpSenderProtocolAddress, EthernetPaddingOctets, ScanWireOptions,
 };
-use new_arp_scan::cli::{CliRoot, CliSubcommand};
+use new_arp_scan::cli::{CliRoot, CliSubcommand, ScanArguments};
 use new_arp_scan::mac_vendor_registry::MacVendorRegistry;
 
 fn main() {
@@ -34,6 +34,7 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
+                let wire = scan_wire_options_from_arguments(&scan);
                 match new_arp_scan::run(ApplicationCommand::Scan {
                     interface_name: scan.interface_name,
                     target_ipv4_address: scan.host_ipv4_address,
@@ -42,36 +43,7 @@ fn main() {
                     attempts: std::num::NonZeroU64::new(scan.attempts).expect(
                         "clap should reject zero attempts before reaching the application run path",
                     ),
-                    wire: ScanWireOptions {
-                        vlan_identifier: scan.vlan_identifier.map(|vlan_identifier| {
-                            Ieee8021qVlanIdentifier::new(vlan_identifier).expect(
-                                "clap should reject VLAN identifiers above 4095 before reaching the application run path",
-                            )
-                        }),
-                        vlan_priority_code_point: scan
-                            .vlan_priority_code_point
-                            .map(|priority_code_point| {
-                                Ieee8021qPriorityCodePoint::new(priority_code_point).expect(
-                                    "clap should reject Priority Code Points above 7 before reaching the application run path",
-                                )
-                            })
-                            .unwrap_or(Ieee8021qPriorityCodePoint::ZERO),
-                        vlan_drop_eligible_indicator: scan.vlan_drop_eligible_indicator,
-                        sender_protocol_address: scan
-                            .sender_protocol_address
-                            .unwrap_or(ArpSenderProtocolAddress::Interface),
-                        llc_snap: scan.llc_snap,
-                        ethernet_destination: scan.ethernet_destination,
-                        ethernet_source: scan.ethernet_source,
-                        arp_hardware_type: scan.arp_hardware_type,
-                        arp_protocol_type: scan.arp_protocol_type,
-                        arp_hardware_length: scan.arp_hardware_length,
-                        arp_protocol_length: scan.arp_protocol_length,
-                        arp_operation: scan.arp_operation,
-                        arp_sender_hardware: scan.arp_sender_hardware,
-                        arp_target_hardware: scan.arp_target_hardware,
-                        padding: scan.ethernet_padding.unwrap_or_default(),
-                    },
+                    wire,
                 }) {
                     Ok(outcome) => {
                         let mut standard_output = std::io::stdout().lock();
@@ -117,6 +89,42 @@ fn main() {
             }
         },
         Err(error) => error.exit(),
+    }
+}
+
+fn scan_wire_options_from_arguments(scan: &ScanArguments) -> ScanWireOptions {
+    ScanWireOptions {
+        vlan_identifier: scan.vlan_identifier.map(|vlan_identifier| {
+            Ieee8021qVlanIdentifier::new(vlan_identifier).expect(
+                "clap should reject VLAN identifiers above 4095 before reaching the application run path",
+            )
+        }),
+        vlan_priority_code_point: scan.vlan_priority_code_point.map_or(
+            Ieee8021qPriorityCodePoint::ZERO,
+            |priority_code_point| {
+                Ieee8021qPriorityCodePoint::new(priority_code_point).expect(
+                    "clap should reject Priority Code Points above 7 before reaching the application run path",
+                )
+            },
+        ),
+        vlan_drop_eligible_indicator: scan.vlan_drop_eligible_indicator,
+        sender_protocol_address: scan
+            .sender_protocol_address
+            .unwrap_or(ArpSenderProtocolAddress::Interface),
+        llc_snap: scan.llc_snap,
+        ethernet_destination: scan.ethernet_destination,
+        ethernet_source: scan.ethernet_source,
+        arp_hardware_type: scan.arp_hardware_type,
+        arp_protocol_type: scan.arp_protocol_type,
+        arp_hardware_length: scan.arp_hardware_length,
+        arp_protocol_length: scan.arp_protocol_length,
+        arp_operation: scan.arp_operation,
+        arp_sender_hardware: scan.arp_sender_hardware,
+        arp_target_hardware: scan.arp_target_hardware,
+        padding: scan
+            .ethernet_padding
+            .clone()
+            .map_or_else(Vec::new, EthernetPaddingOctets::into_vec),
     }
 }
 
