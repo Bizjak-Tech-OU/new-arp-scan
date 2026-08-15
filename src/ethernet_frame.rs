@@ -398,7 +398,7 @@ mod tests {
         // Arrange
         let destination = MacAddress::BROADCAST;
         let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
-        let payload = [0xE0, 0xE0, 0x03, 0x00];
+        let payload = [0xE0, 0xE0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00];
         let wire =
             encode_ethernet_ii_frame(destination, source, IEEE_8023_MAXIMUM_LENGTH, &payload);
 
