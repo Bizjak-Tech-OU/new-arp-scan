@@ -91,7 +91,7 @@ pub struct ScanArguments {
     /// is used.
     #[arg(long = "arpspa", value_name = "IPv4|dest", value_parser = crate::application_command::ArpSenderProtocolAddress::parse_cli_token)]
     pub sender_protocol_address: Option<crate::application_command::ArpSenderProtocolAddress>,
-    /// Send RFC 1042 LLC/SNAP (IEEE 802.3 length + `AA AA 03` + OUI `00:00:00` + EtherType)
+    /// Send RFC 1042 LLC/SNAP (IEEE 802.3 length + `AA AA 03` + OUI `00:00:00` + `EtherType`)
     /// instead of Ethernet II. Replies are decoded in either framing regardless of this flag.
     #[arg(long = "llc", action = clap::ArgAction::SetTrue)]
     pub llc_snap: bool,

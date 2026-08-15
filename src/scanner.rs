@@ -148,6 +148,7 @@ impl ArpReplyAcceptance {
 }
 
 /// MAC, interface IPv4, and on-wire options used when sending ARP requests.
+#[derive(Clone, Copy)]
 pub(crate) struct ScanTransmitContext {
     /// Scanning interface Ethernet address (`ar$sha`).
     pub source_mac_address: MacAddress,

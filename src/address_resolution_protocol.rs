@@ -163,7 +163,7 @@ pub fn build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_
 /// When `llc_snap` is false, this matches
 /// [`build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag`]. When it is
 /// true, the frame uses an IEEE 802.3 length field and RFC 1042 LLC/SNAP (`AA AA 03` plus OUI
-/// `00:00:00` plus EtherType `0x0806`) before the ARP payload. The buffer is still zero-padded to
+/// `00:00:00` plus `EtherType` `0x0806`) before the ARP payload. The buffer is still zero-padded to
 /// [`MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE`].
 ///
 /// # Panics
