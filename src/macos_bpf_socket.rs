@@ -19,23 +19,38 @@ const BPF_RECORD_ALIGNMENT: usize = 4;
 
 /// `BPF_LD | BPF_H | BPF_ABS`: load the 16-bit halfword at a fixed frame offset into the accumulator.
 const BPF_LOAD_HALFWORD_ABSOLUTE: u16 = 0x28;
+/// `BPF_LD | BPF_W | BPF_ABS`: load the 32-bit word at a fixed frame offset into the accumulator.
+const BPF_LOAD_WORD_ABSOLUTE: u16 = 0x20;
 /// `BPF_JMP | BPF_JEQ | BPF_K`: branch on accumulator equal to a constant.
 const BPF_JUMP_IF_EQUAL_CONSTANT: u16 = 0x15;
+/// `BPF_JMP | BPF_JGT | BPF_K`: branch on accumulator greater than a constant.
+const BPF_JUMP_IF_GREATER_THAN_CONSTANT: u16 = 0x25;
 /// `BPF_RET | BPF_K`: return a constant capture length (0 drops the frame).
 const BPF_RETURN_CONSTANT: u16 = 0x06;
-/// Offset of the `EtherType` field in an Ethernet II header.
+/// Offset of the `EtherType` / IEEE 802.3 length field in an Ethernet header.
 const ETHERNET_TYPE_FIELD_OFFSET: u32 = 12;
 /// `EtherType` for ARP (`ETH_P_ARP`).
 const ETHERNET_TYPE_ARP: u32 = 0x0806;
+/// `EtherType` for IEEE 802.1Q VLAN tagging (`ETH_P_8021Q`).
+const ETHERNET_TYPE_VLAN_TAG: u32 = 0x8100;
+/// IEEE 802.3 maximum MAC client data length; values above this are not length fields.
+const IEEE_8023_MAXIMUM_LENGTH: u32 = 1500;
+/// First four octets of RFC 1042 LLC/SNAP (`AA AA 03 00`).
+const RFC_1042_LLC_SNAP_PREFIX: u32 = 0xAAAA_0300;
+/// Last four octets of RFC 1042 SNAP ARP (`00 00 08 06`).
+const RFC_1042_SNAP_ARP_ETHERTYPE: u32 = 0x0000_0806;
 /// Capture length that accepts the whole frame.
 const BPF_ACCEPT_WHOLE_FRAME: u32 = u32::MAX;
 
-/// Classic Berkeley Packet Filter program accepting only Ethernet II frames carrying ARP.
+/// Classic Berkeley Packet Filter program accepting ARP in Ethernet II, a single IEEE 802.1Q tag,
+/// and RFC 1042 LLC/SNAP (untagged or behind one 802.1Q tag).
 ///
 /// Unlike a Linux `AF_PACKET` socket bound to `ETH_P_ARP`, a BPF device delivers every frame on the
 /// interface by default, so this filter is what scopes reads to ARP and avoids flooding the scanner
-/// with unrelated traffic.
-const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 4] = [
+/// with unrelated traffic. VLAN-tagged and IEEE 802.3 SNAP ARP are included so those replies are
+/// not dropped before the shared parser. Stacked VLAN tags are left for the userspace parser to
+/// reject.
+const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 17] = [
     BpfProgramInstruction {
         code: BPF_LOAD_HALFWORD_ABSOLUTE,
         jump_if_true: 0,
@@ -44,21 +59,99 @@ const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 4] = [
     },
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
-        jump_if_true: 0,
-        jump_if_false: 1,
+        jump_if_true: 14,
+        jump_if_false: 0,
         operand: ETHERNET_TYPE_ARP,
     },
     BpfProgramInstruction {
-        code: BPF_RETURN_CONSTANT,
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 5,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_VLAN_TAG,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_GREATER_THAN_CONSTANT,
+        jump_if_true: 11,
+        jump_if_false: 0,
+        operand: IEEE_8023_MAXIMUM_LENGTH,
+    },
+    BpfProgramInstruction {
+        code: BPF_LOAD_WORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: BPF_ACCEPT_WHOLE_FRAME,
+        operand: 14,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 9,
+        operand: RFC_1042_LLC_SNAP_PREFIX,
+    },
+    BpfProgramInstruction {
+        code: BPF_LOAD_WORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: 18,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 8,
+        jump_if_false: 7,
+        operand: RFC_1042_SNAP_ARP_ETHERTYPE,
+    },
+    BpfProgramInstruction {
+        code: BPF_LOAD_HALFWORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_FIELD_OFFSET + 4,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 6,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_ARP,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_GREATER_THAN_CONSTANT,
+        jump_if_true: 4,
+        jump_if_false: 0,
+        operand: IEEE_8023_MAXIMUM_LENGTH,
+    },
+    BpfProgramInstruction {
+        code: BPF_LOAD_WORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: 18,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 2,
+        operand: RFC_1042_LLC_SNAP_PREFIX,
+    },
+    BpfProgramInstruction {
+        code: BPF_LOAD_WORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: 22,
+    },
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 1,
+        jump_if_false: 0,
+        operand: RFC_1042_SNAP_ARP_ETHERTYPE,
     },
     BpfProgramInstruction {
         code: BPF_RETURN_CONSTANT,
         jump_if_true: 0,
         jump_if_false: 0,
         operand: 0,
+    },
+    BpfProgramInstruction {
+        code: BPF_RETURN_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: BPF_ACCEPT_WHOLE_FRAME,
     },
 ];
 
@@ -148,8 +241,9 @@ pub fn open_macos_link_layer_endpoint(interface_name: &str) -> Result<MacosBpfEn
     macos_system_call::set_bpf_interface(&bpf_device, &interface_request)
         .map_err(|source| AppError::SocketBindFailed { source })?;
 
-    // Scope reads to ARP and stop the device from echoing back the requests we broadcast, matching
-    // the effect of a Linux ETH_P_ARP packet socket.
+    // Scope reads to ARP (Ethernet II, one 802.1Q tag, or RFC 1042 SNAP) and stop the device from
+    // echoing back the requests we broadcast, matching the effect of a Linux packet socket plus the
+    // extra framings the shared parser accepts.
     macos_system_call::set_bpf_filter(&bpf_device, &ARP_CAPTURE_FILTER)
         .map_err(|source| AppError::RawSocketOpenFailed { source })?;
     macos_system_call::set_bpf_see_sent(&bpf_device, false)
@@ -231,10 +325,13 @@ impl LinkLayerEndpoint for MacosBpfEndpoint {
 #[cfg(test)]
 mod tests {
     use super::{
-        BPF_RECORD_ALIGNMENT, BpfPacketHeaderLayout, bpf_word_align, next_bpf_record,
+        ARP_CAPTURE_FILTER, BPF_JUMP_IF_EQUAL_CONSTANT, BPF_JUMP_IF_GREATER_THAN_CONSTANT,
+        BPF_LOAD_HALFWORD_ABSOLUTE, BPF_LOAD_WORD_ABSOLUTE, BPF_RECORD_ALIGNMENT,
+        BPF_RETURN_CONSTANT, BpfPacketHeaderLayout, bpf_word_align, next_bpf_record,
         open_macos_link_layer_endpoint,
     };
     use crate::error::AppError;
+    use crate::macos_system_call::BpfProgramInstruction;
     use std::mem::offset_of;
 
     #[test]
@@ -404,6 +501,152 @@ mod tests {
         assert!(
             outcome.is_none(),
             "a capture length past the buffer end should be rejected, got: {outcome:?}"
+        );
+    }
+
+    fn classic_bpf_accepts_frame(filter: &[BpfProgramInstruction], frame: &[u8]) -> bool {
+        let mut program_counter = 0usize;
+        let mut accumulator = 0u32;
+        for _ in 0..=filter.len() {
+            let instruction = filter
+                .get(program_counter)
+                .expect("BPF program counter should stay inside the filter");
+            match instruction.code {
+                BPF_LOAD_HALFWORD_ABSOLUTE => {
+                    let offset = usize::try_from(instruction.operand).expect("offset fits usize");
+                    let Some(octets) = frame.get(offset..offset + 2) else {
+                        return false;
+                    };
+                    accumulator = u32::from(u16::from_be_bytes([octets[0], octets[1]]));
+                    program_counter += 1;
+                }
+                BPF_LOAD_WORD_ABSOLUTE => {
+                    let offset = usize::try_from(instruction.operand).expect("offset fits usize");
+                    let Some(octets) = frame.get(offset..offset + 4) else {
+                        return false;
+                    };
+                    accumulator = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
+                    program_counter += 1;
+                }
+                BPF_JUMP_IF_EQUAL_CONSTANT => {
+                    let skip = if accumulator == instruction.operand {
+                        usize::from(instruction.jump_if_true)
+                    } else {
+                        usize::from(instruction.jump_if_false)
+                    };
+                    program_counter = program_counter
+                        .checked_add(1)
+                        .and_then(|next| next.checked_add(skip))
+                        .expect("BPF jump should stay in range");
+                }
+                BPF_JUMP_IF_GREATER_THAN_CONSTANT => {
+                    let skip = if accumulator > instruction.operand {
+                        usize::from(instruction.jump_if_true)
+                    } else {
+                        usize::from(instruction.jump_if_false)
+                    };
+                    program_counter = program_counter
+                        .checked_add(1)
+                        .and_then(|next| next.checked_add(skip))
+                        .expect("BPF jump should stay in range");
+                }
+                BPF_RETURN_CONSTANT => {
+                    return instruction.operand != 0;
+                }
+                other => panic!("unexpected BPF opcode {other:#x} in ARP capture filter"),
+            }
+        }
+        panic!("ARP capture filter did not return");
+    }
+
+    fn padded_ethernet_fixture(prefix: &[u8]) -> [u8; 60] {
+        let mut frame = [0u8; 60];
+        frame[..prefix.len()].copy_from_slice(prefix);
+        frame
+    }
+
+    #[test]
+    fn arp_capture_filter_accepts_ethernet_ii_vlan_and_rfc_1042_snap_arp() {
+        // Arrange
+        let filter = ARP_CAPTURE_FILTER;
+        let ethernet_ii_arp = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x06,
+        ]);
+        let ethernet_ii_ipv4 = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
+        ]);
+        let vlan_arp = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x81, 0x00, 0x00, 0x0a, 0x08,
+            0x06,
+        ]);
+        let vlan_ipv4 = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x81, 0x00, 0x00, 0x0a, 0x08,
+            0x00,
+        ]);
+        let snap_arp = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x00, 0x24, 0xaa, 0xaa, 0x03,
+            0x00, 0x00, 0x00, 0x08, 0x06,
+        ]);
+        let snap_ipv4 = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x00, 0x24, 0xaa, 0xaa, 0x03,
+            0x00, 0x00, 0x00, 0x08, 0x00,
+        ]);
+        let vlan_snap_arp = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x81, 0x00, 0x00, 0x0a, 0x00,
+            0x24, 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06,
+        ]);
+        let ieee_8023_without_snap = padded_ethernet_fixture(&[
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x00, 0x24, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+
+        // Act
+        let accepts_ethernet_ii_arp = classic_bpf_accepts_frame(&filter, &ethernet_ii_arp);
+        let accepts_ethernet_ii_ipv4 = classic_bpf_accepts_frame(&filter, &ethernet_ii_ipv4);
+        let accepts_vlan_arp = classic_bpf_accepts_frame(&filter, &vlan_arp);
+        let accepts_vlan_ipv4 = classic_bpf_accepts_frame(&filter, &vlan_ipv4);
+        let accepts_snap_arp = classic_bpf_accepts_frame(&filter, &snap_arp);
+        let accepts_snap_ipv4 = classic_bpf_accepts_frame(&filter, &snap_ipv4);
+        let accepts_vlan_snap_arp = classic_bpf_accepts_frame(&filter, &vlan_snap_arp);
+        let accepts_ieee_8023_without_snap =
+            classic_bpf_accepts_frame(&filter, &ieee_8023_without_snap);
+
+        // Assert
+        assert_eq!(filter.len(), 17, "filter should cover SNAP and VLAN+SNAP");
+        assert_eq!(
+            filter[0].operand, 12,
+            "first load is the Ethernet length/type field"
+        );
+        assert_eq!(filter[1].operand, 0x0806, "first compare is EtherType ARP");
+        assert_eq!(
+            filter[2].operand, 0x8100,
+            "second compare is IEEE 802.1Q TPID"
+        );
+        assert_eq!(filter[15].operand, 0, "drop returns zero capture length");
+        assert_eq!(
+            filter[16].operand,
+            u32::MAX,
+            "accept returns the whole frame"
+        );
+        assert!(
+            accepts_ethernet_ii_arp,
+            "untagged Ethernet II ARP must pass"
+        );
+        assert!(
+            !accepts_ethernet_ii_ipv4,
+            "untagged IPv4 must be dropped by the ARP filter"
+        );
+        assert!(accepts_vlan_arp, "single 802.1Q tag plus ARP must pass");
+        assert!(!accepts_vlan_ipv4, "VLAN-tagged IPv4 must be dropped");
+        assert!(accepts_snap_arp, "RFC 1042 LLC/SNAP ARP must pass");
+        assert!(!accepts_snap_ipv4, "RFC 1042 SNAP IPv4 must be dropped");
+        assert!(
+            accepts_vlan_snap_arp,
+            "802.1Q plus RFC 1042 SNAP ARP must pass"
+        );
+        assert!(
+            !accepts_ieee_8023_without_snap,
+            "IEEE 802.3 length without RFC 1042 SNAP must be dropped"
         );
     }
 }

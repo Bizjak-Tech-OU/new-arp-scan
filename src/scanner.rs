@@ -13,11 +13,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::address_resolution_protocol::{
-    build_address_resolution_request_ethernet_frame,
-    try_parse_address_resolution_reply_ipv4_over_ethernet,
+    ARP_OPERATION_REPLY, encode_address_resolution_request_from_layout,
+    try_parse_address_resolution_ipv4_over_ethernet,
 };
+use crate::application_command::ScanWireOptions;
 use crate::application_outcome::{DiscoveredHost, ScanOutcome};
 use crate::error::AppError;
+use crate::ethernet_frame::{ETHERNET_PROTOCOL_ARP, try_parse_ethernet_frame};
 use crate::ipv4_cidr::Ipv4HostAddressIterator;
 use crate::ipv4_subnet::ipv4_address_is_strictly_inside_subnet;
 use crate::link_layer_backend::{InterfaceScanAddresses, LinkLayerEndpoint};
@@ -114,6 +116,7 @@ fn ipv4_sender_is_probed_target(
 }
 
 /// Selects which address resolution reply senders are recorded during a receive phase.
+#[derive(Debug)]
 pub(crate) enum ArpReplyAcceptance {
     /// Accept the interface address and any strictly interior subnet senders (full-subnet scan).
     SubnetScope {
@@ -145,25 +148,30 @@ impl ArpReplyAcceptance {
     }
 }
 
+/// MAC, interface IPv4, and on-wire options used when sending ARP requests.
+#[derive(Clone)]
+pub(crate) struct ScanTransmitContext {
+    /// Scanning interface Ethernet address (`ar$sha`).
+    pub source_mac_address: MacAddress,
+    /// Scanning interface IPv4 address, used when [`ScanWireOptions::sender_protocol_address`] is
+    /// [`crate::application_command::ArpSenderProtocolAddress::Interface`].
+    pub interface_ipv4_address: Ipv4Addr,
+    /// VLAN tag, `ar$spa` override, LLC/SNAP framing, and Ethernet/ARP field overrides.
+    pub wire: ScanWireOptions,
+}
+
 fn run_address_resolution_request_rounds(
     endpoint: &impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
-    source_identity: (MacAddress, Ipv4Addr),
+    transmit: &ScanTransmitContext,
     scan_round_count: NonZeroU64,
     pacing_between_scan_rounds: Duration,
     warnings: &mut Vec<String>,
 ) {
     let total_rounds = scan_round_count.get();
-    let (source_mac_address, source_ipv4_address) = source_identity;
     for round_index in 0..total_rounds {
         for target_ipv4_address in target_ipv4_addresses {
-            send_one_address_resolution_request(
-                endpoint,
-                source_mac_address,
-                source_ipv4_address,
-                *target_ipv4_address,
-                warnings,
-            );
+            send_one_address_resolution_request(endpoint, transmit, *target_ipv4_address, warnings);
         }
         if should_apply_pacing_after_scan_round(
             round_index,
@@ -177,17 +185,21 @@ fn run_address_resolution_request_rounds(
 
 fn send_one_address_resolution_request(
     endpoint: &impl LinkLayerEndpoint,
-    source_mac_address: MacAddress,
-    source_ipv4_address: Ipv4Addr,
+    transmit: &ScanTransmitContext,
     target_ipv4_address: Ipv4Addr,
     warnings: &mut Vec<String>,
 ) {
-    let frame = build_address_resolution_request_ethernet_frame(
-        source_mac_address,
-        source_ipv4_address,
+    let sender_protocol_address = transmit
+        .wire
+        .sender_protocol_address
+        .ipv4_address_for_target(transmit.interface_ipv4_address, target_ipv4_address);
+    let layout = transmit.wire.address_resolution_request_layout(
+        transmit.source_mac_address,
+        sender_protocol_address,
         target_ipv4_address,
     );
-    if let Err(source) = endpoint.send_ethernet_frame(frame.as_ref()) {
+    let frame = encode_address_resolution_request_from_layout(layout);
+    if let Err(source) = endpoint.send_ethernet_frame(&frame) {
         warnings.push(format!(
             "failed to send ARP request to {target_ipv4_address}: {source}"
         ));
@@ -228,16 +240,23 @@ fn drain_buffered_reply_frames(
 ) -> Result<(), AppError> {
     while let Some(bytes_received) = endpoint.try_receive_ethernet_frame(receive_buffer)? {
         let frame_slice = &receive_buffer[..bytes_received];
-        match try_parse_address_resolution_reply_ipv4_over_ethernet(frame_slice) {
-            Ok((sender_ipv4_address, sender_mac_address)) => {
-                if reply_acceptance.accepts_sender_ipv4_address(sender_ipv4_address) {
+        if ethernet_frame_is_not_address_resolution_protocol(frame_slice) {
+            continue;
+        }
+        match try_parse_address_resolution_ipv4_over_ethernet(frame_slice) {
+            Ok(parsed) if parsed.opcode == ARP_OPERATION_REPLY => {
+                if reply_acceptance.accepts_sender_ipv4_address(parsed.sender_protocol) {
                     merge_address_resolution_reply_sender_into_discovered_hosts(
                         discovered_hosts,
-                        sender_ipv4_address,
-                        sender_mac_address,
+                        parsed.sender_protocol,
+                        parsed.sender_hardware,
                         warnings,
                     );
                 }
+            }
+            Ok(_) => {
+                // Well-formed ARP that is not a reply (request, RARP, and so on) is expected LAN
+                // noise, including possible copies of our own requests. It is not a malformation.
             }
             Err(reason) => {
                 warnings.push(format!("received malformed Ethernet/ARP frame: {reason}"));
@@ -248,7 +267,19 @@ fn drain_buffered_reply_frames(
     Ok(())
 }
 
+/// Returns whether `frame_slice` is Ethernet that is not IPv4 ARP (including frames that cannot be
+/// parsed as Ethernet). Those arrivals are expected when the capture socket is bound to every
+/// protocol, and they are not operator-facing malformation warnings. Well-formed ARP that is not a
+/// reply is filtered after this check and is also not treated as malformed.
+fn ethernet_frame_is_not_address_resolution_protocol(frame_slice: &[u8]) -> bool {
+    match try_parse_ethernet_frame(frame_slice) {
+        Ok(parsed) => parsed.ether_type != ETHERNET_PROTOCOL_ARP,
+        Err(_) => true,
+    }
+}
+
 /// The ordered target list and reply-acceptance rule for a full-subnet scan.
+#[derive(Debug)]
 pub(crate) struct SubnetScanPlan {
     /// Targets to probe, interior hosts first, then the interface address when it lies on an edge.
     pub targets: Vec<Ipv4Addr>,
@@ -301,7 +332,7 @@ pub(crate) fn full_subnet_scan_plan(
 /// Sends the request rounds and collects replies on an already-open `endpoint`, returning the
 /// discovered hosts and any warnings.
 ///
-/// `source_identity` is the `(MAC, IPv4)` of the scanning interface. `acceptance` decides which
+/// `transmit` is the scanning interface MAC/IPv4 plus on-wire options (VLAN, `ar$spa`, LLC/SNAP). `acceptance` decides which
 /// reply senders are recorded (full subnet versus a single probed target). The timing parameters
 /// match the public scan contract: `receive_timeout_after_last_request` bounds the receive phase
 /// after the final round, `pacing_between_scan_rounds` sleeps after each round except the last, and
@@ -317,18 +348,19 @@ pub(crate) fn full_subnet_scan_plan(
 pub(crate) fn collect_scan_over_endpoint(
     endpoint: &mut impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
-    source_identity: (MacAddress, Ipv4Addr),
+    transmit: &ScanTransmitContext,
     acceptance: &ArpReplyAcceptance,
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
 ) -> Result<ScanOutcome, AppError> {
+    transmit.wire.validate_ieee_8023_mac_client_data()?;
     let mut warnings = Vec::new();
 
     run_address_resolution_request_rounds(
         endpoint,
         target_ipv4_addresses,
-        source_identity,
+        transmit,
         scan_round_count,
         pacing_between_scan_rounds,
         &mut warnings,
@@ -1032,6 +1064,93 @@ mod ipv4_sender_is_probed_target_tests {
 }
 
 #[cfg(test)]
+mod full_subnet_scan_plan_tests {
+    use super::ArpReplyAcceptance;
+    use super::full_subnet_scan_plan;
+    use crate::error::AppError;
+    use crate::link_layer_backend::InterfaceScanAddresses;
+    use crate::mac_address::MacAddress;
+    use std::net::Ipv4Addr;
+
+    fn slash_24_addresses(source: Ipv4Addr) -> InterfaceScanAddresses {
+        InterfaceScanAddresses {
+            source_ipv4_address: source,
+            ipv4_netmask: Ipv4Addr::new(255, 255, 255, 0),
+            source_mac_address: MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]),
+        }
+    }
+
+    #[test]
+    fn plans_interior_slash_24_targets_and_subnet_scope_acceptance() {
+        // Arrange
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let addresses = slash_24_addresses(source);
+
+        // Act
+        let plan = full_subnet_scan_plan(&addresses).expect("/24 should be scannable");
+
+        // Assert
+        assert_eq!(
+            plan.targets.first().copied(),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(
+            plan.targets.last().copied(),
+            Some(Ipv4Addr::new(192, 168, 1, 254))
+        );
+        assert_eq!(plan.targets.len(), 254);
+        assert!(plan.targets.contains(&source));
+        match plan.acceptance {
+            ArpReplyAcceptance::SubnetScope {
+                source_ipv4_address,
+                ..
+            } => assert_eq!(source_ipv4_address, source),
+            ArpReplyAcceptance::ExactTarget { .. } => {
+                panic!("full-subnet plan should use subnet-scope acceptance")
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_slash_31_subnet_as_unsupported() {
+        // Arrange
+        let addresses = InterfaceScanAddresses {
+            source_ipv4_address: Ipv4Addr::new(192, 168, 1, 0),
+            ipv4_netmask: Ipv4Addr::new(255, 255, 255, 254),
+            source_mac_address: MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]),
+        };
+
+        // Act
+        let outcome = full_subnet_scan_plan(&addresses);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Ipv4SubnetUnsupported { .. })),
+            "/31 has no interior hosts, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_contiguous_netmask() {
+        // Arrange
+        let addresses = InterfaceScanAddresses {
+            source_ipv4_address: Ipv4Addr::new(192, 168, 1, 10),
+            ipv4_netmask: Ipv4Addr::new(255, 255, 0, 255),
+            source_mac_address: MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]),
+        };
+
+        // Act
+        let outcome = full_subnet_scan_plan(&addresses);
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Ipv4NetmaskInvalid { .. })),
+            "non-contiguous netmask should be invalid, got: {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod arp_reply_acceptance_tests {
     use super::ArpReplyAcceptance;
     use std::net::Ipv4Addr;
@@ -1098,6 +1217,1164 @@ mod arp_reply_acceptance_tests {
         assert!(
             !outcome,
             "off-subnet sender should be rejected in subnet scope unless it equals the interface address"
+        );
+    }
+}
+
+#[cfg(test)]
+mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
+    use super::ArpReplyAcceptance;
+    use super::ScanTransmitContext;
+    use super::collect_scan_over_endpoint;
+    use crate::address_resolution_protocol::{
+        ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST, build_address_resolution_request_ethernet_frame,
+    };
+    use crate::application_command::{ArpSenderProtocolAddress, ScanWireOptions};
+    use crate::error::AppError;
+    use crate::ethernet_frame::{
+        ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4,
+        ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation,
+        Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
+        encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
+        encode_ieee_8023_rfc_1042_llc_snap_frame,
+    };
+    use crate::link_layer_backend::LinkLayerEndpoint;
+    use crate::mac_address::MacAddress;
+    use std::cell::RefCell;
+    use std::net::Ipv4Addr;
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    struct ScriptedEndpoint {
+        sent: RefCell<Vec<Vec<u8>>>,
+        inbound: Vec<Vec<u8>>,
+    }
+
+    impl LinkLayerEndpoint for ScriptedEndpoint {
+        fn send_ethernet_frame(&self, frame: &[u8]) -> std::io::Result<()> {
+            self.sent.borrow_mut().push(frame.to_vec());
+            Ok(())
+        }
+
+        fn wait_until_readable(
+            &self,
+            _timeout_milliseconds: libc::c_int,
+        ) -> Result<bool, AppError> {
+            Ok(!self.inbound.is_empty())
+        }
+
+        fn try_receive_ethernet_frame(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> Result<Option<usize>, AppError> {
+            if self.inbound.is_empty() {
+                return Ok(None);
+            }
+            let frame = self.inbound.remove(0);
+            buffer[..frame.len()].copy_from_slice(&frame);
+            Ok(Some(frame.len()))
+        }
+    }
+
+    fn ipv4_ethernet_arp_frame_with_opcode(
+        opcode: u16,
+        sender_mac: MacAddress,
+        sender_ip: Ipv4Addr,
+    ) -> Vec<u8> {
+        let mut frame = build_address_resolution_request_ethernet_frame(
+            sender_mac,
+            sender_ip,
+            Ipv4Addr::new(192, 168, 1, 1),
+        )
+        .to_vec();
+        let opcode_offset = ETHERNET_II_HEADER_LENGTH + 6;
+        frame[opcode_offset..opcode_offset + 2].copy_from_slice(&opcode.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn sends_ieee_8021q_tagged_request_when_vlan_identifier_is_set() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits in 12 bits");
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    vlan_identifier: Some(vlan_identifier),
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(sent.len(), 1, "one target and one round should send once");
+        assert_eq!(&sent[0][12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(&sent[0][14..16], &10u16.to_be_bytes());
+        assert_eq!(&sent[0][16..18], &[0x08, 0x06]);
+        assert!(
+            outcome.warnings.is_empty(),
+            "successful tagged send should not warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn sends_ieee_8021q_priority_code_point_and_drop_eligible_indicator() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits in 12 bits");
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    vlan_identifier: Some(vlan_identifier),
+                    vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(5)
+                        .expect("PCP 5 fits"),
+                    vlan_drop_eligible_indicator: true,
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(&sent[0][12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(
+            &sent[0][14..16],
+            &0xB00Au16.to_be_bytes(),
+            "PCP 5, DEI 1, VID 10 should encode as TCI 0xB00A"
+        );
+    }
+
+    #[test]
+    fn sends_custom_padding_after_arp_payload() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+        let padding = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    padding: padding.clone(),
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        let payload_start = 14 + 28;
+        assert_eq!(
+            &sent[0][payload_start..payload_start + 4],
+            padding.as_slice()
+        );
+        assert_eq!(sent[0].len(), 60);
+    }
+
+    #[test]
+    fn collect_rejects_padding_that_exceeds_ieee_8023_mac_client_data() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    llc_snap: true,
+                    padding: vec![0; 1465],
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        );
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::Ieee8023MacClientDataExceedsMaximum { .. })
+            ),
+            "SNAP padding of 1465 octets must exceed the 1500-octet MAC client data maximum, got: {outcome:?}"
+        );
+        assert!(
+            endpoint.sent.borrow().is_empty(),
+            "oversize padding must not transmit a frame"
+        );
+    }
+
+    #[test]
+    fn ignores_non_arp_ethernet_frames_without_malformed_warning() {
+        // Arrange
+        let ipv4_frame = encode_ethernet_ii_frame(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+            ETHERNET_PROTOCOL_IPV4,
+            &[0x45, 0x00],
+        );
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![ipv4_frame],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "IPv4 frames must not be recorded as ARP replies"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "non-ARP capture noise should not produce malformed-frame warnings, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_inbound_arp_request_without_malformed_warning_or_host() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let request =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REQUEST, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![request],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "ARP requests must not be recorded as discovered hosts"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "well-formed ARP requests should not produce malformed-frame warnings, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn records_inbound_arp_reply_sender() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let reply = ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![reply],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "a well-formed reply should not warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn warns_when_inbound_arp_opcode_is_reserved_by_rfc_5494() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let reserved = ipv4_ethernet_arp_frame_with_opcode(65535, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![reserved],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions::default(),
+            },
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(outcome.discovered_hosts.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("reserved by RFC 5494"),
+            "reserved opcode should remain a malformed-frame warning, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn sends_rfc_5227_probe_when_sender_protocol_address_is_unspecified() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    sender_protocol_address: ArpSenderProtocolAddress::Explicit(
+                        Ipv4Addr::UNSPECIFIED,
+                    ),
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(
+            &sent[0][28..32],
+            &[0, 0, 0, 0],
+            "RFC 5227 Probe SPA is 0.0.0.0"
+        );
+        assert_eq!(&sent[0][38..42], &target_ip.octets());
+    }
+
+    #[test]
+    fn sends_rfc_5227_announcement_when_sender_protocol_address_is_destination_target() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    sender_protocol_address: ArpSenderProtocolAddress::DestinationTarget,
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(
+            &sent[0][28..32],
+            &target_ip.octets(),
+            "RFC 5227 Announcement sets ar$spa to the target"
+        );
+        assert_eq!(&sent[0][38..42], &target_ip.octets());
+    }
+
+    #[test]
+    fn sends_rfc_1042_llc_snap_when_llc_snap_is_set() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    llc_snap: true,
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(
+            &sent[0][14..17],
+            &[0xAA, 0xAA, 0x03],
+            "RFC 1042 LLC header should precede SNAP"
+        );
+        assert_eq!(
+            &sent[0][20..22],
+            &[0x08, 0x06],
+            "SNAP EtherType should be ARP"
+        );
+        assert_eq!(
+            &sent[0][12..14],
+            &36u16.to_be_bytes(),
+            "IEEE 802.3 length is LLC/SNAP plus ARP (36), not an Ethernet-header-inclusive size"
+        );
+    }
+
+    #[test]
+    fn sends_unicast_ethernet_destination_and_independent_arp_sender_hardware() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let destination = MacAddress::from_octets([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let ethernet_source = MacAddress::from_octets([0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]);
+        let sender_hardware = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    ethernet_destination: Some(destination),
+                    ethernet_source: Some(ethernet_source),
+                    arp_sender_hardware: Some(sender_hardware),
+                    arp_hardware_type: 6,
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(&sent[0][0..6], &destination.octets());
+        assert_eq!(&sent[0][6..12], &ethernet_source.octets());
+        assert_eq!(&sent[0][22..28], &sender_hardware.octets());
+        assert_eq!(&sent[0][14..16], &6u16.to_be_bytes());
+    }
+
+    fn default_exact_target_context() -> (
+        MacAddress,
+        Ipv4Addr,
+        Ipv4Addr,
+        ScanTransmitContext,
+        ArpReplyAcceptance,
+    ) {
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let transmit = ScanTransmitContext {
+            source_mac_address: source_mac,
+            interface_ipv4_address: source_ip,
+            wire: ScanWireOptions::default(),
+        };
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+        (source_mac, source_ip, target_ip, transmit, acceptance)
+    }
+
+    #[test]
+    fn warns_when_sending_an_address_resolution_request_fails() {
+        // Arrange
+        struct FailingSendEndpoint;
+        impl LinkLayerEndpoint for FailingSendEndpoint {
+            fn send_ethernet_frame(&self, _frame: &[u8]) -> std::io::Result<()> {
+                Err(std::io::Error::other("link send failed"))
+            }
+
+            fn wait_until_readable(
+                &self,
+                _timeout_milliseconds: libc::c_int,
+            ) -> Result<bool, AppError> {
+                Ok(false)
+            }
+
+            fn try_receive_ethernet_frame(
+                &mut self,
+                _buffer: &mut [u8],
+            ) -> Result<Option<usize>, AppError> {
+                Ok(None)
+            }
+        }
+        let mut endpoint = FailingSendEndpoint;
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("send failure is a warning, not a fatal error");
+
+        // Assert
+        assert!(outcome.discovered_hosts.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("failed to send ARP request")
+                && outcome.warnings[0].contains("192.168.1.50"),
+            "send failure should name the target, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_truncated_ethernet_without_malformed_warning() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![vec![0u8; 10]],
+        };
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(outcome.discovered_hosts.is_empty());
+        assert!(
+            outcome.warnings.is_empty(),
+            "unparseable Ethernet is capture noise, not a malformed ARP warning, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn warns_when_arp_ethertype_payload_is_truncated() {
+        // Arrange
+        let truncated = encode_ethernet_ii_frame(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+            ETHERNET_PROTOCOL_ARP,
+            &[0u8; 10],
+        );
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![truncated],
+        };
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(outcome.discovered_hosts.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("malformed Ethernet/ARP")
+                && outcome.warnings[0].contains("shorter than IPv4 over Ethernet"),
+            "truncated ARP payload should warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_non_reserved_arp_opcode_without_malformed_warning_or_host() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let rarp = ipv4_ethernet_arp_frame_with_opcode(3, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![rarp],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(outcome.discovered_hosts.is_empty());
+        assert!(
+            outcome.warnings.is_empty(),
+            "RARP should be ignored without a malformation warning, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_reply_whose_sender_is_not_the_exact_target() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let other_ip = Ipv4Addr::new(192, 168, 1, 51);
+        let reply = ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, other_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![reply],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "ExactTarget must not record a different sender IPv4"
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn records_reply_after_ignoring_an_inbound_request_in_the_same_drain() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let request =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REQUEST, sender_mac, target_ip);
+        let reply = ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![request, reply],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "a well-formed request must not poison a later reply, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn records_ieee_8021q_tagged_inbound_reply() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let arp_payload =
+            untagged[ETHERNET_II_HEADER_LENGTH..ETHERNET_II_HEADER_LENGTH + 28].to_vec();
+        let tagged = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+            MacAddress::BROADCAST,
+            sender_mac,
+            Some(Ieee8021qTagControlInformation::from_vlan_identifier(
+                Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits"),
+            )),
+            ETHERNET_PROTOCOL_ARP,
+            &arp_payload,
+        );
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![tagged],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn records_rfc_1042_llc_snap_inbound_reply() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let arp_payload =
+            untagged[ETHERNET_II_HEADER_LENGTH..ETHERNET_II_HEADER_LENGTH + 28].to_vec();
+        let snap = encode_ieee_8023_rfc_1042_llc_snap_frame(
+            MacAddress::BROADCAST,
+            sender_mac,
+            None,
+            ETHERNET_PROTOCOL_ARP,
+            &arp_payload,
+        );
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![snap],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn collect_rejects_ethernet_ii_padding_that_exceeds_ieee_8023_mac_client_data() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let (source_mac, source_ip, target_ip, _transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    padding: vec![0; 1473],
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        );
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::Ieee8023MacClientDataExceedsMaximum { .. })
+            ),
+            "Ethernet II padding of 1473 octets must exceed the 1500-octet MAC client data maximum, got: {outcome:?}"
+        );
+        assert!(endpoint.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn keeps_first_mac_when_conflicting_replies_arrive_during_receive() {
+        // Arrange
+        let first_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let second_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 3]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let first = ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, first_mac, target_ip);
+        let second =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, second_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![first, second],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            first_mac
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("conflicting address resolution reply"),
+            "second MAC should warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn returns_error_when_wait_until_readable_fails() {
+        // Arrange
+        struct FailingWaitEndpoint;
+        impl LinkLayerEndpoint for FailingWaitEndpoint {
+            fn send_ethernet_frame(&self, _frame: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn wait_until_readable(
+                &self,
+                _timeout_milliseconds: libc::c_int,
+            ) -> Result<bool, AppError> {
+                Err(AppError::from(std::io::Error::other("poll failed")))
+            }
+
+            fn try_receive_ethernet_frame(
+                &mut self,
+                _buffer: &mut [u8],
+            ) -> Result<Option<usize>, AppError> {
+                Ok(None)
+            }
+        }
+        let mut endpoint = FailingWaitEndpoint;
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        );
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Io(_))),
+            "poll failure should be fatal, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_try_receive_ethernet_frame_fails() {
+        // Arrange
+        struct FailingReceiveEndpoint;
+        impl LinkLayerEndpoint for FailingReceiveEndpoint {
+            fn send_ethernet_frame(&self, _frame: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn wait_until_readable(
+                &self,
+                _timeout_milliseconds: libc::c_int,
+            ) -> Result<bool, AppError> {
+                Ok(true)
+            }
+
+            fn try_receive_ethernet_frame(
+                &mut self,
+                _buffer: &mut [u8],
+            ) -> Result<Option<usize>, AppError> {
+                Err(AppError::from(std::io::Error::other("recv failed")))
+            }
+        }
+        let mut endpoint = FailingReceiveEndpoint;
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        );
+
+        // Assert
+        assert!(
+            matches!(outcome, Err(AppError::Io(_))),
+            "receive failure should be fatal, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn applies_inter_round_pacing_sleep_when_more_than_one_round_is_planned() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            NonZeroU64::new(2).expect("two rounds"),
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(
+            endpoint.sent.borrow().len(),
+            2,
+            "two rounds should send twice"
         );
     }
 }

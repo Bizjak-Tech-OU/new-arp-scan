@@ -5,11 +5,14 @@ use std::mem::zeroed;
 use std::os::fd::OwnedFd;
 
 use crate::address_resolution_protocol::ARP_HARDWARE_TYPE_ETHERNET;
+use crate::application_command::ScanWireOptions;
 use crate::error::AppError;
+use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
 use crate::interface_validation;
 use crate::link_layer_backend::LinkLayerEndpoint;
 use crate::linux_packet::{
-    ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
+    ETHERNET_PROTOCOL_ALL, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IEEE_802_2,
+    INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
     SOCKET_ADDRESS_FAMILY_PACKET, SockAddressLinkLayer, ethernet_protocol_host_to_network_order,
 };
 use crate::linux_system_call;
@@ -95,8 +98,26 @@ pub(crate) fn validate_interface_flags_for_arp_scanning(
     Ok(())
 }
 
-fn open_raw_packet_socket() -> Result<OwnedFd, AppError> {
-    match linux_system_call::open_packet_raw_socket(ETHERNET_PROTOCOL_ARP) {
+fn packet_socket_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
+    if wire.vlan_identifier.is_some() || wire.llc_snap {
+        ETHERNET_PROTOCOL_ALL
+    } else {
+        ETHERNET_PROTOCOL_ARP
+    }
+}
+
+fn link_layer_send_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
+    if wire.vlan_identifier.is_some() {
+        ETHERNET_PROTOCOL_VLAN_TAG
+    } else if wire.llc_snap {
+        ETHERNET_PROTOCOL_IEEE_802_2
+    } else {
+        ETHERNET_PROTOCOL_ARP
+    }
+}
+
+fn open_raw_packet_socket(ethernet_protocol_host_order: u16) -> Result<OwnedFd, AppError> {
+    match linux_system_call::open_packet_raw_socket(ethernet_protocol_host_order) {
         Ok(socket) => Ok(socket),
         Err(source) => {
             if source.kind() == std::io::ErrorKind::PermissionDenied {
@@ -112,10 +133,12 @@ fn bind_packet_socket_to_interface(
     packet_socket: &OwnedFd,
     interface_name: &str,
     interface_index: libc::c_uint,
+    ethernet_protocol_host_order: u16,
 ) -> Result<(), AppError> {
     let mut address: SockAddressLinkLayer = unsafe { zeroed() };
     address.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
-    address.link_layer_protocol = ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+    address.link_layer_protocol =
+        ethernet_protocol_host_to_network_order(ethernet_protocol_host_order);
     address.interface_index =
         libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
             interface_name: interface_name.to_string(),
@@ -134,14 +157,15 @@ fn bind_packet_socket_to_interface(
 }
 
 /// Builds the broadcast `sockaddr_ll` destination used to send ARP requests on `interface_index`.
-fn link_layer_broadcast_destination_for_arp(
+fn link_layer_broadcast_destination_for_scan(
     interface_name: &str,
     interface_index: libc::c_uint,
+    ethernet_protocol_host_order: u16,
 ) -> Result<SockAddressLinkLayer, AppError> {
     let mut link_layer_destination: SockAddressLinkLayer = unsafe { zeroed() };
     link_layer_destination.socket_address_family = SOCKET_ADDRESS_FAMILY_PACKET;
     link_layer_destination.link_layer_protocol =
-        ethernet_protocol_host_to_network_order(ETHERNET_PROTOCOL_ARP);
+        ethernet_protocol_host_to_network_order(ethernet_protocol_host_order);
     link_layer_destination.interface_index =
         libc::c_int::try_from(interface_index).map_err(|_| AppError::InterfaceLookupFailed {
             interface_name: interface_name.to_string(),
@@ -167,6 +191,11 @@ pub struct LinuxLinkLayerEndpoint {
 /// Opens a raw `AF_PACKET` socket bound to `interface_name` and returns a link-layer endpoint for
 /// ARP scanning.
 ///
+/// When `wire` is untagged Ethernet II, the socket is bound to `ETH_P_ARP`. When it requests IEEE
+/// 802.1Q or RFC 1042 LLC/SNAP, the socket is bound to `ETH_P_ALL` so tagged and SNAP replies are
+/// delivered. The send destination protocol is `ETH_P_8021Q` for tagged frames, `ETH_P_802_2` for
+/// untagged SNAP, and `ETH_P_ARP` otherwise.
+///
 /// # Errors
 ///
 /// Returns [`AppError`] when the interface name is invalid or unusable, when the raw socket cannot
@@ -178,12 +207,20 @@ pub struct LinuxLinkLayerEndpoint {
 /// This function does not panic.
 pub fn open_linux_link_layer_endpoint(
     interface_name: &str,
+    wire: &ScanWireOptions,
 ) -> Result<LinuxLinkLayerEndpoint, AppError> {
     let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
-    let packet_socket = open_raw_packet_socket()?;
-    bind_packet_socket_to_interface(&packet_socket, interface_name, interface_index)?;
+    let capture_protocol = packet_socket_protocol_for_wire_options(wire);
+    let send_protocol = link_layer_send_protocol_for_wire_options(wire);
+    let packet_socket = open_raw_packet_socket(capture_protocol)?;
+    bind_packet_socket_to_interface(
+        &packet_socket,
+        interface_name,
+        interface_index,
+        capture_protocol,
+    )?;
     let link_layer_destination =
-        link_layer_broadcast_destination_for_arp(interface_name, interface_index)?;
+        link_layer_broadcast_destination_for_scan(interface_name, interface_index, send_protocol)?;
     Ok(LinuxLinkLayerEndpoint {
         packet_socket,
         link_layer_destination,
@@ -238,9 +275,16 @@ impl LinkLayerEndpoint for LinuxLinkLayerEndpoint {
 
 #[cfg(test)]
 mod tests {
+    use super::link_layer_send_protocol_for_wire_options;
+    use super::packet_socket_protocol_for_wire_options;
     use super::validate_interface_flags_for_arp_scanning;
+    use crate::application_command::ScanWireOptions;
     use crate::error::AppError;
-    use crate::linux_packet::{INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP};
+    use crate::ethernet_frame::{ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qVlanIdentifier};
+    use crate::linux_packet::{
+        ETHERNET_PROTOCOL_ALL, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IEEE_802_2,
+        INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
+    };
 
     #[test]
     fn returns_error_when_interface_flags_indicate_loopback() {
@@ -303,6 +347,70 @@ mod tests {
         assert!(
             matches!(outcome, Ok(())),
             "UP non-loopback without NOARP should be accepted, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn packet_socket_uses_eth_p_all_when_vlan_or_llc_snap_is_set() {
+        // Arrange
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(7).expect("VID 7 fits in 12 bits");
+        let tagged = ScanWireOptions {
+            vlan_identifier: Some(vlan_identifier),
+            ..ScanWireOptions::default()
+        };
+        let llc_snap = ScanWireOptions {
+            llc_snap: true,
+            ..ScanWireOptions::default()
+        };
+        let untagged = ScanWireOptions::default();
+        let vlan_and_llc = ScanWireOptions {
+            vlan_identifier: Some(vlan_identifier),
+            llc_snap: true,
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let tagged_capture = packet_socket_protocol_for_wire_options(&tagged);
+        let tagged_send = link_layer_send_protocol_for_wire_options(&tagged);
+        let llc_capture = packet_socket_protocol_for_wire_options(&llc_snap);
+        let llc_send = link_layer_send_protocol_for_wire_options(&llc_snap);
+        let untagged_capture = packet_socket_protocol_for_wire_options(&untagged);
+        let untagged_send = link_layer_send_protocol_for_wire_options(&untagged);
+        let vlan_and_llc_capture = packet_socket_protocol_for_wire_options(&vlan_and_llc);
+        let vlan_and_llc_send = link_layer_send_protocol_for_wire_options(&vlan_and_llc);
+
+        // Assert
+        assert_eq!(
+            tagged_capture, ETHERNET_PROTOCOL_ALL,
+            "tagged scans must receive both 0x8100 and stripped ARP"
+        );
+        assert_eq!(
+            tagged_send, ETHERNET_PROTOCOL_VLAN_TAG,
+            "tagged send sockaddr_ll protocol should match the outer TPID"
+        );
+        assert_eq!(
+            llc_capture, ETHERNET_PROTOCOL_ALL,
+            "LLC/SNAP scans must receive IEEE 802.3 length-field frames"
+        );
+        assert_eq!(
+            llc_send, ETHERNET_PROTOCOL_IEEE_802_2,
+            "untagged SNAP send sockaddr_ll protocol should be ETH_P_802_2"
+        );
+        assert_eq!(
+            untagged_capture, ETHERNET_PROTOCOL_ARP,
+            "untagged Ethernet II scans should keep ETH_P_ARP capture"
+        );
+        assert_eq!(
+            untagged_send, ETHERNET_PROTOCOL_ARP,
+            "untagged Ethernet II send sockaddr_ll protocol should stay ARP"
+        );
+        assert_eq!(
+            vlan_and_llc_capture, ETHERNET_PROTOCOL_ALL,
+            "tagged SNAP still needs ETH_P_ALL capture"
+        );
+        assert_eq!(
+            vlan_and_llc_send, ETHERNET_PROTOCOL_VLAN_TAG,
+            "outer 802.1Q TPID is the send protocol when both VLAN and SNAP are set"
         );
     }
 }

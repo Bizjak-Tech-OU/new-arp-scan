@@ -12,6 +12,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use crate::mac_address::MacAddress;
+use crate::mac_vendor_registry::{MacVendorRegistry, UNKNOWN_MAC_VENDOR_NAME};
 
 const USABLE_INTERFACE_TABLE_NAME_WIDTH: usize = 16;
 const USABLE_INTERFACE_TABLE_INDEX_WIDTH: usize = 6;
@@ -282,6 +283,28 @@ impl ApplicationOutcome {
         standard_output: &mut impl IoWrite,
         standard_error: &mut impl IoWrite,
     ) -> std::io::Result<()> {
+        self.write_operator_streams_with_mac_vendor_registry(standard_output, standard_error, None)
+    }
+
+    /// Writes operator output, annotating host lines with IEEE MA-L / MA-M / MA-S vendor names
+    /// when `mac_vendor_registry` is [`Some`].
+    ///
+    /// With a registry, each host line is `<IPv4> <MAC> <vendor>` (or `(Unknown)` when no prefix
+    /// matches). Without a registry, host lines stay `<IPv4> <MAC>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] when writing to either stream fails.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    pub fn write_operator_streams_with_mac_vendor_registry(
+        &self,
+        standard_output: &mut impl IoWrite,
+        standard_error: &mut impl IoWrite,
+        mac_vendor_registry: Option<&MacVendorRegistry>,
+    ) -> std::io::Result<()> {
         match self {
             ApplicationOutcome::Scan(scan_outcome) => {
                 for warning in &scan_outcome.warnings {
@@ -294,8 +317,8 @@ impl ApplicationOutcome {
                     for host in &scan_outcome.discovered_hosts {
                         writeln!(
                             standard_output,
-                            "{} {}",
-                            host.ipv4_address, host.media_access_control_address
+                            "{}",
+                            format_discovered_host_line(host, mac_vendor_registry)
                         )?;
                     }
                 }
@@ -314,6 +337,27 @@ impl ApplicationOutcome {
             }
         }
         Ok(())
+    }
+}
+
+fn format_discovered_host_line(
+    host: &DiscoveredHost,
+    mac_vendor_registry: Option<&MacVendorRegistry>,
+) -> String {
+    match mac_vendor_registry {
+        None => format!(
+            "{} {}",
+            host.ipv4_address, host.media_access_control_address
+        ),
+        Some(registry) => {
+            let vendor = registry
+                .vendor_name_for(host.media_access_control_address)
+                .unwrap_or(UNKNOWN_MAC_VENDOR_NAME);
+            format!(
+                "{} {} {vendor}",
+                host.ipv4_address, host.media_access_control_address
+            )
+        }
     }
 }
 
@@ -741,6 +785,76 @@ mod tests {
             expected.as_bytes(),
             "operator output should follow the outcome vector order (callers sort before building the outcome)"
         );
+    }
+
+    #[test]
+    fn write_operator_streams_with_registry_appends_vendor_or_unknown() {
+        // Arrange
+        use crate::mac_vendor_registry::MacVendorRegistry;
+
+        let known = DiscoveredHost {
+            ipv4_address: Ipv4Addr::new(10, 0, 0, 1),
+            media_access_control_address: MacAddress::from_octets([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            ]),
+        };
+        let unknown = DiscoveredHost {
+            ipv4_address: Ipv4Addr::new(10, 0, 0, 2),
+            media_access_control_address: MacAddress::from_octets([
+                0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA,
+            ]),
+        };
+        let registry = MacVendorRegistry::parse_ieee_oui_text("001122\tExample Corp\n")
+            .expect("fixture registry should parse");
+        let outcome = ApplicationOutcome::Scan(ScanOutcome {
+            discovered_hosts: vec![known, unknown],
+            warnings: vec![],
+            timing_summary: None,
+        });
+        let mut standard_output = Vec::new();
+        let mut standard_error = Vec::new();
+
+        // Act
+        outcome
+            .write_operator_streams_with_mac_vendor_registry(
+                &mut standard_output,
+                &mut standard_error,
+                Some(&registry),
+            )
+            .expect("in-memory writes should succeed");
+
+        // Assert
+        let stdout = String::from_utf8(standard_output).expect("host lines are UTF-8");
+        assert_eq!(
+            stdout,
+            "10.0.0.1 00:11:22:33:44:55 Example Corp\n10.0.0.2 ff:ee:dd:cc:bb:aa (Unknown)\n"
+        );
+    }
+
+    #[test]
+    fn write_operator_streams_without_registry_keeps_two_column_host_lines() {
+        // Arrange
+        let host = DiscoveredHost {
+            ipv4_address: Ipv4Addr::new(10, 0, 0, 1),
+            media_access_control_address: MacAddress::from_octets([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            ]),
+        };
+        let outcome = ApplicationOutcome::Scan(ScanOutcome {
+            discovered_hosts: vec![host],
+            warnings: vec![],
+            timing_summary: None,
+        });
+        let mut standard_output = Vec::new();
+        let mut standard_error = Vec::new();
+
+        // Act
+        outcome
+            .write_operator_streams(&mut standard_output, &mut standard_error)
+            .expect("in-memory writes should succeed");
+
+        // Assert
+        assert_eq!(standard_output, b"10.0.0.1 00:11:22:33:44:55\n");
     }
 
     #[test]

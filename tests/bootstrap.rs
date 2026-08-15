@@ -4,7 +4,7 @@
 use new_arp_scan::ApplicationOutcome;
 use new_arp_scan::{
     AppError, ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
-    run,
+    ScanWireOptions, run,
 };
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -17,6 +17,7 @@ fn run_scan_returns_unsupported_platform_on_unsupported_os() {
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
         attempts: DEFAULT_SCAN_ATTEMPTS,
+        wire: ScanWireOptions::default(),
     };
 
     // Act
@@ -50,6 +51,7 @@ fn run_scan_resolves_a_backend_and_fails_for_unknown_interface_on_macos() {
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
         attempts: DEFAULT_SCAN_ATTEMPTS,
+        wire: ScanWireOptions::default(),
     };
 
     // Act
@@ -162,6 +164,7 @@ fn run_scan_rejects_loopback_interface_on_linux() {
         timeout: DEFAULT_SCAN_TIMEOUT,
         pacing: DEFAULT_SCAN_PACING,
         attempts: DEFAULT_SCAN_ATTEMPTS,
+        wire: ScanWireOptions::default(),
     };
 
     // Act

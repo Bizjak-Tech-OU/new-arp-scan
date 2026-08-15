@@ -136,3 +136,78 @@ Introduce a **narrow portable link-layer boundary** that both Linux and macOS im
 **Reason:** Milestone issues #18–#19 call for readable timing context and deterministic operator-visible exit semantics without expanding the error surface into sysexits-style matrices.
 
 **Consequences:** README and [`docs/docs.html`](docs/docs.html) describe the timing line template and exit table; integration tests assert parse failures exit `2` where the toolchain maps `clap` usage errors to that code.
+
+## 2026-08-15 — RFC and IEEE packet fidelity, 802.1Q receive, IEEE MAC registries
+
+**Decision:** Treat the on-wire Ethernet/ARP codecs as a standards contract, not a best-effort layout:
+
+- **RFC 826:** keep transmitting Ethernet II ARP requests with `ar$hrd=1`, `ar$pro=0x0800`, `ar$hln=6`, `ar$pln=4`, `ar$op=1`, `ar$tha=0`, interface `ar$sha`/`ar$spa`, and target `ar$tpa`. Record replies from `ar$spa`/`ar$sha` (not the Ethernet source, which may differ).
+- **RFC 5227:** add explicit ARP Probe (`ar$spa=0.0.0.0`) and ARP Announcement (`ar$spa=ar$tpa`) builders covered by tests. Default `scan` / `--host` remain RFC 826 requests using the interface IPv4 address (the same default as original `arp-scan`). `perform_arp_probe` keeps meaning “single-target scan”, not an RFC 5227 Probe.
+- **RFC 5494:** reject reserved `ar$hrd` and `ar$op` values 0 and 65535 on receive.
+- **IEEE 802.3:** pad transmitted ARP to 60 octets without FCS (46-octet MAC client data, 18 zero pad bytes). Parse length/type as a length when `<= 1500`, as an EtherType when `>= 1536`, and reject the undefined gap. Accept RFC 1042 LLC/SNAP ARP on receive.
+- **IEEE 802.1Q:** decode a single customer VLAN tag on receive (VID is the low 12 TCI bits) and accept the inner ARP payload. Reject IEEE 802.1ad / unofficial QinQ TPIDs and stacked 0x8100 tags so the inner EtherType is never read from the wrong offset. Transmit stays untagged Ethernet II. macOS BPF now accepts both untagged ARP and 0x8100-tagged ARP. Linux `ETH_P_ARP` still relies on kernel VLAN tag stripping for tagged frames on the parent interface.
+- **IEEE MA-L / MA-M / MA-S:** add [`MacVendorRegistry`](src/mac_vendor_registry.rs) with longest-prefix match over `arp-scan` `ieee-oui.txt` text (6 / 7 / 9 hex digits). CLI `--mac-vendor-file` loads an explicit file; `ieee-oui.txt` in the current directory is used when present. Host lines become `<IPv4> <MAC> <vendor>` only when a registry is loaded.
+
+**Reason:** The core product is an ARP scanner. Silent misparse of 802.3 lengths, stacked VLAN TPIDs, and reserved ARP fields, plus no IEEE registry lookup, made the tool unverifiable against the RFCs/IEEE documents and weaker than original `arp-scan` on receive-side 802.1Q and vendor identification.
+
+**Consequences:** Spec-facing tests live in [`src/protocol_conformance.rs`](src/protocol_conformance.rs) and the packet modules. Send-side `--vlan` (superseded below), LLC/SNAP transmit and RFC 5227 Probe as CLI (superseded further below), bundling a full IEEE database, passive ACD / monitor mode, and `libpcap` were still deferred at that time. Operators who want vendor names generate or copy an `ieee-oui.txt` (for example with original `arp-scan`'s `get-oui`).
+
+## 2026-08-15 — IEEE 802.1Q send-side `--vlan` and Linux tagged capture
+
+**Decision:** Operators can tag transmitted ARP requests with a single IEEE 802.1Q customer tag via `scan --vlan <VID>` (`0..=4095`, PCP and DEI zero). The request is still RFC 826 Ethernet II ARP padded to 60 octets without the frame check sequence (IEEE 802.3 / 802.3ac `ETH_ZLEN` behaviour, matching original `arp-scan --vlan`). On Linux, a VLAN scan opens `AF_PACKET` with `ETH_P_ALL` so replies may arrive tagged (`0x8100`) or with the tag stripped; non-ARP frames are ignored without malformed-frame warnings. Untagged scans keep `ETH_P_ARP`. macOS already captured tagged ARP via BPF; it now also transmits the tag when `--vlan` is set.
+
+**Reason:** Receive-side 802.1Q parsing without a send path could not be claimed as IEEE 802.1Q fidelity, and Linux `ETH_P_ARP` silently dropped tagged replies on trunks that do not strip tags.
+
+**Consequences:** LLC/SNAP transmit and RFC 5227 Probe as a CLI mode are superseded below. QinQ / IEEE 802.1ad, bundling a full IEEE database, passive ACD / monitor mode, and `libpcap` remain deferred. VID `4095` is reserved in IEEE 802.1Q but is accepted as a 12-bit TCI field, same as original `arp-scan`.
+
+## 2026-08-15 — RFC 5227 `--arpspa` and RFC 1042 `--llc` transmit
+
+**Decision:** Operators can override RFC 826 `ar$spa` and IEEE 802.3 framing on `scan`:
+
+- **`--arpspa <IPv4|dest>`** matches original `arp-scan`. Omitted uses the interface IPv4 address (RFC 826 default). `0.0.0.0` is an RFC 5227 ARP Probe. `dest` (case-insensitive) is an RFC 5227 ARP Announcement (`ar$spa` equals each target `ar$tpa`). Any other dotted quad is a sender-protocol override. `--host` remains a single-target scan of one interior IPv4 address; it does not imply Probe semantics. Reply acceptance still uses the **interface** subnet (or the `--host` address), not the overridden SPA.
+- **`--llc`** transmits IEEE 802.3 with RFC 1042 LLC/SNAP (`AA AA 03`, OUI `00:00:00`, EtherType `0x0806`) instead of Ethernet II. The IEEE 802.3 length field is LLC + SNAP + ARP payload (**36** for IPv4 ARP), which is the MAC client data after the length field. That is **not** original `arp-scan`'s `packet_size+8` formula when `packet_size` already includes Ethernet header octets. Frames are still zero-padded to 60 octets without FCS. Replies are decoded in Ethernet II, 802.1Q, or SNAP regardless of `--llc`. `--vlan` and `--llc` may be combined (TPID, then length, then SNAP).
+- Linux opens `ETH_P_ALL` when `--vlan` **or** `--llc` is set so length-field SNAP and tagged replies are not dropped; untagged Ethernet II scans keep `ETH_P_ARP`. Untagged SNAP send uses `sockaddr_ll` protocol `ETH_P_802_2`; tagged send keeps `0x8100`.
+- macOS BPF capture expands to Ethernet II ARP, one 802.1Q tag, RFC 1042 SNAP, and 802.1Q+SNAP. The previous 7-instruction filter dropped IEEE 802.3 SNAP because a length of 36 is neither `0x0806` nor `0x8100`.
+
+Wire options are grouped in [`ScanWireOptions`](src/application_command.rs) on [`ApplicationCommand::Scan`](src/application_command.rs) so Linux/macOS scanners and the shared send path take one value instead of growing argument lists.
+
+**Reason:** Library Probe/Announcement builders and SNAP receive without CLI transmit could not be claimed as RFC 5227 / RFC 1042 fidelity. Original `arp-scan` exposes `--arpspa` and `--llc`; sending SNAP with a standards-correct length avoids copying a known length-field bug.
+
+**Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, custom `--padding`, and `--prototype` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA. Ethernet destination/source and remaining `ar$*` overrides are superseded below.
+
+## 2026-08-15 — RFC 826 / arp-scan Ethernet and ARP field overrides
+
+**Decision:** Operators can override the remaining original `arp-scan` outgoing packet fields on `scan`, matching that tool's long option names:
+
+- **Ethernet:** `--destaddr` (default broadcast), `--srcaddr` (default interface MAC). `--prototype` is not implemented: the SNAP/`EtherType` stays ARP (`0x0806`) so replies remain in the capture path.
+- **RFC 826 ARP:** `--arphrd` (default 1), `--arppro` (default `0x0800`), `--arphln` (default 6), `--arppln` (default 4), `--arpop` (default 1), `--arpsha` (default interface MAC), `--arptha` (default zeroes). `--arpspa` was already present. Numeric flags accept decimal or `0x`-prefixed hexadecimal. `--arphln` / `--arppln` change only the advertised length octets; SHA/THA stay 6 bytes and SPA/TPA stay 4 bytes, as in original `arp-scan`.
+- **`--srcaddr` vs `--arpsha`:** these are independent, matching RFC 826 (Ethernet source may differ from `ar$sha`; receive already records `ar$sha`).
+- Transmit of RFC 5494 reserved `ar$hrd` / `ar$op` values 0 and 65535 is allowed (original `arp-scan` permits any 16-bit value). Receive still rejects those reserved values.
+
+Resolved fields are encoded through [`AddressResolutionRequestLayout`](src/address_resolution_protocol.rs) so the scanner does not grow an argument list.
+
+**Reason:** `--vlan`, `--llc`, and `--arpspa` left Ethernet addressing and the rest of the RFC 826 header fixed. Original `arp-scan` documents `--destaddr` as the commonly used Ethernet override, and treating `ar$sha` as distinct from the Ethernet source completes the receive-side RFC 826 contract on transmit.
+
+**Consequences:** QinQ / IEEE 802.1ad, bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and `--prototype` remain deferred. Custom `--padding` and IEEE 802.1Q PCP/DEI are superseded below.
+
+## 2026-08-15 — `--padding` and IEEE 802.1Q PCP/DEI
+
+**Decision:** Operators can complete the remaining original `arp-scan` outgoing packet option and the rest of the IEEE 802.1Q TCI on `scan`:
+
+- **`--padding <HEX>`** matches original `arp-scan`: hex-encoded binary with an even number of digits and **no** `0x` prefix, appended after the 28-octet ARP PDU. The Ethernet frame is still zero-padded to 60 octets without FCS when shorter. With `--llc`, custom padding is included in the IEEE 802.3 length (MAC client data = LLC + SNAP + ARP + padding). Padding that would make MAC client data exceed 1500 octets is rejected (Ethernet II maximum 1472 padding octets; SNAP maximum 1464). Oversize payloads are not silently truncated.
+- **`--pcp <0..=7>`** and **`--dei`** require `--vlan`. They encode the IEEE 802.1Q TCI as `(PCP << 13) | (DEI << 12) | VID`. Omitted PCP is 0 and omitted DEI is 0, matching the previous VID-only send. VID 0 remains legal (priority tagging). Receive-side TCI decoding is superseded below.
+
+**Reason:** `--vlan` left PCP and DEI stuck at zero, so tagged frames could not express IEEE 802.1Q class of service. Custom `--padding` was the last original `arp-scan` outgoing packet option that still needed a `Vec` encode path once the 60-octet buffer was no longer a hard ceiling.
+
+**Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and `--prototype` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA, PCP 0, DEI 0, and no custom padding.
+
+## 2026-08-15 — Non-reply ARP is not malformed; receive decodes 802.1Q PCP/DEI
+
+**Decision:** Scan receive treats well-formed IPv4-over-Ethernet ARP that is not opcode 2 as LAN noise, not a parse failure, and Ethernet receive exposes the full IEEE 802.1Q TCI:
+
+- A crate-internal parser accepts any non-reserved RFC 826 opcode. The scanner records opcode 2 (`ares_op$REPLY`) only. Requests, RARP, and other well-formed opcodes are ignored without a `warning: received malformed Ethernet/ARP frame` line, matching original `arp-scan`. The public reply parser still rejects non-replies so library callers that asked for a reply keep that contract. RFC 5494 reserved `ar$op` values 0 and 65535 still warn as malformed.
+- `try_parse_ethernet_frame` now returns PCP, DEI, and VID for a single customer tag (TCI `0xF044` is PCP 7, DEI 1, VID `0x044`). `vlan_identifier` remains the low 12 bits for existing tests.
+
+**Reason:** Calling the reply parser on every ARP frame turned RFC 826 requests — including possible copies of our own transmitted requests — into operator-facing malformation warnings. Send-side `--pcp` / `--dei` without receive TCI decode left IEEE 802.1Q incomplete on the inbound path.
+
+**Consequences:** Inbound requests are not recorded as discovered hosts (a self-echo would map every target to the scanning MAC). Full RFC 5227 conflict-from-request / passive ACD remains deferred, as do QinQ / IEEE 802.1ad receive, bundled IEEE OUI data, `libpcap`, JSON output, adaptive pacing, and `--prototype`.

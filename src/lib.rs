@@ -5,6 +5,7 @@ pub mod application_outcome;
 pub mod cli;
 pub mod error;
 pub mod mac_address;
+pub mod mac_vendor_registry;
 
 mod address_resolution_protocol;
 mod ethernet_frame;
@@ -13,6 +14,9 @@ mod ipv4_cidr;
 mod ipv4_subnet;
 mod link_layer_backend;
 mod scanner;
+
+#[cfg(test)]
+mod protocol_conformance;
 
 #[cfg(target_os = "linux")]
 mod linux_interface_discovery;
@@ -36,8 +40,15 @@ mod macos_scanner;
 #[cfg(target_os = "macos")]
 mod macos_system_call;
 
+pub use address_resolution_protocol::{
+    build_address_resolution_announcement_ethernet_frame,
+    build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
+    build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
+    try_parse_address_resolution_reply_ipv4_over_ethernet,
+};
 pub use application_command::{
-    ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
+    ApplicationCommand, ArpSenderProtocolAddress, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,
+    DEFAULT_SCAN_TIMEOUT, ScanWireOptions,
 };
 pub use application_outcome::ApplicationOutcome;
 pub use application_outcome::DiscoveredHost;
@@ -46,9 +57,16 @@ pub use application_outcome::ScanTimingSummary;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
 pub use error::AppError;
+pub use ethernet_frame::{
+    Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier,
+};
 pub use ipv4_cidr::Ipv4Cidr;
 pub use ipv4_cidr::Ipv4HostAddressIterator;
 pub use mac_address::{MacAddress, MacAddressParseError};
+pub use mac_vendor_registry::{
+    DEFAULT_MAC_VENDOR_FILE_NAME, MacVendorRegistry, MacVendorRegistryParseError,
+    UNKNOWN_MAC_VENDOR_NAME,
+};
 
 #[cfg(target_os = "linux")]
 pub use linux_scanner::perform_arp_probe;
@@ -61,7 +79,10 @@ pub use linux_scanner::perform_arp_probe;
 /// sends requests only for that address (which must be strictly interior on the subnet) and
 /// records replies only from that sender IPv4. The `timeout` field bounds the global receive
 /// window after the last request is sent; the `pacing` field sleeps after each full round of target
-/// sends except the last round; the `attempts` field is how many such rounds run. When the scan
+/// sends except the last round; the `attempts` field is how many such rounds run. The `wire` field
+/// selects IEEE 802.1Q tagging, RFC 826 `ar$spa` (including RFC 5227 Probe/Announcement),
+/// Ethernet `--destaddr`/`--srcaddr`, remaining RFC 826 `ar$*` fields, RFC 1042 LLC/SNAP
+/// framing, IEEE 802.1Q PCP/DEI, and custom `--padding`. When the scan
 /// command omits an interface name, the library selects an interface automatically only when
 /// exactly one usable interface exists. On Linux, successful scans populate
 /// [`application_outcome::ScanOutcome::timing_summary`] with wall-clock timing, the resolved
@@ -82,7 +103,7 @@ pub use linux_scanner::perform_arp_probe;
 /// ```
 /// use new_arp_scan::{
 ///     run, ApplicationCommand, AppError, ApplicationOutcome, DEFAULT_SCAN_ATTEMPTS,
-///     DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
+///     DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT, ScanWireOptions,
 /// };
 ///
 /// let outcome = run(ApplicationCommand::Scan {
@@ -91,6 +112,7 @@ pub use linux_scanner::perform_arp_probe;
 ///     timeout: DEFAULT_SCAN_TIMEOUT,
 ///     pacing: DEFAULT_SCAN_PACING,
 ///     attempts: DEFAULT_SCAN_ATTEMPTS,
+///     wire: ScanWireOptions::default(),
 /// });
 ///
 /// // On Linux and macOS this attempts a real scan (which may fail without privileges or for an
@@ -114,83 +136,15 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
             timeout,
             pacing,
             attempts,
-        } => {
-            if let Some(interface_name) = interface_name.as_deref() {
-                interface_validation::validate_interface_name_for_linux_packet_socket(
-                    interface_name,
-                )?;
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                let resolved_interface_name =
-                    linux_interface_discovery::resolve_scan_interface_name(
-                        interface_name.as_deref(),
-                    )?;
-                let scan_wall_clock_started = std::time::Instant::now();
-                let scan_outcome = match target_ipv4_address {
-                    Some(target_ipv4_address) => linux_scanner::perform_arp_probe(
-                        &resolved_interface_name,
-                        target_ipv4_address,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                    None => linux_scanner::perform_arp_scan(
-                        &resolved_interface_name,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                };
-                let scan_outcome = scan_outcome.with_scan_timing_summary(
-                    resolved_interface_name,
-                    scan_wall_clock_started.elapsed(),
-                    attempts,
-                );
-                Ok(ApplicationOutcome::Scan(scan_outcome))
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                let resolved_interface_name =
-                    macos_interface_discovery::resolve_scan_interface_name(
-                        interface_name.as_deref(),
-                    )?;
-                let scan_wall_clock_started = std::time::Instant::now();
-                let scan_outcome = match target_ipv4_address {
-                    Some(target_ipv4_address) => macos_scanner::perform_arp_probe(
-                        &resolved_interface_name,
-                        target_ipv4_address,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                    None => macos_scanner::perform_arp_scan(
-                        &resolved_interface_name,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                };
-                let scan_outcome = scan_outcome.with_scan_timing_summary(
-                    resolved_interface_name,
-                    scan_wall_clock_started.elapsed(),
-                    attempts,
-                );
-                Ok(ApplicationOutcome::Scan(scan_outcome))
-            }
-
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                // No raw link-layer backend on this operating system; the timing and target
-                // parameters are intentionally unused on the unsupported path.
-                let _ = (&target_ipv4_address, &timeout, &pacing, &attempts);
-                Err(AppError::UnsupportedPlatform {
-                    operating_system: std::env::consts::OS.to_string(),
-                })
-            }
-        }
+            wire,
+        } => run_address_resolution_scan(
+            interface_name.as_deref(),
+            target_ipv4_address,
+            timeout,
+            pacing,
+            attempts,
+            wire,
+        ),
         ApplicationCommand::UsableInterfacesList => {
             #[cfg(target_os = "linux")]
             {
@@ -213,6 +167,90 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                 })
             }
         }
+    }
+}
+
+fn run_address_resolution_scan(
+    interface_name: Option<&str>,
+    target_ipv4_address: Option<std::net::Ipv4Addr>,
+    timeout: std::time::Duration,
+    pacing: std::time::Duration,
+    attempts: std::num::NonZeroU64,
+    wire: ScanWireOptions,
+) -> Result<ApplicationOutcome, AppError> {
+    wire.validate_ieee_8023_mac_client_data()?;
+    if let Some(interface_name) = interface_name {
+        interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let resolved_interface_name =
+            linux_interface_discovery::resolve_scan_interface_name(interface_name)?;
+        let scan_wall_clock_started = std::time::Instant::now();
+        let scan_outcome = match target_ipv4_address {
+            Some(target_ipv4_address) => linux_scanner::perform_arp_probe(
+                &resolved_interface_name,
+                target_ipv4_address,
+                timeout,
+                pacing,
+                attempts,
+                wire,
+            )?,
+            None => linux_scanner::perform_arp_scan(
+                &resolved_interface_name,
+                timeout,
+                pacing,
+                attempts,
+                wire,
+            )?,
+        };
+        let scan_outcome = scan_outcome.with_scan_timing_summary(
+            resolved_interface_name,
+            scan_wall_clock_started.elapsed(),
+            attempts,
+        );
+        Ok(ApplicationOutcome::Scan(scan_outcome))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let resolved_interface_name =
+            macos_interface_discovery::resolve_scan_interface_name(interface_name)?;
+        let scan_wall_clock_started = std::time::Instant::now();
+        let scan_outcome = match target_ipv4_address {
+            Some(target_ipv4_address) => macos_scanner::perform_arp_probe(
+                &resolved_interface_name,
+                target_ipv4_address,
+                timeout,
+                pacing,
+                attempts,
+                wire,
+            )?,
+            None => macos_scanner::perform_arp_scan(
+                &resolved_interface_name,
+                timeout,
+                pacing,
+                attempts,
+                wire,
+            )?,
+        };
+        let scan_outcome = scan_outcome.with_scan_timing_summary(
+            resolved_interface_name,
+            scan_wall_clock_started.elapsed(),
+            attempts,
+        );
+        Ok(ApplicationOutcome::Scan(scan_outcome))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // No raw link-layer backend on this operating system; the timing and target
+        // parameters are intentionally unused on the unsupported path.
+        let _ = (&target_ipv4_address, &timeout, &pacing, &attempts, &wire);
+        Err(AppError::UnsupportedPlatform {
+            operating_system: std::env::consts::OS.to_string(),
+        })
     }
 }
 
@@ -245,6 +283,7 @@ mod tests {
     use super::DEFAULT_SCAN_ATTEMPTS;
     use super::DEFAULT_SCAN_PACING;
     use super::DEFAULT_SCAN_TIMEOUT;
+    use super::ScanWireOptions;
     use super::run;
 
     #[cfg(not(target_os = "linux"))]
@@ -259,6 +298,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -281,6 +321,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -303,6 +344,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -325,6 +367,7 @@ mod tests {
             timeout: std::time::Duration::from_mins(1),
             pacing: std::time::Duration::from_millis(999),
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -349,6 +392,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -406,6 +450,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -428,6 +473,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -453,6 +499,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -476,6 +523,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -498,6 +546,7 @@ mod tests {
             timeout: std::time::Duration::from_millis(1),
             pacing: std::time::Duration::from_millis(5),
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -522,6 +571,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(99).expect("ninety-nine is non-zero"),
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -578,6 +628,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -617,6 +668,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -642,6 +694,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -678,6 +731,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act
@@ -713,6 +767,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
         };
 
         // Act

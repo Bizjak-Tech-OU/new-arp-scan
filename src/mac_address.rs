@@ -177,6 +177,111 @@ impl MacAddress {
     pub fn is_zero(self) -> bool {
         self.0 == [0u8; 6]
     }
+
+    /// Returns `true` when the IEEE 802 Individual/Group bit is clear (unicast).
+    ///
+    /// The I/G bit is the least-significant bit of the first octet on the wire.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::from_octets([0x00, 0, 0, 0, 0, 1]).is_unicast());
+    /// assert!(!MacAddress::BROADCAST.is_unicast());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_unicast(self) -> bool {
+        self.0[0] & 0x01 == 0
+    }
+
+    /// Returns `true` when the IEEE 802 Individual/Group bit is set (multicast / group).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::BROADCAST.is_multicast());
+    /// assert!(!MacAddress::from_octets([0x00, 0, 0, 0, 0, 1]).is_multicast());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_multicast(self) -> bool {
+        !self.is_unicast()
+    }
+
+    /// Returns `true` when the IEEE 802 Universal/Local bit is clear (universally administered).
+    ///
+    /// The U/L bit is the second least-significant bit of the first octet on the wire. IEEE MA-L,
+    /// MA-M, and MA-S assignments are universally administered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::from_octets([0x00, 0x1A, 0x2B, 0, 0, 1]).is_universally_administered());
+    /// assert!(MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]).is_locally_administered());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_universally_administered(self) -> bool {
+        self.0[0] & 0x02 == 0
+    }
+
+    /// Returns `true` when the IEEE 802 Universal/Local bit is set (locally administered).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert!(MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]).is_locally_administered());
+    /// assert!(!MacAddress::from_octets([0x00, 0x1A, 0x2B, 0, 0, 1]).is_locally_administered());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn is_locally_administered(self) -> bool {
+        !self.is_universally_administered()
+    }
+
+    /// Returns the 24-bit IEEE MA-L (OUI) prefix: the first three octets.
+    ///
+    /// MA-M (28-bit) and MA-S (36-bit) assignments are longer; use [`crate::MacVendorRegistry`]
+    /// for longest-prefix vendor matching across those registries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use new_arp_scan::MacAddress;
+    ///
+    /// assert_eq!(
+    ///     MacAddress::from_octets([0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E]).mal_prefix(),
+    ///     [0x00, 0x1A, 0x2B]
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic.
+    #[must_use]
+    pub const fn mal_prefix(self) -> [u8; 3] {
+        [self.0[0], self.0[1], self.0[2]]
+    }
 }
 
 impl fmt::Display for MacAddress {
@@ -209,34 +314,64 @@ impl TryFrom<&str> for MacAddress {
     /// assert_eq!(address.octets(), [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
     /// ```
     fn try_from(text: &str) -> Result<Self, Self::Error> {
-        const EXPECTED_COMPONENT_COUNT: usize = 6;
-        let components: Vec<&str> = text.split(':').collect();
-        if components.len() != EXPECTED_COMPONENT_COUNT {
-            return Err(MacAddressParseError::WrongComponentCount {
-                expected_component_count: EXPECTED_COMPONENT_COUNT,
-                actual_component_count: components.len(),
+        parse_mac_address_octets_with_separator(text, ':')
+    }
+}
+
+impl MacAddress {
+    /// Parses a CLI MAC token: six hexadecimal octets separated by `:` or by `-`.
+    ///
+    /// Mixed separators are rejected. This matches original `arp-scan` `--destaddr` / `--srcaddr`
+    /// notation without changing [`TryFrom<&str>`], which remains colon-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the token is not six two-digit hexadecimal octets.
+    pub fn parse_cli_token(token: &str) -> Result<Self, String> {
+        let has_colon = token.contains(':');
+        let has_hyphen = token.contains('-');
+        if has_colon && has_hyphen {
+            return Err(format!(
+                "invalid MAC address '{token}': mix of ':' and '-' separators is not allowed"
+            ));
+        }
+        let separator = if has_hyphen { '-' } else { ':' };
+        parse_mac_address_octets_with_separator(token, separator)
+            .map_err(|error| format!("invalid MAC address '{token}': {error}"))
+    }
+}
+
+fn parse_mac_address_octets_with_separator(
+    text: &str,
+    separator: char,
+) -> Result<MacAddress, MacAddressParseError> {
+    const EXPECTED_COMPONENT_COUNT: usize = 6;
+    let components: Vec<&str> = text.split(separator).collect();
+    if components.len() != EXPECTED_COMPONENT_COUNT {
+        return Err(MacAddressParseError::WrongComponentCount {
+            expected_component_count: EXPECTED_COMPONENT_COUNT,
+            actual_component_count: components.len(),
+        });
+    }
+
+    let mut octets = [0u8; EXPECTED_COMPONENT_COUNT];
+    for (component_index, component) in components.iter().enumerate() {
+        let trimmed = component.trim();
+        if trimmed.len() != 2 {
+            return Err(MacAddressParseError::ComponentWrongLength {
+                component_index,
+                observed_length: trimmed.len(),
             });
         }
-
-        let mut octets = [0u8; EXPECTED_COMPONENT_COUNT];
-        for (component_index, component) in components.iter().enumerate() {
-            let trimmed = component.trim();
-            if trimmed.len() != 2 {
-                return Err(MacAddressParseError::ComponentWrongLength {
-                    component_index,
-                    observed_length: trimmed.len(),
-                });
-            }
-            let pair_bytes = trimmed.as_bytes();
-            let high_nibble =
-                parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[0], component_index)?;
-            let low_nibble =
-                parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[1], component_index)?;
-            octets[component_index] = (high_nibble << 4) | low_nibble;
-        }
-
-        Ok(Self(octets))
+        let pair_bytes = trimmed.as_bytes();
+        let high_nibble =
+            parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[0], component_index)?;
+        let low_nibble =
+            parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[1], component_index)?;
+        octets[component_index] = (high_nibble << 4) | low_nibble;
     }
+
+    Ok(MacAddress::from_octets(octets))
 }
 
 impl From<[u8; 6]> for MacAddress {
@@ -412,5 +547,78 @@ mod tests {
 
         // Assert
         assert_eq!(address.octets(), octets, "octets should round-trip");
+    }
+
+    #[test]
+    fn ieee_802_individual_group_bit_is_least_significant_bit_of_first_octet() {
+        // Arrange
+        let unicast = MacAddress::from_octets([0x00, 1, 2, 3, 4, 5]);
+        let multicast = MacAddress::from_octets([0x01, 1, 2, 3, 4, 5]);
+
+        // Act
+        // Assert
+        assert!(unicast.is_unicast());
+        assert!(!unicast.is_multicast());
+        assert!(multicast.is_multicast());
+        assert!(!multicast.is_unicast());
+        assert!(MacAddress::BROADCAST.is_multicast());
+    }
+
+    #[test]
+    fn ieee_802_universal_local_bit_is_second_least_significant_bit_of_first_octet() {
+        // Arrange
+        let universal = MacAddress::from_octets([0x00, 0x1A, 0x2B, 0, 0, 1]);
+        let local = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+
+        // Act
+        // Assert
+        assert!(universal.is_universally_administered());
+        assert!(!universal.is_locally_administered());
+        assert!(local.is_locally_administered());
+        assert!(!local.is_universally_administered());
+    }
+
+    #[test]
+    fn mal_prefix_returns_first_three_octets() {
+        // Arrange
+        let address = MacAddress::from_octets([0xF4, 0xA4, 0x75, 0x01, 0x02, 0x03]);
+
+        // Act
+        let prefix = address.mal_prefix();
+
+        // Assert
+        assert_eq!(prefix, [0xF4, 0xA4, 0x75]);
+    }
+
+    #[test]
+    fn parse_cli_token_accepts_colon_or_hyphen_separators() {
+        // Arrange
+        let colon = "aa:bb:cc:dd:ee:ff";
+        let hyphen = "AA-BB-CC-DD-EE-FF";
+
+        // Act
+        let from_colon = MacAddress::parse_cli_token(colon);
+        let from_hyphen = MacAddress::parse_cli_token(hyphen);
+
+        // Assert
+        let expected = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(from_colon.expect("colon MAC should parse"), expected);
+        assert_eq!(from_hyphen.expect("hyphen MAC should parse"), expected);
+    }
+
+    #[test]
+    fn parse_cli_token_rejects_mixed_separators() {
+        // Arrange
+        let mixed = "aa:bb-cc:dd:ee:ff";
+
+        // Act
+        let outcome = MacAddress::parse_cli_token(mixed);
+
+        // Assert
+        let error = outcome.expect_err("mixed separators should fail");
+        assert!(
+            error.contains("mix of ':' and '-'"),
+            "error should name mixed separators, got: {error}"
+        );
     }
 }

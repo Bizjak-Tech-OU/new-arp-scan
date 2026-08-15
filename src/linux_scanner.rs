@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use crate::application_command::ScanWireOptions;
 use crate::application_outcome::ScanOutcome;
 use crate::error::AppError;
 use crate::ipv4_subnet::validate_strict_interior_scan_target_ipv4_address;
@@ -15,13 +16,15 @@ use crate::linux_interface_discovery::discover_interface_scan_addresses;
 use crate::linux_socket::{
     open_linux_link_layer_endpoint, validated_interface_index_for_arp_scanning,
 };
-use crate::scanner::{self, ArpReplyAcceptance};
+use crate::scanner::{self, ArpReplyAcceptance, ScanTransmitContext};
 
 /// Performs a full-subnet IPv4 address resolution scan on `interface_name`.
 ///
 /// `receive_timeout_after_last_request` bounds how long the scanner waits for replies after the
 /// last request is sent. `pacing_between_scan_rounds` is the delay after each full round of
 /// target sends except the final round. `scan_round_count` is how many such rounds run.
+/// `wire` selects IEEE 802.1Q tagging, RFC 826 header fields, Ethernet addressing, and RFC 1042
+/// LLC/SNAP framing.
 ///
 /// # Errors
 ///
@@ -36,6 +39,7 @@ pub fn perform_arp_scan(
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
+    wire: ScanWireOptions,
 ) -> Result<ScanOutcome, AppError> {
     // Validate interface usability (loopback / down / NOARP rejection) and the subnet before
     // opening any socket; `open_linux_link_layer_endpoint` repeats the interface validation while
@@ -44,11 +48,15 @@ pub fn perform_arp_scan(
     let addresses = discover_interface_scan_addresses(interface_name)?;
     let plan = scanner::full_subnet_scan_plan(&addresses)?;
 
-    let mut endpoint = open_linux_link_layer_endpoint(interface_name)?;
+    let mut endpoint = open_linux_link_layer_endpoint(interface_name, &wire)?;
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &plan.targets,
-        (addresses.source_mac_address, addresses.source_ipv4_address),
+        &ScanTransmitContext {
+            source_mac_address: addresses.source_mac_address,
+            interface_ipv4_address: addresses.source_ipv4_address,
+            wire,
+        },
         &plan.acceptance,
         receive_timeout_after_last_request,
         pacing_between_scan_rounds,
@@ -85,6 +93,7 @@ pub fn perform_arp_scan(
 ///         Duration,
 ///         Duration,
 ///         NonZeroU64,
+///         new_arp_scan::ScanWireOptions,
 ///     ) -> Result<new_arp_scan::application_outcome::ScanOutcome, new_arp_scan::AppError> =
 ///         new_arp_scan::perform_arp_probe;
 /// }
@@ -100,6 +109,7 @@ pub fn perform_arp_probe(
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
+    wire: ScanWireOptions,
 ) -> Result<ScanOutcome, AppError> {
     // Validate interface usability and the single target before opening any socket;
     // `open_linux_link_layer_endpoint` repeats the interface validation while acquiring the
@@ -113,14 +123,18 @@ pub fn perform_arp_probe(
         addresses.ipv4_netmask,
     )?;
 
-    let mut endpoint = open_linux_link_layer_endpoint(interface_name)?;
+    let mut endpoint = open_linux_link_layer_endpoint(interface_name, &wire)?;
     let acceptance = ArpReplyAcceptance::ExactTarget {
         target_ipv4_address,
     };
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &[target_ipv4_address],
-        (addresses.source_mac_address, addresses.source_ipv4_address),
+        &ScanTransmitContext {
+            source_mac_address: addresses.source_mac_address,
+            interface_ipv4_address: addresses.source_ipv4_address,
+            wire,
+        },
         &acceptance,
         receive_timeout_after_last_request,
         pacing_between_scan_rounds,

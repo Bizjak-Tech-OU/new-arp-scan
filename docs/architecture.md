@@ -10,13 +10,14 @@ Tracked for release documentation: [GitHub issue #33](https://github.com/Bizjak-
 
 | Area | Modules | Role |
 |------|---------|------|
-| **Entry** | `main.rs` | Parse arguments with `clap`, call `run()`, write [`ApplicationOutcome`](../src/application_outcome.rs) via [`write_operator_streams`](../src/application_outcome.rs), exit codes, print `AppError` on failure. |
+| **Entry** | `main.rs` | Parse arguments with `clap`, optional IEEE vendor file load, call `run()`, write [`ApplicationOutcome`](../src/application_outcome.rs) via [`write_operator_streams`](../src/application_outcome.rs) / [`write_operator_streams_with_mac_vendor_registry`](../src/application_outcome.rs), exit codes, print `AppError` on failure. |
 | **Application surface** | `lib.rs`, `application_command.rs`, `application_outcome.rs` | Public `run(ApplicationCommand)` contract, outcomes, operator output layout, timing summary attachment after successful Linux scans. |
 | **Operator parsing** | `cli.rs` | Command-line types and validation (delegated from `main.rs`). |
 | **Errors** | `error.rs` | Single [`AppError`](../src/error.rs) enum; `Display` / `Error` for operators and tests. |
 | **Pure IPv4 logic** | `ipv4_subnet.rs`, `ipv4_cidr.rs` | Subnet math and CIDR parsing; built on every target. |
 | **Name / shape checks** | `interface_validation.rs` | Interface name rules and `ifreq` name packing helpers (shared by both backends). |
-| **Link and ARP encoding** | `mac_address.rs`, `ethernet_frame.rs`, `address_resolution_protocol.rs` | Types and on-wire framing for Ethernet II + ARP; built on every target. |
+| **Link and ARP encoding** | `mac_address.rs`, `ethernet_frame.rs`, `address_resolution_protocol.rs` | Types and on-wire framing for Ethernet II + ARP; IEEE 802.1Q send (`--vlan`, `--pcp`, `--dei`) and receive; RFC 1042 SNAP send (`--llc`) and receive; RFC 5227 Probe/Announcement (`--arpspa`); Ethernet `--destaddr`/`--srcaddr`, remaining RFC 826 `ar$*` overrides, and `--padding`. |
+| **IEEE MAC registries** | `mac_vendor_registry.rs` | Longest-prefix MA-L / MA-M / MA-S vendor lookup from `ieee-oui.txt`. |
 | **Portable link layer** | `link_layer_backend.rs`, `scanner.rs` | The `LinkLayerEndpoint` trait and shared interface/address value types; the backend-generic scan engine (target iteration, send/receive scheduling, merge duplicate replies, warnings). |
 | **Linux backend** | `linux_scanner.rs`, `linux_interface_discovery.rs`, `linux_socket.rs`, `linux_system_call.rs`, `linux_packet.rs` | `AF_PACKET` raw socket, `ioctl`/`if_nameindex` discovery, `sockaddr_ll`, and the Linux scan entry points. |
 | **macOS backend** | `macos_scanner.rs`, `macos_interface_discovery.rs`, `macos_bpf_socket.rs`, `macos_system_call.rs`, `macos_packet.rs` | Berkeley Packet Filter device (`/dev/bpf*`), `getifaddrs(3)` discovery, BPF ioctls/filter, and the macOS scan entry points. |
@@ -53,14 +54,15 @@ CLI / library caller
        │
        ▼
   open a LinkLayerEndpoint:
-     Linux  → AF_PACKET SOCK_RAW bound to interface + ETH_P_ARP (linux_socket)
-     macOS  → /dev/bpf* attached to interface + ARP-only filter   (macos_bpf_socket)
+     Linux  → AF_PACKET SOCK_RAW bound to interface + ETH_P_ARP, or ETH_P_ALL when --vlan or --llc is set
+     macOS  → /dev/bpf* attached to interface + ARP / 802.1Q / RFC 1042 SNAP filter   (macos_bpf_socket)
        │
        ▼
   scanner (shared, backend-generic):
-       ├──► For each round: build Ethernet II ARP request frames → endpoint.send
+       ├──► For each round: build ARP request frames (optional 802.1Q TCI, LLC/SNAP, dest/src MAC, ar$* overrides, --padding) → endpoint.send
        │
-       └──► Receive loop (wait_until_readable + try_receive): parse Ethernet II + ARP replies
+       └──► Receive loop (wait_until_readable + try_receive): parse Ethernet II + ARP;
+            record opcode 2 replies; ignore well-formed non-reply ARP; warn on malformed frames
                  │
                  ▼
             Merge into DiscoveredHost map, collect warnings
@@ -80,7 +82,7 @@ For field-level behavior, read module-level `//!` comments and the [operator doc
 
 | Layer | Location | Purpose |
 |-------|----------|---------|
-| **Unit** | `#[cfg(test)]` at bottom of each `src/*.rs` | Default: fast, hermetic, covers parsing, math, error `Display`, and most Linux helpers that do not need raw ARP on the wire. |
+| **Unit** | `#[cfg(test)]` at bottom of each `src/*.rs`, plus [`src/protocol_conformance.rs`](../src/protocol_conformance.rs) | Default: fast, hermetic, covers parsing, math, error `Display`, RFC/IEEE packet contracts, and most Linux helpers that do not need raw ARP on the wire. |
 | **Integration** | `tests/*.rs` | Subprocess CLI (`CARGO_BIN_EXE_*`) and public `run()` behavior across platforms. |
 | **Doc tests** | ` ``` ` blocks on public API | Compile-checked examples (`cargo test` includes them). |
 
