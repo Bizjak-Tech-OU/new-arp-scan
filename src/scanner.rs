@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::address_resolution_protocol::{
-    build_address_resolution_request_ethernet_frame_with_wire_options,
+    encode_address_resolution_request_from_layout,
     try_parse_address_resolution_reply_ipv4_over_ethernet,
 };
 use crate::application_command::ScanWireOptions;
@@ -197,13 +197,12 @@ fn send_one_address_resolution_request(
         .wire
         .sender_protocol_address
         .ipv4_address_for_target(transmit.interface_ipv4_address, target_ipv4_address);
-    let frame = build_address_resolution_request_ethernet_frame_with_wire_options(
+    let layout = transmit.wire.address_resolution_request_layout(
         transmit.source_mac_address,
         sender_protocol_address,
         target_ipv4_address,
-        transmit.wire.vlan_identifier,
-        transmit.wire.llc_snap,
     );
+    let frame = encode_address_resolution_request_from_layout(layout);
     if let Err(source) = endpoint.send_ethernet_frame(frame.as_ref()) {
         warnings.push(format!(
             "failed to send ARP request to {target_ipv4_address}: {source}"
@@ -1414,5 +1413,52 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
             &36u16.to_be_bytes(),
             "IEEE 802.3 length is LLC/SNAP plus ARP (36), not an Ethernet-header-inclusive size"
         );
+    }
+
+    #[test]
+    fn sends_unicast_ethernet_destination_and_independent_arp_sender_hardware() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let destination = MacAddress::from_octets([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let ethernet_source = MacAddress::from_octets([0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]);
+        let sender_hardware = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    ethernet_destination: Some(destination),
+                    ethernet_source: Some(ethernet_source),
+                    arp_sender_hardware: Some(sender_hardware),
+                    arp_hardware_type: 6,
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(&sent[0][0..6], &destination.octets());
+        assert_eq!(&sent[0][6..12], &ethernet_source.octets());
+        assert_eq!(&sent[0][22..28], &sender_hardware.octets());
+        assert_eq!(&sent[0][14..16], &6u16.to_be_bytes());
     }
 }

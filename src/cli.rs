@@ -31,6 +31,9 @@ EXAMPLES:
   RFC 1042 LLC/SNAP framing instead of Ethernet II:
     new-arp-scan scan --interface eth0 --llc
 
+  Unicast ARP to a known Ethernet destination:
+    new-arp-scan scan --interface eth0 --destaddr 00:11:22:33:44:55
+
   Scan using automatic interface selection when exactly one usable interface exists:
     new-arp-scan scan
 
@@ -95,6 +98,60 @@ pub struct ScanArguments {
     /// instead of Ethernet II. Replies are decoded in either framing regardless of this flag.
     #[arg(long = "llc", action = clap::ArgAction::SetTrue)]
     pub llc_snap: bool,
+    /// Ethernet destination MAC. When omitted, the broadcast address is used.
+    #[arg(long = "destaddr", value_name = "MAC", value_parser = crate::mac_address::MacAddress::parse_cli_token)]
+    pub ethernet_destination: Option<crate::mac_address::MacAddress>,
+    /// Ethernet source MAC. When omitted, the scanning interface hardware address is used. This
+    /// does not change RFC 826 `ar$sha`; use `--arpsha` for that field.
+    #[arg(long = "srcaddr", value_name = "MAC", value_parser = crate::mac_address::MacAddress::parse_cli_token)]
+    pub ethernet_source: Option<crate::mac_address::MacAddress>,
+    /// RFC 826 `ar$sha`. When omitted, the scanning interface hardware address is used. This does
+    /// not change the Ethernet source; use `--srcaddr` for that field.
+    #[arg(long = "arpsha", value_name = "MAC", value_parser = crate::mac_address::MacAddress::parse_cli_token)]
+    pub arp_sender_hardware: Option<crate::mac_address::MacAddress>,
+    /// RFC 826 `ar$tha`. When omitted, all zeroes are used (unused in an ARP request).
+    #[arg(long = "arptha", value_name = "MAC", value_parser = crate::mac_address::MacAddress::parse_cli_token)]
+    pub arp_target_hardware: Option<crate::mac_address::MacAddress>,
+    /// RFC 826 `ar$hrd` (default 1 / Ethernet). Decimal or `0x`-prefixed hexadecimal.
+    #[arg(
+        long = "arphrd",
+        value_name = "UINT",
+        default_value_t = 1,
+        value_parser = crate::application_command::parse_u16_cli_token
+    )]
+    pub arp_hardware_type: u16,
+    /// RFC 826 `ar$pro` (default `0x0800` / IPv4). Decimal or `0x`-prefixed hexadecimal.
+    #[arg(
+        long = "arppro",
+        value_name = "UINT",
+        default_value = "0x0800",
+        value_parser = crate::application_command::parse_u16_cli_token
+    )]
+    pub arp_protocol_type: u16,
+    /// RFC 826 `ar$hln` (default 6). Does not change the encoded SHA/THA widths.
+    #[arg(
+        long = "arphln",
+        value_name = "UINT",
+        default_value_t = 6,
+        value_parser = crate::application_command::parse_u8_cli_token
+    )]
+    pub arp_hardware_length: u8,
+    /// RFC 826 `ar$pln` (default 4). Does not change the encoded SPA/TPA widths.
+    #[arg(
+        long = "arppln",
+        value_name = "UINT",
+        default_value_t = 4,
+        value_parser = crate::application_command::parse_u8_cli_token
+    )]
+    pub arp_protocol_length: u8,
+    /// RFC 826 `ar$op` (default 1 / request). Decimal or `0x`-prefixed hexadecimal.
+    #[arg(
+        long = "arpop",
+        value_name = "UINT",
+        default_value_t = 1,
+        value_parser = crate::application_command::parse_u16_cli_token
+    )]
+    pub arp_operation: u16,
     /// Milliseconds to wait for address resolution replies after the last request is sent.
     #[arg(
         long = "timeout-ms",
@@ -119,6 +176,7 @@ pub struct ScanArguments {
 mod tests {
     use super::CliRoot;
     use crate::application_command::ArpSenderProtocolAddress;
+    use crate::mac_address::MacAddress;
     use clap::CommandFactory;
     use clap::Parser;
     use std::net::Ipv4Addr;
@@ -1256,10 +1314,139 @@ mod tests {
             help.contains("--arpspa") && help.contains("--llc") && help.contains("--vlan"),
             "scan long help should name VLAN, arpspa, and llc flags, got:\n{help}"
         );
+        assert!(
+            help.contains("--destaddr")
+                && help.contains("--srcaddr")
+                && help.contains("--arpsha")
+                && help.contains("--arptha")
+                && help.contains("--arphrd")
+                && help.contains("--arppro")
+                && help.contains("--arphln")
+                && help.contains("--arppln")
+                && help.contains("--arpop"),
+            "scan long help should name Ethernet and remaining RFC 826 field overrides, got:\n{help}"
+        );
         let lower = help.to_lowercase();
         assert!(
             lower.contains("5227") || lower.contains("probe") || lower.contains("dest"),
             "scan long help should describe RFC 5227 Probe / dest SPA, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_destaddr_srcaddr_and_arp_field_overrides() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--destaddr",
+            "00:11:22:33:44:55",
+            "--srcaddr",
+            "0a-0b-0c-0d-0e-0f",
+            "--arpsha",
+            "aa:bb:cc:dd:ee:ff",
+            "--arptha",
+            "01:02:03:04:05:06",
+            "--arphrd",
+            "6",
+            "--arppro",
+            "0x0800",
+            "--arphln",
+            "6",
+            "--arppln",
+            "4",
+            "--arpop",
+            "1",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        match parsed.subcommand.expect("subcommand should be present") {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.ethernet_destination,
+                    Some(MacAddress::from_octets([
+                        0x00, 0x11, 0x22, 0x33, 0x44, 0x55
+                    ]))
+                );
+                assert_eq!(
+                    scan.ethernet_source,
+                    Some(MacAddress::from_octets([
+                        0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+                    ]))
+                );
+                assert_eq!(
+                    scan.arp_sender_hardware,
+                    Some(MacAddress::from_octets([
+                        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+                    ]))
+                );
+                assert_eq!(
+                    scan.arp_target_hardware,
+                    Some(MacAddress::from_octets([
+                        0x01, 0x02, 0x03, 0x04, 0x05, 0x06
+                    ]))
+                );
+                assert_eq!(scan.arp_hardware_type, 6);
+                assert_eq!(scan.arp_protocol_type, 0x0800);
+                assert_eq!(scan.arp_hardware_length, 6);
+                assert_eq!(scan.arp_protocol_length, 4);
+                assert_eq!(scan.arp_operation, 1);
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_destaddr_and_arp_field_overrides_use_rfc_826_defaults() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--interface", "eth0"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        match parsed
+            .expect("parsing should succeed")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(scan.ethernet_destination.is_none());
+                assert!(scan.ethernet_source.is_none());
+                assert!(scan.arp_sender_hardware.is_none());
+                assert!(scan.arp_target_hardware.is_none());
+                assert_eq!(scan.arp_hardware_type, 1);
+                assert_eq!(scan.arp_protocol_type, 0x0800);
+                assert_eq!(scan.arp_hardware_length, 6);
+                assert_eq!(scan.arp_protocol_length, 4);
+                assert_eq!(scan.arp_operation, 1);
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_destaddr_is_not_a_mac_address() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--destaddr", "not-a-mac"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "invalid --destaddr should fail parsing, got: {outcome:?}"
         );
     }
 }

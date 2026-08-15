@@ -173,4 +173,19 @@ Wire options are grouped in [`ScanWireOptions`](src/application_command.rs) on [
 
 **Reason:** Library Probe/Announcement builders and SNAP receive without CLI transmit could not be claimed as RFC 5227 / RFC 1042 fidelity. Original `arp-scan` exposes `--arpspa` and `--llc`; sending SNAP with a standards-correct length avoids copying a known length-field bug.
 
-**Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, and `libpcap` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA.
+**Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, custom `--padding`, and `--prototype` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA. Ethernet destination/source and remaining `ar$*` overrides are superseded below.
+
+## 2026-08-15 — RFC 826 / arp-scan Ethernet and ARP field overrides
+
+**Decision:** Operators can override the remaining original `arp-scan` outgoing packet fields on `scan`, matching that tool's long option names:
+
+- **Ethernet:** `--destaddr` (default broadcast), `--srcaddr` (default interface MAC). `--prototype` is not implemented: the SNAP/`EtherType` stays ARP (`0x0806`) so replies remain in the capture path.
+- **RFC 826 ARP:** `--arphrd` (default 1), `--arppro` (default `0x0800`), `--arphln` (default 6), `--arppln` (default 4), `--arpop` (default 1), `--arpsha` (default interface MAC), `--arptha` (default zeroes). `--arpspa` was already present. Numeric flags accept decimal or `0x`-prefixed hexadecimal. `--arphln` / `--arppln` change only the advertised length octets; SHA/THA stay 6 bytes and SPA/TPA stay 4 bytes, as in original `arp-scan`.
+- **`--srcaddr` vs `--arpsha`:** these are independent, matching RFC 826 (Ethernet source may differ from `ar$sha`; receive already records `ar$sha`).
+- Transmit of RFC 5494 reserved `ar$hrd` / `ar$op` values 0 and 65535 is allowed (original `arp-scan` permits any 16-bit value). Receive still rejects those reserved values.
+
+Resolved fields are encoded through [`AddressResolutionRequestLayout`](src/address_resolution_protocol.rs) so the scanner does not grow an argument list.
+
+**Reason:** `--vlan`, `--llc`, and `--arpspa` left Ethernet addressing and the rest of the RFC 826 header fixed. Original `arp-scan` documents `--destaddr` as the commonly used Ethernet override, and treating `ar$sha` as distinct from the Ethernet source completes the receive-side RFC 826 contract on transmit.
+
+**Consequences:** QinQ / IEEE 802.1ad, bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and custom `--padding` (which can exceed the 60-octet buffer) remain deferred.

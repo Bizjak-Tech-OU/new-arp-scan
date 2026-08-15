@@ -314,34 +314,64 @@ impl TryFrom<&str> for MacAddress {
     /// assert_eq!(address.octets(), [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
     /// ```
     fn try_from(text: &str) -> Result<Self, Self::Error> {
-        const EXPECTED_COMPONENT_COUNT: usize = 6;
-        let components: Vec<&str> = text.split(':').collect();
-        if components.len() != EXPECTED_COMPONENT_COUNT {
-            return Err(MacAddressParseError::WrongComponentCount {
-                expected_component_count: EXPECTED_COMPONENT_COUNT,
-                actual_component_count: components.len(),
+        parse_mac_address_octets_with_separator(text, ':')
+    }
+}
+
+impl MacAddress {
+    /// Parses a CLI MAC token: six hexadecimal octets separated by `:` or by `-`.
+    ///
+    /// Mixed separators are rejected. This matches original `arp-scan` `--destaddr` / `--srcaddr`
+    /// notation without changing [`TryFrom<&str>`], which remains colon-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the token is not six two-digit hexadecimal octets.
+    pub fn parse_cli_token(token: &str) -> Result<Self, String> {
+        let has_colon = token.contains(':');
+        let has_hyphen = token.contains('-');
+        if has_colon && has_hyphen {
+            return Err(format!(
+                "invalid MAC address '{token}': mix of ':' and '-' separators is not allowed"
+            ));
+        }
+        let separator = if has_hyphen { '-' } else { ':' };
+        parse_mac_address_octets_with_separator(token, separator)
+            .map_err(|error| format!("invalid MAC address '{token}': {error}"))
+    }
+}
+
+fn parse_mac_address_octets_with_separator(
+    text: &str,
+    separator: char,
+) -> Result<MacAddress, MacAddressParseError> {
+    const EXPECTED_COMPONENT_COUNT: usize = 6;
+    let components: Vec<&str> = text.split(separator).collect();
+    if components.len() != EXPECTED_COMPONENT_COUNT {
+        return Err(MacAddressParseError::WrongComponentCount {
+            expected_component_count: EXPECTED_COMPONENT_COUNT,
+            actual_component_count: components.len(),
+        });
+    }
+
+    let mut octets = [0u8; EXPECTED_COMPONENT_COUNT];
+    for (component_index, component) in components.iter().enumerate() {
+        let trimmed = component.trim();
+        if trimmed.len() != 2 {
+            return Err(MacAddressParseError::ComponentWrongLength {
+                component_index,
+                observed_length: trimmed.len(),
             });
         }
-
-        let mut octets = [0u8; EXPECTED_COMPONENT_COUNT];
-        for (component_index, component) in components.iter().enumerate() {
-            let trimmed = component.trim();
-            if trimmed.len() != 2 {
-                return Err(MacAddressParseError::ComponentWrongLength {
-                    component_index,
-                    observed_length: trimmed.len(),
-                });
-            }
-            let pair_bytes = trimmed.as_bytes();
-            let high_nibble =
-                parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[0], component_index)?;
-            let low_nibble =
-                parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[1], component_index)?;
-            octets[component_index] = (high_nibble << 4) | low_nibble;
-        }
-
-        Ok(Self(octets))
+        let pair_bytes = trimmed.as_bytes();
+        let high_nibble =
+            parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[0], component_index)?;
+        let low_nibble =
+            parse_hexadecimal_nibble_for_mac_address_text(pair_bytes[1], component_index)?;
+        octets[component_index] = (high_nibble << 4) | low_nibble;
     }
+
+    Ok(MacAddress::from_octets(octets))
 }
 
 impl From<[u8; 6]> for MacAddress {
@@ -558,5 +588,37 @@ mod tests {
 
         // Assert
         assert_eq!(prefix, [0xF4, 0xA4, 0x75]);
+    }
+
+    #[test]
+    fn parse_cli_token_accepts_colon_or_hyphen_separators() {
+        // Arrange
+        let colon = "aa:bb:cc:dd:ee:ff";
+        let hyphen = "AA-BB-CC-DD-EE-FF";
+
+        // Act
+        let from_colon = MacAddress::parse_cli_token(colon);
+        let from_hyphen = MacAddress::parse_cli_token(hyphen);
+
+        // Assert
+        let expected = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(from_colon.expect("colon MAC should parse"), expected);
+        assert_eq!(from_hyphen.expect("hyphen MAC should parse"), expected);
+    }
+
+    #[test]
+    fn parse_cli_token_rejects_mixed_separators() {
+        // Arrange
+        let mixed = "aa:bb-cc:dd:ee:ff";
+
+        // Act
+        let outcome = MacAddress::parse_cli_token(mixed);
+
+        // Assert
+        let error = outcome.expect_err("mixed separators should fail");
+        assert!(
+            error.contains("mix of ':' and '-'"),
+            "error should name mixed separators, got: {error}"
+        );
     }
 }

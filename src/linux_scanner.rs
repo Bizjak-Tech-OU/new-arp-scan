@@ -23,7 +23,8 @@ use crate::scanner::{self, ArpReplyAcceptance, ScanTransmitContext};
 /// `receive_timeout_after_last_request` bounds how long the scanner waits for replies after the
 /// last request is sent. `pacing_between_scan_rounds` is the delay after each full round of
 /// target sends except the final round. `scan_round_count` is how many such rounds run.
-/// `wire` selects IEEE 802.1Q tagging, RFC 826 `ar$spa`, and RFC 1042 LLC/SNAP framing.
+/// `wire` selects IEEE 802.1Q tagging, RFC 826 header fields, Ethernet addressing, and RFC 1042
+/// LLC/SNAP framing.
 ///
 /// # Errors
 ///

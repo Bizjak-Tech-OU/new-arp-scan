@@ -77,8 +77,9 @@ pub use linux_scanner::perform_arp_probe;
 /// records replies only from that sender IPv4. The `timeout` field bounds the global receive
 /// window after the last request is sent; the `pacing` field sleeps after each full round of target
 /// sends except the last round; the `attempts` field is how many such rounds run. The `wire` field
-/// selects IEEE 802.1Q tagging, RFC 826 `ar$spa` (including RFC 5227 Probe/Announcement), and
-/// RFC 1042 LLC/SNAP framing. When the scan
+/// selects IEEE 802.1Q tagging, RFC 826 `ar$spa` (including RFC 5227 Probe/Announcement),
+/// Ethernet `--destaddr`/`--srcaddr`, remaining RFC 826 `ar$*` fields, and RFC 1042 LLC/SNAP
+/// framing. When the scan
 /// command omits an interface name, the library selects an interface automatically only when
 /// exactly one usable interface exists. On Linux, successful scans populate
 /// [`application_outcome::ScanOutcome::timing_summary`] with wall-clock timing, the resolved

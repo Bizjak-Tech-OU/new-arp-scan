@@ -77,6 +77,64 @@ pub const MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE: usize = 60
 /// IEEE 802.3 MAC client data minimum (46 octets) that ARP's 28-byte payload must be padded to.
 pub const MINIMUM_ETHERNET_MAC_CLIENT_DATA_LENGTH: usize = 46;
 
+/// Fully resolved Ethernet and RFC 826 fields for one transmitted ARP request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AddressResolutionRequestLayout {
+    /// Ethernet destination (broadcast unless `--destaddr` overrides it).
+    pub ethernet_destination: MacAddress,
+    /// Ethernet source (`--srcaddr`, defaulting to the interface MAC).
+    pub ethernet_source: MacAddress,
+    /// Optional IEEE 802.1Q customer tag.
+    pub vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    /// RFC 1042 LLC/SNAP instead of Ethernet II.
+    pub llc_snap: bool,
+    /// RFC 826 `ar$hrd`.
+    pub hardware_type: u16,
+    /// RFC 826 `ar$pro`.
+    pub protocol_type: u16,
+    /// RFC 826 `ar$hln` (does not change the encoded SHA/THA widths).
+    pub hardware_length: u8,
+    /// RFC 826 `ar$pln` (does not change the encoded SPA/TPA widths).
+    pub protocol_length: u8,
+    /// RFC 826 `ar$op`.
+    pub opcode: u16,
+    /// RFC 826 `ar$sha`.
+    pub sender_hardware: MacAddress,
+    /// RFC 826 `ar$spa`.
+    pub sender_protocol: Ipv4Addr,
+    /// RFC 826 `ar$tha`.
+    pub target_hardware: MacAddress,
+    /// RFC 826 `ar$tpa`.
+    pub target_protocol: Ipv4Addr,
+}
+
+impl AddressResolutionRequestLayout {
+    /// RFC 826 Ethernet II request: broadcast destination, interface MAC as Ethernet source and
+    /// `ar$sha`, zero `ar$tha`, request opcode, Ethernet/IPv4 type lengths.
+    #[must_use]
+    pub(crate) fn rfc_826_ethernet_ii(
+        interface_mac_address: MacAddress,
+        source_ipv4_address: Ipv4Addr,
+        target_ipv4_address: Ipv4Addr,
+    ) -> Self {
+        Self {
+            ethernet_destination: MacAddress::BROADCAST,
+            ethernet_source: interface_mac_address,
+            vlan_identifier: None,
+            llc_snap: false,
+            hardware_type: ARP_HARDWARE_TYPE_ETHERNET,
+            protocol_type: ETHERNET_PROTOCOL_IPV4,
+            hardware_length: ARP_ETHERNET_HARDWARE_ADDRESS_LENGTH,
+            protocol_length: ARP_IPV4_PROTOCOL_ADDRESS_LENGTH,
+            opcode: ARP_OPERATION_REQUEST,
+            sender_hardware: interface_mac_address,
+            sender_protocol: source_ipv4_address,
+            target_hardware: MacAddress::ZERO,
+            target_protocol: target_ipv4_address,
+        }
+    }
+}
+
 const _: () = {
     assert!(
         14 + MINIMUM_ETHERNET_MAC_CLIENT_DATA_LENGTH
@@ -177,15 +235,14 @@ pub fn build_address_resolution_request_ethernet_frame_with_wire_options(
     vlan_identifier: Option<Ieee8021qVlanIdentifier>,
     llc_snap: bool,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
-    build_address_resolution_ethernet_frame(
+    let mut layout = AddressResolutionRequestLayout::rfc_826_ethernet_ii(
         source_mac_address,
         source_ipv4_address,
-        MacAddress::ZERO,
         target_ipv4_address,
-        ARP_OPERATION_REQUEST,
-        vlan_identifier,
-        llc_snap,
-    )
+    );
+    layout.vlan_identifier = vlan_identifier;
+    layout.llc_snap = llc_snap;
+    encode_address_resolution_request_from_layout(layout)
 }
 
 /// Builds an RFC 5227 ARP Probe: an ARP request with an all-zero sender IPv4 address.
@@ -214,14 +271,12 @@ pub fn build_address_resolution_probe_ethernet_frame(
     source_mac_address: MacAddress,
     target_ipv4_address: Ipv4Addr,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
-    build_address_resolution_ethernet_frame(
-        source_mac_address,
-        Ipv4Addr::UNSPECIFIED,
-        MacAddress::ZERO,
-        target_ipv4_address,
-        ARP_OPERATION_REQUEST,
-        None,
-        false,
+    encode_address_resolution_request_from_layout(
+        AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            source_mac_address,
+            Ipv4Addr::UNSPECIFIED,
+            target_ipv4_address,
+        ),
     )
 }
 
@@ -251,57 +306,56 @@ pub fn build_address_resolution_announcement_ethernet_frame(
     source_mac_address: MacAddress,
     claimed_ipv4_address: Ipv4Addr,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
-    build_address_resolution_ethernet_frame(
-        source_mac_address,
-        claimed_ipv4_address,
-        MacAddress::ZERO,
-        claimed_ipv4_address,
-        ARP_OPERATION_REQUEST,
-        None,
-        false,
+    encode_address_resolution_request_from_layout(
+        AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            source_mac_address,
+            claimed_ipv4_address,
+            claimed_ipv4_address,
+        ),
     )
 }
 
-fn build_address_resolution_ethernet_frame(
-    source_mac_address: MacAddress,
-    source_ipv4_address: Ipv4Addr,
-    target_mac_address: MacAddress,
-    target_ipv4_address: Ipv4Addr,
-    opcode: u16,
-    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
-    llc_snap: bool,
+/// Encodes one ARP request from already-resolved Ethernet and RFC 826 fields, zero-padded to the
+/// IEEE 802.3 60-octet minimum without the frame check sequence.
+///
+/// # Panics
+///
+/// This function does not panic.
+#[must_use]
+pub(crate) fn encode_address_resolution_request_from_layout(
+    layout: AddressResolutionRequestLayout,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
     let mut address_resolution_payload = [0u8; ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
     address_resolution_payload[ARP_HARDWARE_TYPE_OFFSET..ARP_HARDWARE_TYPE_OFFSET + 2]
-        .copy_from_slice(&ARP_HARDWARE_TYPE_ETHERNET.to_be_bytes());
+        .copy_from_slice(&layout.hardware_type.to_be_bytes());
     address_resolution_payload[ARP_PROTOCOL_TYPE_OFFSET..ARP_PROTOCOL_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_PROTOCOL_IPV4.to_be_bytes());
-    address_resolution_payload[ARP_HARDWARE_LENGTH_OFFSET] = ARP_ETHERNET_HARDWARE_ADDRESS_LENGTH;
-    address_resolution_payload[ARP_PROTOCOL_LENGTH_OFFSET] = ARP_IPV4_PROTOCOL_ADDRESS_LENGTH;
+        .copy_from_slice(&layout.protocol_type.to_be_bytes());
+    address_resolution_payload[ARP_HARDWARE_LENGTH_OFFSET] = layout.hardware_length;
+    address_resolution_payload[ARP_PROTOCOL_LENGTH_OFFSET] = layout.protocol_length;
     address_resolution_payload[ARP_OPCODE_OFFSET..ARP_OPCODE_OFFSET + 2]
-        .copy_from_slice(&opcode.to_be_bytes());
+        .copy_from_slice(&layout.opcode.to_be_bytes());
     address_resolution_payload[ARP_SENDER_HARDWARE_OFFSET..ARP_SENDER_HARDWARE_OFFSET + 6]
-        .copy_from_slice(&source_mac_address.octets());
+        .copy_from_slice(&layout.sender_hardware.octets());
     address_resolution_payload[ARP_SENDER_PROTOCOL_OFFSET..ARP_SENDER_PROTOCOL_OFFSET + 4]
-        .copy_from_slice(&source_ipv4_address.octets());
+        .copy_from_slice(&layout.sender_protocol.octets());
     address_resolution_payload[ARP_TARGET_HARDWARE_OFFSET..ARP_TARGET_HARDWARE_OFFSET + 6]
-        .copy_from_slice(&target_mac_address.octets());
+        .copy_from_slice(&layout.target_hardware.octets());
     address_resolution_payload[ARP_TARGET_PROTOCOL_OFFSET..ARP_TARGET_PROTOCOL_OFFSET + 4]
-        .copy_from_slice(&target_ipv4_address.octets());
+        .copy_from_slice(&layout.target_protocol.octets());
 
-    let ethernet_body = if llc_snap {
+    let ethernet_body = if layout.llc_snap {
         encode_ieee_8023_rfc_1042_llc_snap_frame(
-            MacAddress::BROADCAST,
-            source_mac_address,
-            vlan_identifier,
+            layout.ethernet_destination,
+            layout.ethernet_source,
+            layout.vlan_identifier,
             ETHERNET_PROTOCOL_ARP,
             &address_resolution_payload,
         )
     } else {
         encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
-            MacAddress::BROADCAST,
-            source_mac_address,
-            vlan_identifier,
+            layout.ethernet_destination,
+            layout.ethernet_source,
+            layout.vlan_identifier,
             ETHERNET_PROTOCOL_ARP,
             &address_resolution_payload,
         )
@@ -533,6 +587,44 @@ mod tests {
             frame.len(),
             MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE
         );
+    }
+
+    #[test]
+    fn layout_encode_uses_ethernet_destination_source_and_arp_field_overrides() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let ethernet_destination = MacAddress::from_octets([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let ethernet_source = MacAddress::from_octets([0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]);
+        let sender_hardware = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let target_hardware = MacAddress::from_octets([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 2);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let mut layout = super::AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            interface_mac,
+            source_ip,
+            target_ip,
+        );
+        layout.ethernet_destination = ethernet_destination;
+        layout.ethernet_source = ethernet_source;
+        layout.hardware_type = 6;
+        layout.sender_hardware = sender_hardware;
+        layout.target_hardware = target_hardware;
+
+        // Act
+        let frame = super::encode_address_resolution_request_from_layout(layout);
+
+        // Assert
+        assert_eq!(&frame[0..6], &ethernet_destination.octets());
+        assert_eq!(&frame[6..12], &ethernet_source.octets());
+        assert_ne!(
+            &frame[6..12],
+            &sender_hardware.octets(),
+            "Ethernet source and ar$sha are independent RFC 826 fields"
+        );
+        let arp = &frame[ETHERNET_II_HEADER_LENGTH..];
+        assert_eq!(u16::from_be_bytes([arp[0], arp[1]]), 6);
+        assert_eq!(&arp[8..14], &sender_hardware.octets());
+        assert_eq!(&arp[18..24], &target_hardware.octets());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::scanner::{self, ArpReplyAcceptance, ScanTransmitContext};
 /// Timing semantics match the Linux backend: `receive_timeout_after_last_request` bounds the
 /// receive window after the last request, `pacing_between_scan_rounds` sleeps after each round
 /// except the last, and `scan_round_count` is how many rounds run. `wire` selects IEEE 802.1Q
-/// tagging, RFC 826 `ar$spa`, and RFC 1042 LLC/SNAP framing.
+/// tagging, RFC 826 header fields, Ethernet addressing, and RFC 1042 LLC/SNAP framing.
 ///
 /// # Errors
 ///

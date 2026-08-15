@@ -51,6 +51,15 @@ fn main() {
                             .sender_protocol_address
                             .unwrap_or(ArpSenderProtocolAddress::Interface),
                         llc_snap: scan.llc_snap,
+                        ethernet_destination: scan.ethernet_destination,
+                        ethernet_source: scan.ethernet_source,
+                        arp_hardware_type: scan.arp_hardware_type,
+                        arp_protocol_type: scan.arp_protocol_type,
+                        arp_hardware_length: scan.arp_hardware_length,
+                        arp_protocol_length: scan.arp_protocol_length,
+                        arp_operation: scan.arp_operation,
+                        arp_sender_hardware: scan.arp_sender_hardware,
+                        arp_target_hardware: scan.arp_target_hardware,
                     },
                 }) {
                     Ok(outcome) => {

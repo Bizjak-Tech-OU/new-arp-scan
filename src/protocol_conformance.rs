@@ -8,9 +8,10 @@ use crate::address_resolution_protocol::{
     build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
     build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
     build_address_resolution_request_ethernet_frame_with_wire_options,
+    encode_address_resolution_request_from_layout,
     try_parse_address_resolution_reply_ipv4_over_ethernet,
 };
-use crate::application_command::ArpSenderProtocolAddress;
+use crate::application_command::{ArpSenderProtocolAddress, ScanWireOptions};
 use crate::ethernet_frame::{
     ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG, EthernetFraming,
     IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH, Ieee8021qVlanIdentifier,
@@ -298,4 +299,34 @@ fn rfc_5227_announcement_via_destination_sender_protocol_address_matches_announc
     assert_eq!(from_wire, from_builder);
     assert_eq!(&from_wire[28..32], &claimed.octets());
     assert_eq!(&from_wire[38..42], &claimed.octets());
+}
+
+#[test]
+fn rfc_826_ethernet_source_and_sender_hardware_are_independent_and_destaddr_can_be_unicast() {
+    // Arrange
+    let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+    let destination = MacAddress::from_octets([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let ethernet_source = MacAddress::from_octets([0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F]);
+    let sender_hardware = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    let spa = Ipv4Addr::new(192, 168, 1, 1);
+    let tpa = Ipv4Addr::new(192, 168, 1, 50);
+    let wire = ScanWireOptions {
+        ethernet_destination: Some(destination),
+        ethernet_source: Some(ethernet_source),
+        arp_sender_hardware: Some(sender_hardware),
+        arp_hardware_type: 6,
+        ..ScanWireOptions::default()
+    };
+
+    // Act
+    let frame = encode_address_resolution_request_from_layout(
+        wire.address_resolution_request_layout(interface_mac, spa, tpa),
+    );
+
+    // Assert
+    assert_eq!(&frame[0..6], &destination.octets());
+    assert_eq!(&frame[6..12], &ethernet_source.octets());
+    assert_eq!(&frame[22..28], &sender_hardware.octets());
+    assert_eq!(rfc_826_arp_field(&frame, 0, 2), 6u16.to_be_bytes());
+    assert_ne!(ethernet_source, sender_hardware);
 }

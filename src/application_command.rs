@@ -4,7 +4,12 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use crate::ethernet_frame::Ieee8021qVlanIdentifier;
+use crate::address_resolution_protocol::{
+    ARP_ETHERNET_HARDWARE_ADDRESS_LENGTH, ARP_HARDWARE_TYPE_ETHERNET,
+    ARP_IPV4_PROTOCOL_ADDRESS_LENGTH, ARP_OPERATION_REQUEST, AddressResolutionRequestLayout,
+};
+use crate::ethernet_frame::{ETHERNET_PROTOCOL_IPV4, Ieee8021qVlanIdentifier};
+use crate::mac_address::MacAddress;
 
 /// How transmitted ARP requests fill RFC 826 `ar$spa`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +54,46 @@ impl ArpSenderProtocolAddress {
     }
 }
 
+/// Parses a decimal or `0x`-prefixed hexadecimal unsigned integer for ARP header CLI flags.
+///
+/// # Errors
+///
+/// Returns a message when `token` is not a decimal or hexadecimal integer in range for `T`.
+pub fn parse_u16_cli_token(token: &str) -> Result<u16, String> {
+    parse_cli_integer(token, "16-bit")
+}
+
+/// Parses a decimal or `0x`-prefixed hexadecimal octet for `ar$hln` / `ar$pln`.
+///
+/// # Errors
+///
+/// Returns a message when `token` is not a decimal or hexadecimal integer in `0..=255`.
+pub fn parse_u8_cli_token(token: &str) -> Result<u8, String> {
+    parse_cli_integer(token, "8-bit")
+}
+
+fn parse_cli_integer<T>(token: &str, width_name: &str) -> Result<T, String>
+where
+    T: TryFrom<u128>,
+{
+    let trimmed = token.trim();
+    let parsed = if let Some(hexadecimal) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u128::from_str_radix(hexadecimal, 16).map_err(|_| {
+            format!("invalid hexadecimal integer '{token}': expected a {width_name} value")
+        })?
+    } else {
+        trimmed.parse::<u128>().map_err(|_| {
+            format!(
+                "invalid integer '{token}': expected a decimal or 0x-prefixed {width_name} value"
+            )
+        })?
+    };
+    T::try_from(parsed).map_err(|_| format!("integer '{token}' is outside the {width_name} range"))
+}
+
 /// On-wire options for transmitted ARP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanWireOptions {
@@ -58,6 +103,24 @@ pub struct ScanWireOptions {
     pub sender_protocol_address: ArpSenderProtocolAddress,
     /// When true, encapsulate ARP in IEEE 802.3 with RFC 1042 LLC/SNAP instead of Ethernet II.
     pub llc_snap: bool,
+    /// Ethernet destination. [`None`] means the broadcast address.
+    pub ethernet_destination: Option<MacAddress>,
+    /// Ethernet source. [`None`] means the scanning interface MAC.
+    pub ethernet_source: Option<MacAddress>,
+    /// RFC 826 `ar$hrd` (default Ethernet / 1).
+    pub arp_hardware_type: u16,
+    /// RFC 826 `ar$pro` (default IPv4 / `0x0800`).
+    pub arp_protocol_type: u16,
+    /// RFC 826 `ar$hln` (default 6). Does not change encoded SHA/THA widths.
+    pub arp_hardware_length: u8,
+    /// RFC 826 `ar$pln` (default 4). Does not change encoded SPA/TPA widths.
+    pub arp_protocol_length: u8,
+    /// RFC 826 `ar$op` (default request / 1).
+    pub arp_operation: u16,
+    /// RFC 826 `ar$sha`. [`None`] means the scanning interface MAC.
+    pub arp_sender_hardware: Option<MacAddress>,
+    /// RFC 826 `ar$tha`. [`None`] means all zeroes.
+    pub arp_target_hardware: Option<MacAddress>,
 }
 
 impl Default for ScanWireOptions {
@@ -66,6 +129,42 @@ impl Default for ScanWireOptions {
             vlan_identifier: None,
             sender_protocol_address: ArpSenderProtocolAddress::Interface,
             llc_snap: false,
+            ethernet_destination: None,
+            ethernet_source: None,
+            arp_hardware_type: ARP_HARDWARE_TYPE_ETHERNET,
+            arp_protocol_type: ETHERNET_PROTOCOL_IPV4,
+            arp_hardware_length: ARP_ETHERNET_HARDWARE_ADDRESS_LENGTH,
+            arp_protocol_length: ARP_IPV4_PROTOCOL_ADDRESS_LENGTH,
+            arp_operation: ARP_OPERATION_REQUEST,
+            arp_sender_hardware: None,
+            arp_target_hardware: None,
+        }
+    }
+}
+
+impl ScanWireOptions {
+    /// Resolves CLI/library wire options against one interface and target into an on-wire layout.
+    #[must_use]
+    pub(crate) fn address_resolution_request_layout(
+        self,
+        interface_mac_address: MacAddress,
+        sender_protocol_address: Ipv4Addr,
+        target_protocol_address: Ipv4Addr,
+    ) -> AddressResolutionRequestLayout {
+        AddressResolutionRequestLayout {
+            ethernet_destination: self.ethernet_destination.unwrap_or(MacAddress::BROADCAST),
+            ethernet_source: self.ethernet_source.unwrap_or(interface_mac_address),
+            vlan_identifier: self.vlan_identifier,
+            llc_snap: self.llc_snap,
+            hardware_type: self.arp_hardware_type,
+            protocol_type: self.arp_protocol_type,
+            hardware_length: self.arp_hardware_length,
+            protocol_length: self.arp_protocol_length,
+            opcode: self.arp_operation,
+            sender_hardware: self.arp_sender_hardware.unwrap_or(interface_mac_address),
+            sender_protocol: sender_protocol_address,
+            target_hardware: self.arp_target_hardware.unwrap_or(MacAddress::ZERO),
+            target_protocol: target_protocol_address,
         }
     }
 }
@@ -95,7 +194,7 @@ pub enum ApplicationCommand {
         pacing: Duration,
         /// Total request rounds: each round sends one broadcast request per target.
         attempts: NonZeroU64,
-        /// IEEE 802.1Q tag, RFC 826 `ar$spa` override, and RFC 1042 LLC/SNAP framing.
+        /// IEEE 802.1Q tag, RFC 826 field overrides, Ethernet addressing, and RFC 1042 LLC/SNAP.
         wire: ScanWireOptions,
     },
     /// List interfaces that are usable for ARP scanning on Linux.
@@ -106,9 +205,10 @@ pub enum ApplicationCommand {
 mod tests {
     use super::{
         ApplicationCommand, ArpSenderProtocolAddress, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,
-        DEFAULT_SCAN_TIMEOUT, ScanWireOptions,
+        DEFAULT_SCAN_TIMEOUT, ScanWireOptions, parse_u8_cli_token, parse_u16_cli_token,
     };
     use crate::ethernet_frame::Ieee8021qVlanIdentifier;
+    use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
     use std::num::NonZeroU64;
     use std::time::Duration;
@@ -593,5 +693,92 @@ mod tests {
             !llc_differs,
             "RFC 1042 LLC/SNAP framing must distinguish Scan commands"
         );
+    }
+
+    #[test]
+    fn parse_u16_cli_token_accepts_decimal_and_hexadecimal() {
+        // Arrange
+        // Act
+        let decimal = parse_u16_cli_token("6");
+        let hexadecimal = parse_u16_cli_token("0x0800");
+        let too_large = parse_u16_cli_token("0x10000");
+
+        // Assert
+        assert_eq!(decimal, Ok(6));
+        assert_eq!(hexadecimal, Ok(0x0800));
+        assert!(
+            too_large
+                .expect_err("0x10000 exceeds u16")
+                .contains("range"),
+            "overflow should mention the integer range"
+        );
+    }
+
+    #[test]
+    fn parse_u8_cli_token_rejects_values_above_255() {
+        // Arrange
+        // Act
+        let maximum = parse_u8_cli_token("0xff");
+        let overflow = parse_u8_cli_token("256");
+
+        // Assert
+        assert_eq!(maximum, Ok(255));
+        assert!(overflow.is_err(), "256 is outside an 8-bit field");
+    }
+
+    #[test]
+    fn request_layout_uses_broadcast_and_interface_mac_by_default() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let spa = Ipv4Addr::new(192, 168, 1, 1);
+        let tpa = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Act
+        let layout =
+            ScanWireOptions::default().address_resolution_request_layout(interface_mac, spa, tpa);
+
+        // Assert
+        assert_eq!(layout.ethernet_destination, MacAddress::BROADCAST);
+        assert_eq!(layout.ethernet_source, interface_mac);
+        assert_eq!(layout.sender_hardware, interface_mac);
+        assert_eq!(layout.target_hardware, MacAddress::ZERO);
+        assert_eq!(layout.hardware_type, 1);
+        assert_eq!(layout.opcode, 1);
+        assert_eq!(layout.sender_protocol, spa);
+        assert_eq!(layout.target_protocol, tpa);
+    }
+
+    #[test]
+    fn request_layout_applies_ethernet_and_arp_hardware_overrides() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let destination = MacAddress::from_octets([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let ethernet_source = MacAddress::from_octets([0x0A; 6]);
+        let sender_hardware = MacAddress::from_octets([0xBB; 6]);
+        let target_hardware = MacAddress::from_octets([0xCC; 6]);
+        let wire = ScanWireOptions {
+            ethernet_destination: Some(destination),
+            ethernet_source: Some(ethernet_source),
+            arp_hardware_type: 6,
+            arp_operation: 1,
+            arp_sender_hardware: Some(sender_hardware),
+            arp_target_hardware: Some(target_hardware),
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let layout = wire.address_resolution_request_layout(
+            interface_mac,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
+
+        // Assert
+        assert_eq!(layout.ethernet_destination, destination);
+        assert_eq!(layout.ethernet_source, ethernet_source);
+        assert_eq!(layout.sender_hardware, sender_hardware);
+        assert_eq!(layout.target_hardware, target_hardware);
+        assert_eq!(layout.hardware_type, 6);
+        assert_ne!(layout.ethernet_source, layout.sender_hardware);
     }
 }
