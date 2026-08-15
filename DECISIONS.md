@@ -150,4 +150,12 @@ Introduce a **narrow portable link-layer boundary** that both Linux and macOS im
 
 **Reason:** The core product is an ARP scanner. Silent misparse of 802.3 lengths, stacked VLAN TPIDs, and reserved ARP fields, plus no IEEE registry lookup, made the tool unverifiable against the RFCs/IEEE documents and weaker than original `arp-scan` on receive-side 802.1Q and vendor identification.
 
-**Consequences:** Spec-facing tests live in [`src/protocol_conformance.rs`](src/protocol_conformance.rs) and the packet modules. Still deferred (send-side `--vlan`, LLC/SNAP transmit, bundling a full IEEE database, passive ACD / monitor mode, `libpcap`). Operators who want vendor names generate or copy an `ieee-oui.txt` (for example with original `arp-scan`'s `get-oui`).
+**Consequences:** Spec-facing tests live in [`src/protocol_conformance.rs`](src/protocol_conformance.rs) and the packet modules. Still deferred at that time: send-side `--vlan` (superseded below), LLC/SNAP transmit, bundling a full IEEE database, passive ACD / monitor mode, `libpcap`. Operators who want vendor names generate or copy an `ieee-oui.txt` (for example with original `arp-scan`'s `get-oui`).
+
+## 2026-08-15 — IEEE 802.1Q send-side `--vlan` and Linux tagged capture
+
+**Decision:** Operators can tag transmitted ARP requests with a single IEEE 802.1Q customer tag via `scan --vlan <VID>` (`0..=4095`, PCP and DEI zero). The request is still RFC 826 Ethernet II ARP padded to 60 octets without the frame check sequence (IEEE 802.3 / 802.3ac `ETH_ZLEN` behaviour, matching original `arp-scan --vlan`). On Linux, a VLAN scan opens `AF_PACKET` with `ETH_P_ALL` so replies may arrive tagged (`0x8100`) or with the tag stripped; non-ARP frames are ignored without malformed-frame warnings. Untagged scans keep `ETH_P_ARP`. macOS already captured tagged ARP via BPF; it now also transmits the tag when `--vlan` is set.
+
+**Reason:** Receive-side 802.1Q parsing without a send path could not be claimed as IEEE 802.1Q fidelity, and Linux `ETH_P_ARP` silently dropped tagged replies on trunks that do not strip tags.
+
+**Consequences:** LLC/SNAP transmit, QinQ / IEEE 802.1ad, bundling a full IEEE database, RFC 5227 Probe as a CLI mode, passive ACD / monitor mode, and `libpcap` remain deferred. VID `4095` is reserved in IEEE 802.1Q but is accepted as a 12-bit TCI field, same as original `arp-scan`.

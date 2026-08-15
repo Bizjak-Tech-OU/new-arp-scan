@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::application_outcome::ScanOutcome;
 use crate::error::AppError;
+use crate::ethernet_frame::Ieee8021qVlanIdentifier;
 use crate::ipv4_subnet::validate_strict_interior_scan_target_ipv4_address;
 use crate::macos_bpf_socket::open_macos_link_layer_endpoint;
 use crate::macos_interface_discovery::discover_interface_scan_addresses;
@@ -19,7 +20,8 @@ use crate::scanner::{self, ArpReplyAcceptance};
 ///
 /// Timing semantics match the Linux backend: `receive_timeout_after_last_request` bounds the
 /// receive window after the last request, `pacing_between_scan_rounds` sleeps after each round
-/// except the last, and `scan_round_count` is how many rounds run.
+/// except the last, and `scan_round_count` is how many rounds run. `vlan_identifier` tags each
+/// transmitted request with a single IEEE 802.1Q header when set.
 ///
 /// # Errors
 ///
@@ -34,6 +36,7 @@ pub fn perform_arp_scan(
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
 ) -> Result<ScanOutcome, AppError> {
     // Discovery validates interface usability (loopback / down / NOARP / non-Ethernet) and the
     // subnet plan is built before opening the Berkeley Packet Filter device.
@@ -44,7 +47,11 @@ pub fn perform_arp_scan(
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &plan.targets,
-        (addresses.source_mac_address, addresses.source_ipv4_address),
+        (
+            addresses.source_mac_address,
+            addresses.source_ipv4_address,
+            vlan_identifier,
+        ),
         &plan.acceptance,
         receive_timeout_after_last_request,
         pacing_between_scan_rounds,
@@ -73,6 +80,7 @@ pub fn perform_arp_probe(
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
 ) -> Result<ScanOutcome, AppError> {
     let addresses = discover_interface_scan_addresses(interface_name)?;
     validate_strict_interior_scan_target_ipv4_address(
@@ -89,7 +97,11 @@ pub fn perform_arp_probe(
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &[target_ipv4_address],
-        (addresses.source_mac_address, addresses.source_ipv4_address),
+        (
+            addresses.source_mac_address,
+            addresses.source_ipv4_address,
+            vlan_identifier,
+        ),
         &acceptance,
         receive_timeout_after_last_request,
         pacing_between_scan_rounds,

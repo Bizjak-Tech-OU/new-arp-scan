@@ -186,7 +186,7 @@
           <pre
             class="mt-4 overflow-x-auto rounded border border-zinc-200 bg-white p-4 font-mono text-sm leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200"
           ><code>new-arp-scan interfaces
-new-arp-scan scan [--interface &lt;NAME&gt;] [--host &lt;IPv4&gt;] [--timeout-ms &lt;MILLISECONDS&gt;] [--pacing-ms &lt;MILLISECONDS&gt;] [--attempts &lt;COUNT&gt;] [--mac-vendor-file &lt;PATH&gt;]</code></pre>
+new-arp-scan scan [--interface &lt;NAME&gt;] [--host &lt;IPv4&gt;] [--timeout-ms &lt;MILLISECONDS&gt;] [--pacing-ms &lt;MILLISECONDS&gt;] [--attempts &lt;COUNT&gt;] [--mac-vendor-file &lt;PATH&gt;] [--vlan &lt;VID&gt;]</code></pre>
           <p class="mt-3 text-sm text-zinc-500 dark:text-zinc-500">
             Built-in help: <span class="font-mono">new-arp-scan --help</span>,
             <span class="font-mono">new-arp-scan interfaces --help</span>,
@@ -211,7 +211,8 @@ new-arp-scan scan [--interface &lt;NAME&gt;] [--host &lt;IPv4&gt;] [--timeout-ms
             On Linux and macOS, reads the interface IPv4 address, netmask, and Ethernet hardware address (via
             <span class="font-mono">ioctl</span> on Linux, <span class="font-mono">getifaddrs</span> on macOS), opens a
             raw link-layer endpoint scoped to ARP (an <span class="font-mono">ETH_P_ARP</span> packet socket on Linux,
-            a filtered Berkeley Packet Filter device on macOS), then runs <span class="font-mono">--attempts</span> full rounds (default
+            or <span class="font-mono">ETH_P_ALL</span> when <span class="font-mono">--vlan</span> is set so tagged
+            replies are not dropped; a filtered Berkeley Packet Filter device on macOS), then runs <span class="font-mono">--attempts</span> full rounds (default
             <span class="font-mono">1</span>). With <span class="font-mono">--host &lt;IPv4&gt;</span>, each round sends one broadcast ARP request for that address only; the address must be strictly interior on the subnet (not network or broadcast, and not off-subnet). Otherwise each round sends one broadcast ARP request per target address in the
             subnet (excluding network and broadcast, but always including the interface’s own IPv4 when it falls
             outside that open range). In single-host mode, only replies whose sender IPv4 equals
@@ -253,7 +254,10 @@ new-arp-scan scan
 new-arp-scan scan --interface eth0 --timeout-ms 5000 --pacing-ms 10 --attempts 3
 
 # Annotate MAC addresses from an IEEE MA-L / MA-M / MA-S mapping file
-new-arp-scan scan --interface eth0 --mac-vendor-file ieee-oui.txt</code></pre>
+new-arp-scan scan --interface eth0 --mac-vendor-file ieee-oui.txt
+
+# Send IEEE 802.1Q tagged ARP requests on VLAN 10
+new-arp-scan scan --interface eth0 --vlan 10</code></pre>
         </section>
 
         <section id="scan-behavior" class="mt-12 scroll-mt-20">
@@ -269,8 +273,8 @@ new-arp-scan scan --interface eth0 --mac-vendor-file ieee-oui.txt</code></pre>
             </li>
             <li>
               Requests are broadcast RFC 826 ARP frames (Ethernet II, 60-octet IEEE 802.3 minimum without FCS) sent through a raw link-layer endpoint scoped to ARP
-              (an <span class="font-mono">ETH_P_ARP</span> packet socket on Linux, a filtered Berkeley Packet Filter
-              device on macOS that also accepts a single IEEE 802.1Q tag). Replies may arrive Ethernet II, 802.1Q-tagged, or RFC 1042 LLC/SNAP. Stacked VLAN tags are rejected. <span class="font-mono">--host</span> is a single-target RFC 826 request, not an RFC 5227 ARP Probe.
+              (an <span class="font-mono">ETH_P_ARP</span> packet socket on Linux, or <span class="font-mono">ETH_P_ALL</span> when <span class="font-mono">--vlan</span> is set; a filtered Berkeley Packet Filter
+              device on macOS that also accepts a single IEEE 802.1Q tag). With <span class="font-mono">--vlan &lt;VID&gt;</span> (<span class="font-mono">0..=4095</span>) each request carries a single IEEE 802.1Q tag (TPID <span class="font-mono">0x8100</span>, PCP and DEI zero) and is still padded to 60 octets. Replies may arrive Ethernet II, 802.1Q-tagged, or RFC 1042 LLC/SNAP. Stacked VLAN tags are rejected. <span class="font-mono">--host</span> is a single-target RFC 826 request, not an RFC 5227 ARP Probe.
             </li>
             <li>
               <span class="font-mono">--attempts</span> is the total number of scan rounds (minimum

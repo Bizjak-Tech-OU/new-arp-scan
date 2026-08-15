@@ -43,6 +43,7 @@ mod macos_system_call;
 pub use address_resolution_protocol::{
     build_address_resolution_announcement_ethernet_frame,
     build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
+    build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
 };
 pub use application_command::{
     ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
@@ -54,6 +55,7 @@ pub use application_outcome::ScanTimingSummary;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
 pub use error::AppError;
+pub use ethernet_frame::Ieee8021qVlanIdentifier;
 pub use ipv4_cidr::Ipv4Cidr;
 pub use ipv4_cidr::Ipv4HostAddressIterator;
 pub use mac_address::{MacAddress, MacAddressParseError};
@@ -103,6 +105,7 @@ pub use linux_scanner::perform_arp_probe;
 ///     timeout: DEFAULT_SCAN_TIMEOUT,
 ///     pacing: DEFAULT_SCAN_PACING,
 ///     attempts: DEFAULT_SCAN_ATTEMPTS,
+///     vlan_identifier: None,
 /// });
 ///
 /// // On Linux and macOS this attempts a real scan (which may fail without privileges or for an
@@ -126,83 +129,15 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
             timeout,
             pacing,
             attempts,
-        } => {
-            if let Some(interface_name) = interface_name.as_deref() {
-                interface_validation::validate_interface_name_for_linux_packet_socket(
-                    interface_name,
-                )?;
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                let resolved_interface_name =
-                    linux_interface_discovery::resolve_scan_interface_name(
-                        interface_name.as_deref(),
-                    )?;
-                let scan_wall_clock_started = std::time::Instant::now();
-                let scan_outcome = match target_ipv4_address {
-                    Some(target_ipv4_address) => linux_scanner::perform_arp_probe(
-                        &resolved_interface_name,
-                        target_ipv4_address,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                    None => linux_scanner::perform_arp_scan(
-                        &resolved_interface_name,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                };
-                let scan_outcome = scan_outcome.with_scan_timing_summary(
-                    resolved_interface_name,
-                    scan_wall_clock_started.elapsed(),
-                    attempts,
-                );
-                Ok(ApplicationOutcome::Scan(scan_outcome))
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                let resolved_interface_name =
-                    macos_interface_discovery::resolve_scan_interface_name(
-                        interface_name.as_deref(),
-                    )?;
-                let scan_wall_clock_started = std::time::Instant::now();
-                let scan_outcome = match target_ipv4_address {
-                    Some(target_ipv4_address) => macos_scanner::perform_arp_probe(
-                        &resolved_interface_name,
-                        target_ipv4_address,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                    None => macos_scanner::perform_arp_scan(
-                        &resolved_interface_name,
-                        timeout,
-                        pacing,
-                        attempts,
-                    )?,
-                };
-                let scan_outcome = scan_outcome.with_scan_timing_summary(
-                    resolved_interface_name,
-                    scan_wall_clock_started.elapsed(),
-                    attempts,
-                );
-                Ok(ApplicationOutcome::Scan(scan_outcome))
-            }
-
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                // No raw link-layer backend on this operating system; the timing and target
-                // parameters are intentionally unused on the unsupported path.
-                let _ = (&target_ipv4_address, &timeout, &pacing, &attempts);
-                Err(AppError::UnsupportedPlatform {
-                    operating_system: std::env::consts::OS.to_string(),
-                })
-            }
-        }
+            vlan_identifier,
+        } => run_address_resolution_scan(
+            interface_name.as_deref(),
+            target_ipv4_address,
+            timeout,
+            pacing,
+            attempts,
+            vlan_identifier,
+        ),
         ApplicationCommand::UsableInterfacesList => {
             #[cfg(target_os = "linux")]
             {
@@ -225,6 +160,95 @@ pub fn run(command: ApplicationCommand) -> Result<ApplicationOutcome, AppError> 
                 })
             }
         }
+    }
+}
+
+fn run_address_resolution_scan(
+    interface_name: Option<&str>,
+    target_ipv4_address: Option<std::net::Ipv4Addr>,
+    timeout: std::time::Duration,
+    pacing: std::time::Duration,
+    attempts: std::num::NonZeroU64,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+) -> Result<ApplicationOutcome, AppError> {
+    if let Some(interface_name) = interface_name {
+        interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let resolved_interface_name =
+            linux_interface_discovery::resolve_scan_interface_name(interface_name)?;
+        let scan_wall_clock_started = std::time::Instant::now();
+        let scan_outcome = match target_ipv4_address {
+            Some(target_ipv4_address) => linux_scanner::perform_arp_probe(
+                &resolved_interface_name,
+                target_ipv4_address,
+                timeout,
+                pacing,
+                attempts,
+                vlan_identifier,
+            )?,
+            None => linux_scanner::perform_arp_scan(
+                &resolved_interface_name,
+                timeout,
+                pacing,
+                attempts,
+                vlan_identifier,
+            )?,
+        };
+        let scan_outcome = scan_outcome.with_scan_timing_summary(
+            resolved_interface_name,
+            scan_wall_clock_started.elapsed(),
+            attempts,
+        );
+        Ok(ApplicationOutcome::Scan(scan_outcome))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let resolved_interface_name =
+            macos_interface_discovery::resolve_scan_interface_name(interface_name)?;
+        let scan_wall_clock_started = std::time::Instant::now();
+        let scan_outcome = match target_ipv4_address {
+            Some(target_ipv4_address) => macos_scanner::perform_arp_probe(
+                &resolved_interface_name,
+                target_ipv4_address,
+                timeout,
+                pacing,
+                attempts,
+                vlan_identifier,
+            )?,
+            None => macos_scanner::perform_arp_scan(
+                &resolved_interface_name,
+                timeout,
+                pacing,
+                attempts,
+                vlan_identifier,
+            )?,
+        };
+        let scan_outcome = scan_outcome.with_scan_timing_summary(
+            resolved_interface_name,
+            scan_wall_clock_started.elapsed(),
+            attempts,
+        );
+        Ok(ApplicationOutcome::Scan(scan_outcome))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // No raw link-layer backend on this operating system; the timing and target
+        // parameters are intentionally unused on the unsupported path.
+        let _ = (
+            &target_ipv4_address,
+            &timeout,
+            &pacing,
+            &attempts,
+            &vlan_identifier,
+        );
+        Err(AppError::UnsupportedPlatform {
+            operating_system: std::env::consts::OS.to_string(),
+        })
     }
 }
 
@@ -271,6 +295,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -293,6 +318,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -315,6 +341,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -337,6 +364,7 @@ mod tests {
             timeout: std::time::Duration::from_mins(1),
             pacing: std::time::Duration::from_millis(999),
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -361,6 +389,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -418,6 +447,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -440,6 +470,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -465,6 +496,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -488,6 +520,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -510,6 +543,7 @@ mod tests {
             timeout: std::time::Duration::from_millis(1),
             pacing: std::time::Duration::from_millis(5),
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -534,6 +568,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(99).expect("ninety-nine is non-zero"),
+            vlan_identifier: None,
         };
 
         // Act
@@ -590,6 +625,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -629,6 +665,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -654,6 +691,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -690,6 +728,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -725,6 +764,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act

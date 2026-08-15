@@ -41,6 +41,41 @@ const ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300: u16 = 0x9300;
 /// IEEE 802.1Q VLAN identifier mask (12 bits) applied to the TCI.
 pub const IEEE_8021Q_VLAN_IDENTIFIER_MASK: u16 = 0x0FFF;
 
+/// A 12-bit IEEE 802.1Q VLAN identifier (`0..=4095`).
+///
+/// Identifier `0` is the null VID (priority tagging). Identifier `4095` is reserved in IEEE 802.1Q
+/// but is still a legal 12-bit TCI field; this type permits the full range so operators can match
+/// original `arp-scan --vlan` / `-Q` behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ieee8021qVlanIdentifier(u16);
+
+impl Ieee8021qVlanIdentifier {
+    /// Inclusive maximum 12-bit VLAN identifier.
+    pub const MAXIMUM: u16 = IEEE_8021Q_VLAN_IDENTIFIER_MASK;
+
+    /// Returns a VLAN identifier when `vlan_identifier` fits in 12 bits.
+    #[must_use]
+    pub const fn new(vlan_identifier: u16) -> Option<Self> {
+        if vlan_identifier <= Self::MAXIMUM {
+            Some(Self(vlan_identifier))
+        } else {
+            None
+        }
+    }
+
+    /// Masks `tag_control_information` down to the 12-bit VID.
+    #[must_use]
+    pub const fn from_tag_control_information(tag_control_information: u16) -> Self {
+        Self(tag_control_information & IEEE_8021Q_VLAN_IDENTIFIER_MASK)
+    }
+
+    /// Returns the 12-bit identifier in host byte order.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
 /// `EtherType` for IPv4 (`ETH_P_IP`).
 pub const ETHERNET_PROTOCOL_IPV4: u16 = 0x0800;
 
@@ -99,6 +134,39 @@ pub fn encode_ethernet_ii_frame(
     let mut frame = Vec::with_capacity(ETHERNET_II_HEADER_LENGTH + payload.len());
     frame.extend_from_slice(&destination.octets());
     frame.extend_from_slice(&source.octets());
+    frame.extend_from_slice(&ether_type.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Builds an Ethernet II frame, optionally inserting a single IEEE 802.1Q tag after the source
+/// address.
+///
+/// When `vlan_identifier` is [`None`], this matches [`encode_ethernet_ii_frame`]. When it is
+/// [`Some`], the header is destination, source, TPID `0x8100`, TCI (PCP and DEI zero, VID in the
+/// low 12 bits), inner `EtherType`, then `payload`. No minimum-frame padding is applied.
+///
+/// # Panics
+///
+/// This function does not panic.
+#[must_use]
+pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+    destination: MacAddress,
+    source: MacAddress,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    ether_type: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let Some(vlan_identifier) = vlan_identifier else {
+        return encode_ethernet_ii_frame(destination, source, ether_type, payload);
+    };
+
+    let tagged_header_length = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
+    let mut frame = Vec::with_capacity(tagged_header_length + payload.len());
+    frame.extend_from_slice(&destination.octets());
+    frame.extend_from_slice(&source.octets());
+    frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+    frame.extend_from_slice(&vlan_identifier.as_u16().to_be_bytes());
     frame.extend_from_slice(&ether_type.to_be_bytes());
     frame.extend_from_slice(payload);
     frame
@@ -243,11 +311,68 @@ mod tests {
     use super::ETHERNET_PROTOCOL_VLAN_TAG;
     use super::ETHERNET_PROTOCOL_VLAN_TAG_SERVICE;
     use super::EthernetFraming;
+    use super::IEEE_8021Q_TAG_LENGTH;
     use super::IEEE_8023_MAXIMUM_LENGTH;
+    use super::Ieee8021qVlanIdentifier;
     use super::MINIMUM_ETHERNET_II_ETHERTYPE;
     use super::encode_ethernet_ii_frame;
+    use super::encode_ethernet_ii_frame_with_optional_ieee_8021q_tag;
     use super::try_parse_ethernet_frame;
     use crate::mac_address::MacAddress;
+
+    #[test]
+    fn vlan_identifier_new_accepts_twelve_bit_range_and_rejects_4096() {
+        // Arrange
+        // Act
+        let zero = Ieee8021qVlanIdentifier::new(0);
+        let maximum = Ieee8021qVlanIdentifier::new(Ieee8021qVlanIdentifier::MAXIMUM);
+        let too_large = Ieee8021qVlanIdentifier::new(4096);
+
+        // Assert
+        assert_eq!(zero.map(Ieee8021qVlanIdentifier::as_u16), Some(0));
+        assert_eq!(
+            maximum.map(Ieee8021qVlanIdentifier::as_u16),
+            Some(0x0FFF),
+            "4095 is a legal 12-bit VLAN identifier"
+        );
+        assert!(
+            too_large.is_none(),
+            "4096 is outside the IEEE 802.1Q 12-bit VID field"
+        );
+    }
+
+    #[test]
+    fn encode_with_vlan_inserts_tpid_tci_and_inner_ether_type() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([2, 0, 0, 0, 0, 1]);
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits in 12 bits");
+        let payload = [0xAAu8, 0xBB];
+
+        // Act
+        let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+            destination,
+            source,
+            Some(vlan_identifier),
+            ETHERNET_PROTOCOL_ARP,
+            &payload,
+        );
+
+        // Assert
+        assert_eq!(
+            frame.len(),
+            ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH + payload.len(),
+            "tagged encoder must not add padding"
+        );
+        assert_eq!(&frame[12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(&frame[14..16], &10u16.to_be_bytes());
+        assert_eq!(&frame[16..18], &ETHERNET_PROTOCOL_ARP.to_be_bytes());
+        assert_eq!(&frame[18..], payload.as_slice());
+        let parsed = try_parse_ethernet_frame(&frame).expect("tagged encoding should parse");
+        assert_eq!(parsed.vlan_identifier, Some(10));
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.payload, payload.as_slice());
+    }
 
     #[test]
     fn encode_produces_exact_header_plus_payload_length() {

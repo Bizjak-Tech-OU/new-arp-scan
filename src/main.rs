@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::CommandFactory;
 use clap::Parser;
 
+use new_arp_scan::Ieee8021qVlanIdentifier;
 use new_arp_scan::application_command::ApplicationCommand;
 use new_arp_scan::cli::{CliRoot, CliSubcommand};
 use new_arp_scan::mac_vendor_registry::MacVendorRegistry;
@@ -38,6 +39,11 @@ fn main() {
                     attempts: std::num::NonZeroU64::new(scan.attempts).expect(
                         "clap should reject zero attempts before reaching the application run path",
                     ),
+                    vlan_identifier: scan.vlan_identifier.map(|vlan_identifier| {
+                        Ieee8021qVlanIdentifier::new(vlan_identifier).expect(
+                            "clap should reject VLAN identifiers above 4095 before reaching the application run path",
+                        )
+                    }),
                 }) {
                     Ok(outcome) => {
                         let mut standard_output = std::io::stdout().lock();

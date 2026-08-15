@@ -19,6 +19,9 @@ EXAMPLES:
   Annotate MAC addresses with IEEE MA-L / MA-M / MA-S vendor names:
     new-arp-scan scan --interface eth0 --mac-vendor-file ieee-oui.txt
 
+  Send IEEE 802.1Q tagged ARP requests on VLAN 10:
+    new-arp-scan scan --interface eth0 --vlan 10
+
   Scan using automatic interface selection when exactly one usable interface exists:
     new-arp-scan scan
 
@@ -65,6 +68,15 @@ pub struct ScanArguments {
     /// current directory is used if that file exists; otherwise host lines stay `<IPv4> <MAC>`.
     #[arg(long = "mac-vendor-file", value_name = "PATH")]
     pub mac_vendor_file: Option<std::path::PathBuf>,
+    /// IEEE 802.1Q VLAN identifier (`0..=4095`). When set, each request is an Ethernet II ARP
+    /// frame with a single customer tag (TPID `0x8100`, PCP and DEI zero). When omitted, requests
+    /// are untagged.
+    #[arg(
+        long = "vlan",
+        value_name = "VID",
+        value_parser = clap::value_parser!(u16).range(0..=4095)
+    )]
+    pub vlan_identifier: Option<u16>,
     /// Milliseconds to wait for address resolution replies after the last request is sent.
     #[arg(
         long = "timeout-ms",
@@ -877,5 +889,121 @@ mod tests {
                 panic!("expected scan subcommand, got interfaces");
             }
         }
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_vlan_identifier() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--vlan",
+            "10",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.vlan_identifier,
+                    Some(10),
+                    "--vlan should populate the 12-bit VLAN identifier"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_vlan_identifier_is_none() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--interface", "eth0"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        let subcommand = parsed.subcommand.expect("subcommand should be present");
+        match subcommand {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(
+                    scan.vlan_identifier.is_none(),
+                    "omitted --vlan should yield None"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_vlan_identifier_zero_and_4095() {
+        // Arrange
+        let zero = ["new-arp-scan", "scan", "--vlan", "0"];
+        let maximum = ["new-arp-scan", "scan", "--vlan", "4095"];
+
+        // Act
+        let parsed_zero = CliRoot::try_parse_from(zero);
+        let parsed_maximum = CliRoot::try_parse_from(maximum);
+
+        // Assert
+        match parsed_zero
+            .expect("VID 0 should parse")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.vlan_identifier,
+                    Some(0),
+                    "null VID 0 should be accepted"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+        match parsed_maximum
+            .expect("VID 4095 should parse")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(
+                    scan.vlan_identifier,
+                    Some(4095),
+                    "12-bit maximum VID should be accepted"
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_vlan_identifier_exceeds_twelve_bits() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--vlan", "4096"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "VLAN identifier 4096 is outside the IEEE 802.1Q 12-bit field, got: {outcome:?}"
+        );
     }
 }

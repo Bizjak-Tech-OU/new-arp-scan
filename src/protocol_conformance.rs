@@ -6,12 +6,13 @@ use crate::address_resolution_protocol::{
     MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE,
     build_address_resolution_announcement_ethernet_frame,
     build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
+    build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
     try_parse_address_resolution_reply_ipv4_over_ethernet,
 };
 use crate::ethernet_frame::{
     ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG, EthernetFraming,
-    IEEE_8023_MAXIMUM_LENGTH, MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame,
-    try_parse_ethernet_frame,
+    IEEE_8023_MAXIMUM_LENGTH, Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE,
+    encode_ethernet_ii_frame, try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
 use crate::mac_vendor_registry::MacVendorRegistry;
@@ -156,6 +157,38 @@ fn ieee_8021q_vid_is_the_low_twelve_tci_bits() {
     assert_eq!(parsed.vlan_identifier, Some(0x044));
     assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
     assert_eq!(parsed.payload, &[0x99]);
+}
+
+#[test]
+fn ieee_8021q_tagged_request_round_trips_through_parser() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+    let target_ip = Ipv4Addr::new(192, 168, 1, 2);
+    let vlan_identifier = Ieee8021qVlanIdentifier::new(100).expect("VID 100 fits in 12 bits");
+
+    // Act
+    let frame = build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag(
+        source_mac,
+        source_ip,
+        target_ip,
+        Some(vlan_identifier),
+    );
+    let parsed = try_parse_ethernet_frame(&frame).expect("tagged request should parse");
+
+    // Assert
+    assert_eq!(parsed.vlan_identifier, Some(100));
+    assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+    assert_eq!(parsed.framing, EthernetFraming::EthernetIi);
+    assert_eq!(
+        &parsed.payload[24..28],
+        &target_ip.octets(),
+        "RFC 826 target protocol address should follow the 802.1Q header"
+    );
+    assert_eq!(
+        frame.len(),
+        MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE
+    );
 }
 
 #[test]

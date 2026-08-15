@@ -5,6 +5,12 @@ pub const SOCKET_ADDRESS_FAMILY_PACKET: libc::c_ushort = 17;
 /// Ethernet protocol identifier for ARP (`ETH_P_ARP` in `linux/if_ether.h`).
 pub const ETHERNET_PROTOCOL_ARP: u16 = 0x0806;
 
+/// Packet-socket protocol that delivers every Ethernet type (`ETH_P_ALL` in `linux/if_ether.h`).
+///
+/// Used when transmitting IEEE 802.1Q-tagged ARP so replies can arrive tagged (`0x8100`) or with
+/// the tag stripped by the NIC or bridge.
+pub const ETHERNET_PROTOCOL_ALL: u16 = 0x0003;
+
 /// `IFF_UP` from `linux/if.h` (interface is administratively up).
 pub const INTERFACE_FLAG_UP: i32 = 0x0001;
 
@@ -64,8 +70,9 @@ pub fn ethernet_protocol_host_to_network_order(
 mod tests {
     use super::SockAddressLinkLayer;
     use super::{
-        ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
-        SOCKET_ADDRESS_FAMILY_PACKET, ethernet_protocol_host_to_network_order,
+        ETHERNET_PROTOCOL_ALL, ETHERNET_PROTOCOL_ARP, INTERFACE_FLAG_LOOPBACK,
+        INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP, SOCKET_ADDRESS_FAMILY_PACKET,
+        ethernet_protocol_host_to_network_order,
     };
     use crate::address_resolution_protocol::{
         ARP_HARDWARE_TYPE_ETHERNET, ARP_OPERATION_REPLY, ARP_OPERATION_REQUEST,
@@ -152,6 +159,18 @@ mod tests {
             libc::c_int::from(ETHERNET_PROTOCOL_ARP),
             libc::ETH_P_ARP,
             "ETHERNET_PROTOCOL_ARP should match libc::ETH_P_ARP"
+        );
+    }
+
+    #[test]
+    fn ethernet_protocol_all_matches_libc() {
+        // Arrange
+        // Act
+        // Assert
+        assert_eq!(
+            libc::c_int::from(ETHERNET_PROTOCOL_ALL),
+            libc::ETH_P_ALL,
+            "ETHERNET_PROTOCOL_ALL should match libc::ETH_P_ALL"
         );
     }
 

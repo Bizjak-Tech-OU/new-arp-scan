@@ -8,8 +8,8 @@
 use std::net::Ipv4Addr;
 
 use crate::ethernet_frame::{
-    ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, encode_ethernet_ii_frame,
-    try_parse_ethernet_frame,
+    ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, Ieee8021qVlanIdentifier,
+    encode_ethernet_ii_frame_with_optional_ieee_8021q_tag, try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
 
@@ -119,12 +119,41 @@ pub fn build_address_resolution_request_ethernet_frame(
     source_ipv4_address: Ipv4Addr,
     target_ipv4_address: Ipv4Addr,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
+    build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag(
+        source_mac_address,
+        source_ipv4_address,
+        target_ipv4_address,
+        None,
+    )
+}
+
+/// Builds a minimum-length Ethernet frame carrying an IPv4 ARP request, with an optional IEEE
+/// 802.1Q tag.
+///
+/// When `vlan_identifier` is [`None`], this matches
+/// [`build_address_resolution_request_ethernet_frame`]. When it is [`Some`], the Ethernet header
+/// is destination, source, TPID `0x8100`, TCI (VID only), inner `EtherType` `0x0806`, then the
+/// RFC 826 ARP payload. The buffer is still zero-padded to
+/// [`MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE`] (IEEE 802.3 / 802.3ac minimum
+/// without the frame check sequence, matching original `arp-scan` `ETH_ZLEN` padding).
+///
+/// # Panics
+///
+/// This function does not panic.
+#[must_use]
+pub fn build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag(
+    source_mac_address: MacAddress,
+    source_ipv4_address: Ipv4Addr,
+    target_ipv4_address: Ipv4Addr,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
     build_address_resolution_ethernet_frame(
         source_mac_address,
         source_ipv4_address,
         MacAddress::ZERO,
         target_ipv4_address,
         ARP_OPERATION_REQUEST,
+        vlan_identifier,
     )
 }
 
@@ -160,6 +189,7 @@ pub fn build_address_resolution_probe_ethernet_frame(
         MacAddress::ZERO,
         target_ipv4_address,
         ARP_OPERATION_REQUEST,
+        None,
     )
 }
 
@@ -195,6 +225,7 @@ pub fn build_address_resolution_announcement_ethernet_frame(
         MacAddress::ZERO,
         claimed_ipv4_address,
         ARP_OPERATION_REQUEST,
+        None,
     )
 }
 
@@ -204,6 +235,7 @@ fn build_address_resolution_ethernet_frame(
     target_mac_address: MacAddress,
     target_ipv4_address: Ipv4Addr,
     opcode: u16,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
     let mut address_resolution_payload = [0u8; ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
     address_resolution_payload[ARP_HARDWARE_TYPE_OFFSET..ARP_HARDWARE_TYPE_OFFSET + 2]
@@ -223,9 +255,10 @@ fn build_address_resolution_ethernet_frame(
     address_resolution_payload[ARP_TARGET_PROTOCOL_OFFSET..ARP_TARGET_PROTOCOL_OFFSET + 4]
         .copy_from_slice(&target_ipv4_address.octets());
 
-    let ethernet_body = encode_ethernet_ii_frame(
+    let ethernet_body = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
         MacAddress::BROADCAST,
         source_mac_address,
+        vlan_identifier,
         ETHERNET_PROTOCOL_ARP,
         &address_resolution_payload,
     );
@@ -324,9 +357,12 @@ mod tests {
     use super::build_address_resolution_announcement_ethernet_frame;
     use super::build_address_resolution_probe_ethernet_frame;
     use super::build_address_resolution_request_ethernet_frame;
+    use super::build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag;
     use super::try_parse_address_resolution_reply_ipv4_over_ethernet;
     use crate::ethernet_frame::ETHERNET_II_HEADER_LENGTH;
     use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
+    use crate::ethernet_frame::IEEE_8021Q_TAG_LENGTH;
+    use crate::ethernet_frame::Ieee8021qVlanIdentifier;
     use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
 
@@ -364,6 +400,54 @@ mod tests {
             frame.len(),
             MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE,
             "frame should meet minimum Ethernet size"
+        );
+    }
+
+    #[test]
+    fn built_request_with_ieee_8021q_tag_places_arp_after_tpid_and_tci() {
+        // Arrange
+        let source_mac = MacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 2);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(42).expect("VID 42 fits in 12 bits");
+
+        // Act
+        let frame = build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag(
+            source_mac,
+            source_ip,
+            target_ip,
+            Some(vlan_identifier),
+        );
+
+        // Assert
+        assert_eq!(&frame[12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(&frame[14..16], &42u16.to_be_bytes());
+        assert_eq!(
+            &frame[16..18],
+            &[0x08, 0x06],
+            "inner EtherType should be ARP"
+        );
+        let arp_start = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
+        assert_eq!(
+            u16::from_be_bytes([frame[arp_start], frame[arp_start + 1]]),
+            1,
+            "hardware type should be Ethernet"
+        );
+        assert_eq!(
+            &frame[arp_start + 24..arp_start + 28],
+            &target_ip.octets(),
+            "target protocol address should follow the tagged header"
+        );
+        assert_eq!(
+            frame.len(),
+            MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE,
+            "tagged request should still pad to the 60-octet minimum without FCS"
+        );
+        assert!(
+            frame[arp_start + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH..]
+                .iter()
+                .all(|octet| *octet == 0),
+            "octets after the ARP payload should be zero padding"
         );
     }
 

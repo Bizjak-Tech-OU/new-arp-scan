@@ -4,6 +4,8 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use crate::ethernet_frame::Ieee8021qVlanIdentifier;
+
 /// Default global receive window after the last address resolution request is sent.
 pub const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -29,6 +31,9 @@ pub enum ApplicationCommand {
         pacing: Duration,
         /// Total request rounds: each round sends one broadcast request per target.
         attempts: NonZeroU64,
+        /// When set, transmit a single IEEE 802.1Q tag with this VLAN identifier (PCP and DEI
+        /// zero). Omitted scans stay untagged Ethernet II.
+        vlan_identifier: Option<Ieee8021qVlanIdentifier>,
     },
     /// List interfaces that are usable for ARP scanning on Linux.
     UsableInterfacesList,
@@ -39,6 +44,7 @@ mod tests {
     use super::{
         ApplicationCommand, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING, DEFAULT_SCAN_TIMEOUT,
     };
+    use crate::ethernet_frame::Ieee8021qVlanIdentifier;
     use std::num::NonZeroU64;
     use std::time::Duration;
 
@@ -93,6 +99,7 @@ mod tests {
             timeout: Duration::from_millis(500),
             pacing: Duration::from_millis(1),
             attempts: NonZeroU64::new(2).expect("two is non-zero"),
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -100,6 +107,7 @@ mod tests {
             timeout: Duration::from_millis(500),
             pacing: Duration::from_millis(1),
             attempts: NonZeroU64::new(2).expect("two is non-zero"),
+            vlan_identifier: None,
         };
 
         // Act
@@ -121,6 +129,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             pacing: Duration::ZERO,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -128,6 +137,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             pacing: Duration::ZERO,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -149,6 +159,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: Duration::from_millis(1),
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -156,6 +167,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: Duration::from_millis(2),
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -177,6 +189,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth1".to_string()),
@@ -184,6 +197,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -205,6 +219,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let explicit = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -212,6 +227,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -233,6 +249,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(1).expect("one is non-zero"),
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -240,6 +257,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: NonZeroU64::new(3).expect("three is non-zero"),
+            vlan_identifier: None,
         };
 
         // Act
@@ -263,6 +281,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let single_target = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -270,6 +289,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -293,6 +313,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -300,6 +321,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -323,6 +345,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
         let second = ApplicationCommand::Scan {
             interface_name: Some("eth0".to_string()),
@@ -330,6 +353,7 @@ mod tests {
             timeout: DEFAULT_SCAN_TIMEOUT,
             pacing: DEFAULT_SCAN_PACING,
             attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
         };
 
         // Act
@@ -339,6 +363,36 @@ mod tests {
         assert!(
             !equal,
             "scan commands with different Some targets must not compare equal"
+        );
+    }
+
+    #[test]
+    fn scan_command_variants_compare_unequal_when_vlan_identifier_differs() {
+        // Arrange
+        let untagged = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: None,
+        };
+        let tagged = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+        };
+
+        // Act
+        let equal = untagged == tagged;
+
+        // Assert
+        assert!(
+            !equal,
+            "scan commands with different VLAN identifiers must not compare equal"
         );
     }
 }

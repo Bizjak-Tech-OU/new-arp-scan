@@ -13,11 +13,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::address_resolution_protocol::{
-    build_address_resolution_request_ethernet_frame,
+    build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
     try_parse_address_resolution_reply_ipv4_over_ethernet,
 };
 use crate::application_outcome::{DiscoveredHost, ScanOutcome};
 use crate::error::AppError;
+use crate::ethernet_frame::{
+    ETHERNET_PROTOCOL_ARP, Ieee8021qVlanIdentifier, try_parse_ethernet_frame,
+};
 use crate::ipv4_cidr::Ipv4HostAddressIterator;
 use crate::ipv4_subnet::ipv4_address_is_strictly_inside_subnet;
 use crate::link_layer_backend::{InterfaceScanAddresses, LinkLayerEndpoint};
@@ -148,13 +151,13 @@ impl ArpReplyAcceptance {
 fn run_address_resolution_request_rounds(
     endpoint: &impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
-    source_identity: (MacAddress, Ipv4Addr),
+    source_identity: (MacAddress, Ipv4Addr, Option<Ieee8021qVlanIdentifier>),
     scan_round_count: NonZeroU64,
     pacing_between_scan_rounds: Duration,
     warnings: &mut Vec<String>,
 ) {
     let total_rounds = scan_round_count.get();
-    let (source_mac_address, source_ipv4_address) = source_identity;
+    let (source_mac_address, source_ipv4_address, vlan_identifier) = source_identity;
     for round_index in 0..total_rounds {
         for target_ipv4_address in target_ipv4_addresses {
             send_one_address_resolution_request(
@@ -162,6 +165,7 @@ fn run_address_resolution_request_rounds(
                 source_mac_address,
                 source_ipv4_address,
                 *target_ipv4_address,
+                vlan_identifier,
                 warnings,
             );
         }
@@ -180,12 +184,14 @@ fn send_one_address_resolution_request(
     source_mac_address: MacAddress,
     source_ipv4_address: Ipv4Addr,
     target_ipv4_address: Ipv4Addr,
+    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
     warnings: &mut Vec<String>,
 ) {
-    let frame = build_address_resolution_request_ethernet_frame(
+    let frame = build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag(
         source_mac_address,
         source_ipv4_address,
         target_ipv4_address,
+        vlan_identifier,
     );
     if let Err(source) = endpoint.send_ethernet_frame(frame.as_ref()) {
         warnings.push(format!(
@@ -228,6 +234,9 @@ fn drain_buffered_reply_frames(
 ) -> Result<(), AppError> {
     while let Some(bytes_received) = endpoint.try_receive_ethernet_frame(receive_buffer)? {
         let frame_slice = &receive_buffer[..bytes_received];
+        if ethernet_frame_is_not_address_resolution_protocol(frame_slice) {
+            continue;
+        }
         match try_parse_address_resolution_reply_ipv4_over_ethernet(frame_slice) {
             Ok((sender_ipv4_address, sender_mac_address)) => {
                 if reply_acceptance.accepts_sender_ipv4_address(sender_ipv4_address) {
@@ -246,6 +255,16 @@ fn drain_buffered_reply_frames(
     }
 
     Ok(())
+}
+
+/// Returns whether `frame_slice` is Ethernet that is not IPv4 ARP (including frames that cannot be
+/// parsed as Ethernet). Those arrivals are expected when the capture socket is bound to every
+/// protocol, and they are not operator-facing malformation warnings.
+fn ethernet_frame_is_not_address_resolution_protocol(frame_slice: &[u8]) -> bool {
+    match try_parse_ethernet_frame(frame_slice) {
+        Ok(parsed) => parsed.ether_type != ETHERNET_PROTOCOL_ARP,
+        Err(_) => true,
+    }
 }
 
 /// The ordered target list and reply-acceptance rule for a full-subnet scan.
@@ -301,7 +320,7 @@ pub(crate) fn full_subnet_scan_plan(
 /// Sends the request rounds and collects replies on an already-open `endpoint`, returning the
 /// discovered hosts and any warnings.
 ///
-/// `source_identity` is the `(MAC, IPv4)` of the scanning interface. `acceptance` decides which
+/// `source_identity` is the `(MAC, IPv4, optional IEEE 802.1Q VID)` of the scanning interface. `acceptance` decides which
 /// reply senders are recorded (full subnet versus a single probed target). The timing parameters
 /// match the public scan contract: `receive_timeout_after_last_request` bounds the receive phase
 /// after the final round, `pacing_between_scan_rounds` sleeps after each round except the last, and
@@ -317,7 +336,7 @@ pub(crate) fn full_subnet_scan_plan(
 pub(crate) fn collect_scan_over_endpoint(
     endpoint: &mut impl LinkLayerEndpoint,
     target_ipv4_addresses: &[Ipv4Addr],
-    source_identity: (MacAddress, Ipv4Addr),
+    source_identity: (MacAddress, Ipv4Addr, Option<Ieee8021qVlanIdentifier>),
     acceptance: &ArpReplyAcceptance,
     receive_timeout_after_last_request: Duration,
     pacing_between_scan_rounds: Duration,
@@ -1098,6 +1117,138 @@ mod arp_reply_acceptance_tests {
         assert!(
             !outcome,
             "off-subnet sender should be rejected in subnet scope unless it equals the interface address"
+        );
+    }
+}
+
+#[cfg(test)]
+mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
+    use super::ArpReplyAcceptance;
+    use super::collect_scan_over_endpoint;
+    use crate::error::AppError;
+    use crate::ethernet_frame::{
+        ETHERNET_PROTOCOL_IPV4, ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qVlanIdentifier,
+        encode_ethernet_ii_frame,
+    };
+    use crate::link_layer_backend::LinkLayerEndpoint;
+    use crate::mac_address::MacAddress;
+    use std::cell::RefCell;
+    use std::net::Ipv4Addr;
+    use std::num::NonZeroU64;
+    use std::time::Duration;
+
+    struct ScriptedEndpoint {
+        sent: RefCell<Vec<Vec<u8>>>,
+        inbound: Vec<Vec<u8>>,
+    }
+
+    impl LinkLayerEndpoint for ScriptedEndpoint {
+        fn send_ethernet_frame(&self, frame: &[u8]) -> std::io::Result<()> {
+            self.sent.borrow_mut().push(frame.to_vec());
+            Ok(())
+        }
+
+        fn wait_until_readable(
+            &self,
+            _timeout_milliseconds: libc::c_int,
+        ) -> Result<bool, AppError> {
+            Ok(!self.inbound.is_empty())
+        }
+
+        fn try_receive_ethernet_frame(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> Result<Option<usize>, AppError> {
+            if self.inbound.is_empty() {
+                return Ok(None);
+            }
+            let frame = self.inbound.remove(0);
+            buffer[..frame.len()].copy_from_slice(&frame);
+            Ok(Some(frame.len()))
+        }
+    }
+
+    #[test]
+    fn sends_ieee_8021q_tagged_request_when_vlan_identifier_is_set() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits in 12 bits");
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            (source_mac, source_ip, Some(vlan_identifier)),
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(sent.len(), 1, "one target and one round should send once");
+        assert_eq!(&sent[0][12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(&sent[0][14..16], &10u16.to_be_bytes());
+        assert_eq!(&sent[0][16..18], &[0x08, 0x06]);
+        assert!(
+            outcome.warnings.is_empty(),
+            "successful tagged send should not warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_non_arp_ethernet_frames_without_malformed_warning() {
+        // Arrange
+        let ipv4_frame = encode_ethernet_ii_frame(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+            ETHERNET_PROTOCOL_IPV4,
+            &[0x45, 0x00],
+        );
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![ipv4_frame],
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            (source_mac, source_ip, None),
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "IPv4 frames must not be recorded as ARP replies"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "non-ARP capture noise should not produce malformed-frame warnings, got: {:?}",
+            outcome.warnings
         );
     }
 }

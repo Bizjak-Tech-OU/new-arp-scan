@@ -12,7 +12,7 @@ macOS has no `AF_PACKET`. To send and receive raw **Ethernet II frames** carryin
 
 - Open a cloning **`/dev/bpf*`** device (the tool tries successive minor devices, skipping busy ones).
 - Attach it to the interface with **`BIOCSETIF`**, then read and write complete link-layer frames.
-- Install a **filter program** (`BIOCSETF`) so untagged ARP (`EtherType 0x0806`) and IEEE 802.1Q-tagged ARP (`0x8100` then inner `0x0806`) frames are delivered, and disable **`BIOCSSEESENT`** so the device does not echo back the requests the tool broadcasts. Together these match the effect of a Linux packet socket bound to `ETH_P_ARP`, plus tagged ARP that would otherwise be dropped at offset 12.
+- Install a **filter program** (`BIOCSETF`) so untagged ARP (`EtherType 0x0806`) and IEEE 802.1Q-tagged ARP (`0x8100` then inner `0x0806`) frames are delivered, and disable **`BIOCSSEESENT`** so the device does not echo back the requests the tool broadcasts. Together these match the effect of a Linux packet socket bound to `ETH_P_ARP`, plus tagged ARP that would otherwise be dropped at offset 12. When **`--vlan`** is set, transmitted frames include a single IEEE 802.1Q tag; receive filtering is unchanged.
 - Enable **`BIOCIMMEDIATE`** for prompt delivery and **`BIOCSHDRCMPLT`** so the source hardware address written by the encoder is preserved.
 
 Interface enumeration uses **`getifaddrs(3)`** (rather than Linux `ioctl`), aggregating the `AF_INET` address/netmask and the `AF_LINK` Ethernet address per interface. The pure ARP/Ethernet framing and the scan scheduling are shared with Linux through the portable link-layer backend (see [architecture](./architecture.md) and `DECISIONS.md`, 2026-06-03).
