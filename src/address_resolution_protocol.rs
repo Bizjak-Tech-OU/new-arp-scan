@@ -8,7 +8,8 @@
 use std::net::Ipv4Addr;
 
 use crate::ethernet_frame::{
-    ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, Ieee8021qVlanIdentifier,
+    ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, IEEE_8023_LLC_SNAP_HEADER_LENGTH,
+    IEEE_8023_MAXIMUM_LENGTH, Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier,
     encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
     encode_ieee_8023_rfc_1042_llc_snap_frame, try_parse_ethernet_frame,
 };
@@ -77,15 +78,18 @@ pub const MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE: usize = 60
 /// IEEE 802.3 MAC client data minimum (46 octets) that ARP's 28-byte payload must be padded to.
 pub const MINIMUM_ETHERNET_MAC_CLIENT_DATA_LENGTH: usize = 46;
 
+/// Empty custom payload padding used by RFC 826 default request builders.
+const EMPTY_ETHERNET_PADDING: &[u8] = &[];
+
 /// Fully resolved Ethernet and RFC 826 fields for one transmitted ARP request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AddressResolutionRequestLayout {
+pub(crate) struct AddressResolutionRequestLayout<'a> {
     /// Ethernet destination (broadcast unless `--destaddr` overrides it).
     pub ethernet_destination: MacAddress,
     /// Ethernet source (`--srcaddr`, defaulting to the interface MAC).
     pub ethernet_source: MacAddress,
-    /// Optional IEEE 802.1Q customer tag.
-    pub vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    /// Optional IEEE 802.1Q customer tag (PCP, DEI, and VID).
+    pub vlan_tag: Option<Ieee8021qTagControlInformation>,
     /// RFC 1042 LLC/SNAP instead of Ethernet II.
     pub llc_snap: bool,
     /// RFC 826 `ar$hrd`.
@@ -106,9 +110,12 @@ pub(crate) struct AddressResolutionRequestLayout {
     pub target_hardware: MacAddress,
     /// RFC 826 `ar$tpa`.
     pub target_protocol: Ipv4Addr,
+    /// Octets appended after the 28-octet ARP PDU (`--padding`). Not the IEEE 802.3 minimum-frame
+    /// zero pad.
+    pub padding: &'a [u8],
 }
 
-impl AddressResolutionRequestLayout {
+impl AddressResolutionRequestLayout<'static> {
     /// RFC 826 Ethernet II request: broadcast destination, interface MAC as Ethernet source and
     /// `ar$sha`, zero `ar$tha`, request opcode, Ethernet/IPv4 type lengths.
     #[must_use]
@@ -120,7 +127,7 @@ impl AddressResolutionRequestLayout {
         Self {
             ethernet_destination: MacAddress::BROADCAST,
             ethernet_source: interface_mac_address,
-            vlan_identifier: None,
+            vlan_tag: None,
             llc_snap: false,
             hardware_type: ARP_HARDWARE_TYPE_ETHERNET,
             protocol_type: ETHERNET_PROTOCOL_IPV4,
@@ -131,6 +138,7 @@ impl AddressResolutionRequestLayout {
             sender_protocol: source_ipv4_address,
             target_hardware: MacAddress::ZERO,
             target_protocol: target_ipv4_address,
+            padding: EMPTY_ETHERNET_PADDING,
         }
     }
 }
@@ -240,9 +248,9 @@ pub fn build_address_resolution_request_ethernet_frame_with_wire_options(
         source_ipv4_address,
         target_ipv4_address,
     );
-    layout.vlan_identifier = vlan_identifier;
+    layout.vlan_tag = vlan_identifier.map(Ieee8021qTagControlInformation::from);
     layout.llc_snap = llc_snap;
-    encode_address_resolution_request_from_layout(layout)
+    copy_into_minimum_ethernet_frame(&encode_address_resolution_request_from_layout(layout))
 }
 
 /// Builds an RFC 5227 ARP Probe: an ARP request with an all-zero sender IPv4 address.
@@ -271,13 +279,13 @@ pub fn build_address_resolution_probe_ethernet_frame(
     source_mac_address: MacAddress,
     target_ipv4_address: Ipv4Addr,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
-    encode_address_resolution_request_from_layout(
+    copy_into_minimum_ethernet_frame(&encode_address_resolution_request_from_layout(
         AddressResolutionRequestLayout::rfc_826_ethernet_ii(
             source_mac_address,
             Ipv4Addr::UNSPECIFIED,
             target_ipv4_address,
         ),
-    )
+    ))
 }
 
 /// Builds an RFC 5227 ARP Announcement: an ARP request whose sender and target IPv4 addresses are
@@ -306,48 +314,57 @@ pub fn build_address_resolution_announcement_ethernet_frame(
     source_mac_address: MacAddress,
     claimed_ipv4_address: Ipv4Addr,
 ) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
-    encode_address_resolution_request_from_layout(
+    copy_into_minimum_ethernet_frame(&encode_address_resolution_request_from_layout(
         AddressResolutionRequestLayout::rfc_826_ethernet_ii(
             source_mac_address,
             claimed_ipv4_address,
             claimed_ipv4_address,
         ),
-    )
+    ))
 }
 
-/// Encodes one ARP request from already-resolved Ethernet and RFC 826 fields, zero-padded to the
-/// IEEE 802.3 60-octet minimum without the frame check sequence.
+/// Encodes one ARP request from already-resolved Ethernet and RFC 826 fields.
+///
+/// Custom [`AddressResolutionRequestLayout::padding`] is appended after the 28-octet ARP PDU. The
+/// frame is then zero-padded to
+/// [`MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE`] when shorter. IEEE 802.3 SNAP
+/// length fields include LLC, SNAP, ARP, and custom padding, but not the minimum-frame zero pad.
 ///
 /// # Panics
 ///
 /// This function does not panic.
 #[must_use]
 pub(crate) fn encode_address_resolution_request_from_layout(
-    layout: AddressResolutionRequestLayout,
-) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
-    let mut address_resolution_payload = [0u8; ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
-    address_resolution_payload[ARP_HARDWARE_TYPE_OFFSET..ARP_HARDWARE_TYPE_OFFSET + 2]
+    layout: AddressResolutionRequestLayout<'_>,
+) -> Vec<u8> {
+    let mut address_resolution_header = [0u8; ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
+    address_resolution_header[ARP_HARDWARE_TYPE_OFFSET..ARP_HARDWARE_TYPE_OFFSET + 2]
         .copy_from_slice(&layout.hardware_type.to_be_bytes());
-    address_resolution_payload[ARP_PROTOCOL_TYPE_OFFSET..ARP_PROTOCOL_TYPE_OFFSET + 2]
+    address_resolution_header[ARP_PROTOCOL_TYPE_OFFSET..ARP_PROTOCOL_TYPE_OFFSET + 2]
         .copy_from_slice(&layout.protocol_type.to_be_bytes());
-    address_resolution_payload[ARP_HARDWARE_LENGTH_OFFSET] = layout.hardware_length;
-    address_resolution_payload[ARP_PROTOCOL_LENGTH_OFFSET] = layout.protocol_length;
-    address_resolution_payload[ARP_OPCODE_OFFSET..ARP_OPCODE_OFFSET + 2]
+    address_resolution_header[ARP_HARDWARE_LENGTH_OFFSET] = layout.hardware_length;
+    address_resolution_header[ARP_PROTOCOL_LENGTH_OFFSET] = layout.protocol_length;
+    address_resolution_header[ARP_OPCODE_OFFSET..ARP_OPCODE_OFFSET + 2]
         .copy_from_slice(&layout.opcode.to_be_bytes());
-    address_resolution_payload[ARP_SENDER_HARDWARE_OFFSET..ARP_SENDER_HARDWARE_OFFSET + 6]
+    address_resolution_header[ARP_SENDER_HARDWARE_OFFSET..ARP_SENDER_HARDWARE_OFFSET + 6]
         .copy_from_slice(&layout.sender_hardware.octets());
-    address_resolution_payload[ARP_SENDER_PROTOCOL_OFFSET..ARP_SENDER_PROTOCOL_OFFSET + 4]
+    address_resolution_header[ARP_SENDER_PROTOCOL_OFFSET..ARP_SENDER_PROTOCOL_OFFSET + 4]
         .copy_from_slice(&layout.sender_protocol.octets());
-    address_resolution_payload[ARP_TARGET_HARDWARE_OFFSET..ARP_TARGET_HARDWARE_OFFSET + 6]
+    address_resolution_header[ARP_TARGET_HARDWARE_OFFSET..ARP_TARGET_HARDWARE_OFFSET + 6]
         .copy_from_slice(&layout.target_hardware.octets());
-    address_resolution_payload[ARP_TARGET_PROTOCOL_OFFSET..ARP_TARGET_PROTOCOL_OFFSET + 4]
+    address_resolution_header[ARP_TARGET_PROTOCOL_OFFSET..ARP_TARGET_PROTOCOL_OFFSET + 4]
         .copy_from_slice(&layout.target_protocol.octets());
+    let mut address_resolution_payload = Vec::with_capacity(
+        ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH.saturating_add(layout.padding.len()),
+    );
+    address_resolution_payload.extend_from_slice(&address_resolution_header);
+    address_resolution_payload.extend_from_slice(layout.padding);
 
-    let ethernet_body = if layout.llc_snap {
+    let mut ethernet_body = if layout.llc_snap {
         encode_ieee_8023_rfc_1042_llc_snap_frame(
             layout.ethernet_destination,
             layout.ethernet_source,
-            layout.vlan_identifier,
+            layout.vlan_tag,
             ETHERNET_PROTOCOL_ARP,
             &address_resolution_payload,
         )
@@ -355,17 +372,41 @@ pub(crate) fn encode_address_resolution_request_from_layout(
         encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
             layout.ethernet_destination,
             layout.ethernet_source,
-            layout.vlan_identifier,
+            layout.vlan_tag,
             ETHERNET_PROTOCOL_ARP,
             &address_resolution_payload,
         )
     };
 
-    let mut frame = [0u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE];
-    let copy_length = ethernet_body.len();
-    frame[..copy_length].copy_from_slice(&ethernet_body);
+    if ethernet_body.len() < MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE {
+        ethernet_body.resize(
+            MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE,
+            0,
+        );
+    }
+    ethernet_body
+}
 
-    frame
+fn copy_into_minimum_ethernet_frame(
+    frame: &[u8],
+) -> [u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE] {
+    let mut minimum = [0u8; MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE];
+    let copy_length = frame
+        .len()
+        .min(MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE);
+    minimum[..copy_length].copy_from_slice(&frame[..copy_length]);
+    minimum
+}
+
+/// Maximum `--padding` octets that still fit in IEEE 802.3 MAC client data with a 28-octet ARP PDU.
+#[must_use]
+pub(crate) fn maximum_arp_request_padding_octet_count(llc_snap: bool) -> usize {
+    let reserved = if llc_snap {
+        IEEE_8023_LLC_SNAP_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH
+    } else {
+        ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH
+    };
+    usize::from(IEEE_8023_MAXIMUM_LENGTH).saturating_sub(reserved)
 }
 
 /// Parses an IPv4 ARP reply from a raw Ethernet frame buffer.
@@ -462,6 +503,8 @@ mod tests {
     use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
     use crate::ethernet_frame::IEEE_8021Q_TAG_LENGTH;
     use crate::ethernet_frame::IEEE_8023_LLC_SNAP_HEADER_LENGTH;
+    use crate::ethernet_frame::Ieee8021qPriorityCodePoint;
+    use crate::ethernet_frame::Ieee8021qTagControlInformation;
     use crate::ethernet_frame::Ieee8021qVlanIdentifier;
     use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
@@ -625,6 +668,125 @@ mod tests {
         assert_eq!(u16::from_be_bytes([arp[0], arp[1]]), 6);
         assert_eq!(&arp[8..14], &sender_hardware.octets());
         assert_eq!(&arp[18..24], &target_hardware.octets());
+    }
+
+    #[test]
+    fn layout_encode_appends_custom_padding_then_zero_pads_to_minimum_frame() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let mut layout = super::AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            interface_mac,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+        );
+        let custom_padding = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        layout.padding = &custom_padding;
+
+        // Act
+        let frame = super::encode_address_resolution_request_from_layout(layout);
+
+        // Assert
+        let payload_start =
+            ETHERNET_II_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+        assert_eq!(&frame[payload_start..payload_start + 4], &custom_padding);
+        assert_eq!(
+            frame.len(),
+            MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE,
+            "short custom padding should still zero-pad the frame to 60 octets"
+        );
+        assert!(
+            frame[payload_start + 4..].iter().all(|octet| *octet == 0),
+            "octets after custom padding should be IEEE 802.3 minimum-frame zeroes"
+        );
+    }
+
+    #[test]
+    fn layout_encode_keeps_custom_padding_when_frame_exceeds_minimum() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let mut layout = super::AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            interface_mac,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+        );
+        let custom_padding = [0xAAu8; 20];
+        layout.padding = &custom_padding;
+
+        // Act
+        let frame = super::encode_address_resolution_request_from_layout(layout);
+
+        // Assert
+        let payload_start =
+            ETHERNET_II_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+        assert_eq!(
+            frame.len(),
+            ETHERNET_II_HEADER_LENGTH + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH + 20
+        );
+        assert_eq!(&frame[payload_start..], custom_padding.as_slice());
+    }
+
+    #[test]
+    fn layout_encode_includes_custom_padding_in_rfc_1042_snap_length() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let mut layout = super::AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            interface_mac,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+        );
+        let custom_padding = [0x11u8, 0x22];
+        layout.llc_snap = true;
+        layout.padding = &custom_padding;
+        let expected_length = u16::try_from(
+            IEEE_8023_LLC_SNAP_HEADER_LENGTH
+                + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH
+                + custom_padding.len(),
+        )
+        .expect("SNAP plus ARP plus two padding octets fits in an IEEE 802.3 length");
+
+        // Act
+        let frame = super::encode_address_resolution_request_from_layout(layout);
+
+        // Assert
+        assert_eq!(&frame[12..14], &expected_length.to_be_bytes());
+        let padding_start = ETHERNET_II_HEADER_LENGTH
+            + IEEE_8023_LLC_SNAP_HEADER_LENGTH
+            + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+        assert_eq!(&frame[padding_start..padding_start + 2], &custom_padding);
+        assert_eq!(
+            expected_length, 38,
+            "MAC client data is LLC/SNAP (8) plus ARP (28) plus custom padding (2)"
+        );
+    }
+
+    #[test]
+    fn layout_encode_writes_ieee_8021q_pcp_and_dei_in_tci() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let mut layout = super::AddressResolutionRequestLayout::rfc_826_ethernet_ii(
+            interface_mac,
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+        );
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits");
+        let priority = Ieee8021qPriorityCodePoint::new(5).expect("PCP 5 fits");
+        layout.vlan_tag = Some(Ieee8021qTagControlInformation::new(
+            priority,
+            true,
+            vlan_identifier,
+        ));
+
+        // Act
+        let frame = super::encode_address_resolution_request_from_layout(layout);
+
+        // Assert
+        assert_eq!(&frame[12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(
+            &frame[14..16],
+            &0xB00Au16.to_be_bytes(),
+            "PCP 5, DEI 1, VID 10 encode as TCI 0xB00A"
+        );
+        assert_eq!(&frame[16..18], &[0x08, 0x06]);
     }
 
     #[test]

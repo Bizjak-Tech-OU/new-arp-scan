@@ -48,7 +48,7 @@ pub fn perform_arp_scan(
     let addresses = discover_interface_scan_addresses(interface_name)?;
     let plan = scanner::full_subnet_scan_plan(&addresses)?;
 
-    let mut endpoint = open_linux_link_layer_endpoint(interface_name, wire)?;
+    let mut endpoint = open_linux_link_layer_endpoint(interface_name, &wire)?;
     scanner::collect_scan_over_endpoint(
         &mut endpoint,
         &plan.targets,
@@ -123,7 +123,7 @@ pub fn perform_arp_probe(
         addresses.ipv4_netmask,
     )?;
 
-    let mut endpoint = open_linux_link_layer_endpoint(interface_name, wire)?;
+    let mut endpoint = open_linux_link_layer_endpoint(interface_name, &wire)?;
     let acceptance = ArpReplyAcceptance::ExactTarget {
         target_ipv4_address,
     };

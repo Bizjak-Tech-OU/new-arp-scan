@@ -76,6 +76,96 @@ impl Ieee8021qVlanIdentifier {
     }
 }
 
+/// IEEE 802.1Q Priority Code Point bit shift within the Tag Control Information field.
+pub const IEEE_8021Q_PRIORITY_CODE_POINT_SHIFT: u16 = 13;
+
+/// IEEE 802.1Q Drop Eligible Indicator bit within the Tag Control Information field.
+pub const IEEE_8021Q_DROP_ELIGIBLE_INDICATOR_BIT: u16 = 1 << 12;
+
+/// A 3-bit IEEE 802.1Q Priority Code Point (`0..=7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ieee8021qPriorityCodePoint(u8);
+
+impl Ieee8021qPriorityCodePoint {
+    /// Best-effort / default priority (PCP 0).
+    pub const ZERO: Self = Self(0);
+
+    /// Inclusive maximum 3-bit Priority Code Point.
+    pub const MAXIMUM: u8 = 7;
+
+    /// Returns a Priority Code Point when `priority_code_point` fits in 3 bits.
+    #[must_use]
+    pub const fn new(priority_code_point: u8) -> Option<Self> {
+        if priority_code_point <= Self::MAXIMUM {
+            Some(Self(priority_code_point))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the 3-bit priority in host byte order.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+}
+
+/// Full IEEE 802.1Q Tag Control Information: PCP (3 bits), DEI (1 bit), and VID (12 bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ieee8021qTagControlInformation {
+    /// IEEE 802.1Q Priority Code Point (`0..=7`).
+    pub priority_code_point: Ieee8021qPriorityCodePoint,
+    /// IEEE 802.1Q Drop Eligible Indicator (formerly CFI).
+    pub drop_eligible_indicator: bool,
+    /// IEEE 802.1Q VLAN identifier (`0..=4095`).
+    pub vlan_identifier: Ieee8021qVlanIdentifier,
+}
+
+impl Ieee8021qTagControlInformation {
+    /// Builds Tag Control Information from a VLAN identifier with PCP 0 and DEI 0.
+    #[must_use]
+    pub const fn from_vlan_identifier(vlan_identifier: Ieee8021qVlanIdentifier) -> Self {
+        Self {
+            priority_code_point: Ieee8021qPriorityCodePoint::ZERO,
+            drop_eligible_indicator: false,
+            vlan_identifier,
+        }
+    }
+
+    /// Builds Tag Control Information from PCP, DEI, and VID.
+    #[must_use]
+    pub const fn new(
+        priority_code_point: Ieee8021qPriorityCodePoint,
+        drop_eligible_indicator: bool,
+        vlan_identifier: Ieee8021qVlanIdentifier,
+    ) -> Self {
+        Self {
+            priority_code_point,
+            drop_eligible_indicator,
+            vlan_identifier,
+        }
+    }
+
+    /// Encodes PCP, DEI, and VID as a 16-bit TCI in host byte order.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        let priority =
+            (self.priority_code_point.as_u8() as u16) << IEEE_8021Q_PRIORITY_CODE_POINT_SHIFT;
+        let drop_eligible = if self.drop_eligible_indicator {
+            IEEE_8021Q_DROP_ELIGIBLE_INDICATOR_BIT
+        } else {
+            0
+        };
+        priority | drop_eligible | self.vlan_identifier.as_u16()
+    }
+}
+
+impl From<Ieee8021qVlanIdentifier> for Ieee8021qTagControlInformation {
+    fn from(vlan_identifier: Ieee8021qVlanIdentifier) -> Self {
+        Self::from_vlan_identifier(vlan_identifier)
+    }
+}
+
 /// `EtherType` for IPv4 (`ETH_P_IP`).
 pub const ETHERNET_PROTOCOL_IPV4: u16 = 0x0800;
 
@@ -142,9 +232,9 @@ pub fn encode_ethernet_ii_frame(
 /// Builds an Ethernet II frame, optionally inserting a single IEEE 802.1Q tag after the source
 /// address.
 ///
-/// When `vlan_identifier` is [`None`], this matches [`encode_ethernet_ii_frame`]. When it is
-/// [`Some`], the header is destination, source, TPID `0x8100`, TCI (PCP and DEI zero, VID in the
-/// low 12 bits), inner `EtherType`, then `payload`. No minimum-frame padding is applied.
+/// When `vlan_tag` is [`None`], this matches [`encode_ethernet_ii_frame`]. When it is [`Some`], the
+/// header is destination, source, TPID `0x8100`, the 16-bit TCI (PCP, DEI, and VID), inner
+/// `EtherType`, then `payload`. No minimum-frame padding is applied.
 ///
 /// # Panics
 ///
@@ -153,11 +243,11 @@ pub fn encode_ethernet_ii_frame(
 pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
     destination: MacAddress,
     source: MacAddress,
-    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    vlan_tag: Option<Ieee8021qTagControlInformation>,
     ether_type: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let Some(vlan_identifier) = vlan_identifier else {
+    let Some(vlan_tag) = vlan_tag else {
         return encode_ethernet_ii_frame(destination, source, ether_type, payload);
     };
 
@@ -165,8 +255,7 @@ pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
     let mut frame = Vec::with_capacity(tagged_header_length + payload.len());
     frame.extend_from_slice(&destination.octets());
     frame.extend_from_slice(&source.octets());
-    frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
-    frame.extend_from_slice(&vlan_identifier.as_u16().to_be_bytes());
+    append_ieee_8021q_tag(&mut frame, vlan_tag);
     frame.extend_from_slice(&ether_type.to_be_bytes());
     frame.extend_from_slice(payload);
     frame
@@ -186,13 +275,13 @@ pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
 pub fn encode_ieee_8023_rfc_1042_llc_snap_frame(
     destination: MacAddress,
     source: MacAddress,
-    vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    vlan_tag: Option<Ieee8021qTagControlInformation>,
     ether_type: u16,
     payload: &[u8],
 ) -> Vec<u8> {
     let mac_client_data_length = IEEE_8023_LLC_SNAP_HEADER_LENGTH.saturating_add(payload.len());
     let length_field = u16::try_from(mac_client_data_length).unwrap_or(IEEE_8023_MAXIMUM_LENGTH);
-    let tagged_header_length = match vlan_identifier {
+    let tagged_header_length = match vlan_tag {
         Some(_) => ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH,
         None => ETHERNET_II_HEADER_LENGTH,
     };
@@ -200,9 +289,8 @@ pub fn encode_ieee_8023_rfc_1042_llc_snap_frame(
         Vec::with_capacity(tagged_header_length + IEEE_8023_LLC_SNAP_HEADER_LENGTH + payload.len());
     frame.extend_from_slice(&destination.octets());
     frame.extend_from_slice(&source.octets());
-    if let Some(vlan_identifier) = vlan_identifier {
-        frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
-        frame.extend_from_slice(&vlan_identifier.as_u16().to_be_bytes());
+    if let Some(vlan_tag) = vlan_tag {
+        append_ieee_8021q_tag(&mut frame, vlan_tag);
     }
     frame.extend_from_slice(&length_field.to_be_bytes());
     frame.push(LLC_SNAP_ADDRESS);
@@ -212,6 +300,11 @@ pub fn encode_ieee_8023_rfc_1042_llc_snap_frame(
     frame.extend_from_slice(&ether_type.to_be_bytes());
     frame.extend_from_slice(payload);
     frame
+}
+
+fn append_ieee_8021q_tag(frame: &mut Vec<u8>, vlan_tag: Ieee8021qTagControlInformation) {
+    frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+    frame.extend_from_slice(&vlan_tag.as_u16().to_be_bytes());
 }
 
 /// Parses destination, source, and the payload after Ethernet II, optional IEEE 802.1Q, and
@@ -356,6 +449,8 @@ mod tests {
     use super::IEEE_8021Q_TAG_LENGTH;
     use super::IEEE_8023_LLC_SNAP_HEADER_LENGTH;
     use super::IEEE_8023_MAXIMUM_LENGTH;
+    use super::Ieee8021qPriorityCodePoint;
+    use super::Ieee8021qTagControlInformation;
     use super::Ieee8021qVlanIdentifier;
     use super::MINIMUM_ETHERNET_II_ETHERTYPE;
     use super::encode_ethernet_ii_frame;
@@ -386,6 +481,33 @@ mod tests {
     }
 
     #[test]
+    fn tag_control_information_encodes_pcp_dei_and_vid() {
+        // Arrange
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(0x044).expect("VID fits in 12 bits");
+        let priority = Ieee8021qPriorityCodePoint::new(7).expect("PCP 7 fits in 3 bits");
+        let tag = Ieee8021qTagControlInformation::new(priority, true, vlan_identifier);
+
+        // Act
+        let tci = tag.as_u16();
+        let vid_only =
+            Ieee8021qTagControlInformation::from_vlan_identifier(vlan_identifier).as_u16();
+
+        // Assert
+        assert_eq!(
+            tci, 0xE044,
+            "PCP 7, DEI 1, VID 0x044 should encode as TCI 0xE044"
+        );
+        assert_eq!(
+            vid_only, 0x0044,
+            "VID-only TCI should leave PCP and DEI zero"
+        );
+        assert!(
+            Ieee8021qPriorityCodePoint::new(8).is_none(),
+            "PCP 8 is outside the 3-bit field"
+        );
+    }
+
+    #[test]
     fn encode_with_vlan_inserts_tpid_tci_and_inner_ether_type() {
         // Arrange
         let destination = MacAddress::BROADCAST;
@@ -397,7 +519,9 @@ mod tests {
         let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
             destination,
             source,
-            Some(vlan_identifier),
+            Some(Ieee8021qTagControlInformation::from_vlan_identifier(
+                vlan_identifier,
+            )),
             ETHERNET_PROTOCOL_ARP,
             &payload,
         );
@@ -462,7 +586,9 @@ mod tests {
         let frame = encode_ieee_8023_rfc_1042_llc_snap_frame(
             destination,
             source,
-            Some(vlan_identifier),
+            Some(Ieee8021qTagControlInformation::from_vlan_identifier(
+                vlan_identifier,
+            )),
             ETHERNET_PROTOCOL_ARP,
             &payload,
         );

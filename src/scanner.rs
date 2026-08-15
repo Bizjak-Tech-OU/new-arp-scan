@@ -148,14 +148,14 @@ impl ArpReplyAcceptance {
 }
 
 /// MAC, interface IPv4, and on-wire options used when sending ARP requests.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ScanTransmitContext {
     /// Scanning interface Ethernet address (`ar$sha`).
     pub source_mac_address: MacAddress,
     /// Scanning interface IPv4 address, used when [`ScanWireOptions::sender_protocol_address`] is
     /// [`crate::application_command::ArpSenderProtocolAddress::Interface`].
     pub interface_ipv4_address: Ipv4Addr,
-    /// VLAN tag, `ar$spa` override, and LLC/SNAP framing.
+    /// VLAN tag, `ar$spa` override, LLC/SNAP framing, and Ethernet/ARP field overrides.
     pub wire: ScanWireOptions,
 }
 
@@ -203,7 +203,7 @@ fn send_one_address_resolution_request(
         target_ipv4_address,
     );
     let frame = encode_address_resolution_request_from_layout(layout);
-    if let Err(source) = endpoint.send_ethernet_frame(frame.as_ref()) {
+    if let Err(source) = endpoint.send_ethernet_frame(&frame) {
         warnings.push(format!(
             "failed to send ARP request to {target_ipv4_address}: {source}"
         ));
@@ -352,6 +352,7 @@ pub(crate) fn collect_scan_over_endpoint(
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
 ) -> Result<ScanOutcome, AppError> {
+    transmit.wire.validate_ieee_8023_mac_client_data()?;
     let mut warnings = Vec::new();
 
     run_address_resolution_request_rounds(
@@ -1139,8 +1140,8 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
     use crate::application_command::{ArpSenderProtocolAddress, ScanWireOptions};
     use crate::error::AppError;
     use crate::ethernet_frame::{
-        ETHERNET_PROTOCOL_IPV4, ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qVlanIdentifier,
-        encode_ethernet_ii_frame,
+        ETHERNET_PROTOCOL_IPV4, ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qPriorityCodePoint,
+        Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
     };
     use crate::link_layer_backend::LinkLayerEndpoint;
     use crate::mac_address::MacAddress;
@@ -1224,6 +1225,144 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
             outcome.warnings.is_empty(),
             "successful tagged send should not warn, got: {:?}",
             outcome.warnings
+        );
+    }
+
+    #[test]
+    fn sends_ieee_8021q_priority_code_point_and_drop_eligible_indicator() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits in 12 bits");
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    vlan_identifier: Some(vlan_identifier),
+                    vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(5)
+                        .expect("PCP 5 fits"),
+                    vlan_drop_eligible_indicator: true,
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(&sent[0][12..14], &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        assert_eq!(
+            &sent[0][14..16],
+            &0xB00Au16.to_be_bytes(),
+            "PCP 5, DEI 1, VID 10 should encode as TCI 0xB00A"
+        );
+    }
+
+    #[test]
+    fn sends_custom_padding_after_arp_payload() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+        let padding = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        // Act
+        collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    padding: padding.clone(),
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        let payload_start = 14 + 28;
+        assert_eq!(
+            &sent[0][payload_start..payload_start + 4],
+            padding.as_slice()
+        );
+        assert_eq!(sent[0].len(), 60);
+    }
+
+    #[test]
+    fn collect_rejects_padding_that_exceeds_ieee_8023_mac_client_data() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+        let acceptance = ArpReplyAcceptance::ExactTarget {
+            target_ipv4_address: target_ip,
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    llc_snap: true,
+                    padding: vec![0; 1465],
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        );
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::Ieee8023MacClientDataExceedsMaximum { .. })
+            ),
+            "SNAP padding of 1465 octets must exceed the 1500-octet MAC client data maximum, got: {outcome:?}"
+        );
+        assert!(
+            endpoint.sent.borrow().is_empty(),
+            "oversize padding must not transmit a frame"
         );
     }
 

@@ -98,7 +98,7 @@ pub(crate) fn validate_interface_flags_for_arp_scanning(
     Ok(())
 }
 
-fn packet_socket_protocol_for_wire_options(wire: ScanWireOptions) -> u16 {
+fn packet_socket_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
     if wire.vlan_identifier.is_some() || wire.llc_snap {
         ETHERNET_PROTOCOL_ALL
     } else {
@@ -106,7 +106,7 @@ fn packet_socket_protocol_for_wire_options(wire: ScanWireOptions) -> u16 {
     }
 }
 
-fn link_layer_send_protocol_for_wire_options(wire: ScanWireOptions) -> u16 {
+fn link_layer_send_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
     if wire.vlan_identifier.is_some() {
         ETHERNET_PROTOCOL_VLAN_TAG
     } else if wire.llc_snap {
@@ -207,7 +207,7 @@ pub struct LinuxLinkLayerEndpoint {
 /// This function does not panic.
 pub fn open_linux_link_layer_endpoint(
     interface_name: &str,
-    wire: ScanWireOptions,
+    wire: &ScanWireOptions,
 ) -> Result<LinuxLinkLayerEndpoint, AppError> {
     let interface_index = validated_interface_index_for_arp_scanning(interface_name)?;
     let capture_protocol = packet_socket_protocol_for_wire_options(wire);
@@ -370,14 +370,14 @@ mod tests {
         };
 
         // Act
-        let tagged_capture = packet_socket_protocol_for_wire_options(tagged);
-        let tagged_send = link_layer_send_protocol_for_wire_options(tagged);
-        let llc_capture = packet_socket_protocol_for_wire_options(llc_snap);
-        let llc_send = link_layer_send_protocol_for_wire_options(llc_snap);
-        let untagged_capture = packet_socket_protocol_for_wire_options(untagged);
-        let untagged_send = link_layer_send_protocol_for_wire_options(untagged);
-        let vlan_and_llc_capture = packet_socket_protocol_for_wire_options(vlan_and_llc);
-        let vlan_and_llc_send = link_layer_send_protocol_for_wire_options(vlan_and_llc);
+        let tagged_capture = packet_socket_protocol_for_wire_options(&tagged);
+        let tagged_send = link_layer_send_protocol_for_wire_options(&tagged);
+        let llc_capture = packet_socket_protocol_for_wire_options(&llc_snap);
+        let llc_send = link_layer_send_protocol_for_wire_options(&llc_snap);
+        let untagged_capture = packet_socket_protocol_for_wire_options(&untagged);
+        let untagged_send = link_layer_send_protocol_for_wire_options(&untagged);
+        let vlan_and_llc_capture = packet_socket_protocol_for_wire_options(&vlan_and_llc);
+        let vlan_and_llc_send = link_layer_send_protocol_for_wire_options(&vlan_and_llc);
 
         // Assert
         assert_eq!(

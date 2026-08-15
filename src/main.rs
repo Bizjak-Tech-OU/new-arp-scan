@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::CommandFactory;
 use clap::Parser;
 
+use new_arp_scan::Ieee8021qPriorityCodePoint;
 use new_arp_scan::Ieee8021qVlanIdentifier;
 use new_arp_scan::application_command::{
     ApplicationCommand, ArpSenderProtocolAddress, ScanWireOptions,
@@ -47,6 +48,15 @@ fn main() {
                                 "clap should reject VLAN identifiers above 4095 before reaching the application run path",
                             )
                         }),
+                        vlan_priority_code_point: scan
+                            .vlan_priority_code_point
+                            .map(|priority_code_point| {
+                                Ieee8021qPriorityCodePoint::new(priority_code_point).expect(
+                                    "clap should reject Priority Code Points above 7 before reaching the application run path",
+                                )
+                            })
+                            .unwrap_or(Ieee8021qPriorityCodePoint::ZERO),
+                        vlan_drop_eligible_indicator: scan.vlan_drop_eligible_indicator,
                         sender_protocol_address: scan
                             .sender_protocol_address
                             .unwrap_or(ArpSenderProtocolAddress::Interface),
@@ -60,6 +70,7 @@ fn main() {
                         arp_operation: scan.arp_operation,
                         arp_sender_hardware: scan.arp_sender_hardware,
                         arp_target_hardware: scan.arp_target_hardware,
+                        padding: scan.ethernet_padding.unwrap_or_default(),
                     },
                 }) {
                     Ok(outcome) => {

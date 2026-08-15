@@ -14,8 +14,9 @@ use crate::address_resolution_protocol::{
 use crate::application_command::{ArpSenderProtocolAddress, ScanWireOptions};
 use crate::ethernet_frame::{
     ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG, EthernetFraming,
-    IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH, Ieee8021qVlanIdentifier,
-    MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame, try_parse_ethernet_frame,
+    IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH, Ieee8021qPriorityCodePoint,
+    Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame,
+    try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
 use crate::mac_vendor_registry::MacVendorRegistry;
@@ -329,4 +330,65 @@ fn rfc_826_ethernet_source_and_sender_hardware_are_independent_and_destaddr_can_
     assert_eq!(&frame[22..28], &sender_hardware.octets());
     assert_eq!(rfc_826_arp_field(&frame, 0, 2), 6u16.to_be_bytes());
     assert_ne!(ethernet_source, sender_hardware);
+}
+
+#[test]
+fn ieee_8021q_transmit_encodes_pcp_and_dei_in_tci() {
+    // Arrange
+    let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+    let spa = Ipv4Addr::new(192, 168, 1, 1);
+    let tpa = Ipv4Addr::new(192, 168, 1, 50);
+    let wire = ScanWireOptions {
+        vlan_identifier: Ieee8021qVlanIdentifier::new(0x044),
+        vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(7).expect("PCP 7 fits"),
+        vlan_drop_eligible_indicator: true,
+        ..ScanWireOptions::default()
+    };
+
+    // Act
+    let frame = encode_address_resolution_request_from_layout(
+        wire.address_resolution_request_layout(interface_mac, spa, tpa),
+    );
+    let parsed = try_parse_ethernet_frame(&frame).expect("tagged request should parse");
+
+    // Assert
+    assert_eq!(&frame[14..16], &0xE044u16.to_be_bytes());
+    assert_eq!(parsed.vlan_identifier, Some(0x044));
+}
+
+#[test]
+fn ieee_8023_custom_padding_is_included_in_snap_length_and_still_meets_minimum_frame() {
+    // Arrange
+    let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+    let spa = Ipv4Addr::new(192, 168, 1, 1);
+    let tpa = Ipv4Addr::new(192, 168, 1, 50);
+    let padding = vec![0xAAu8, 0xBB];
+    let wire = ScanWireOptions {
+        llc_snap: true,
+        padding: padding.clone(),
+        ..ScanWireOptions::default()
+    };
+    let expected_length = u16::try_from(
+        IEEE_8023_LLC_SNAP_HEADER_LENGTH
+            + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH
+            + padding.len(),
+    )
+    .expect("SNAP plus ARP plus two padding octets fits");
+
+    // Act
+    let frame = encode_address_resolution_request_from_layout(
+        wire.address_resolution_request_layout(interface_mac, spa, tpa),
+    );
+
+    // Assert
+    assert_eq!(&frame[12..14], &expected_length.to_be_bytes());
+    assert_eq!(expected_length, 38);
+    assert_eq!(
+        frame.len(),
+        MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE
+    );
+    let padding_start = ETHERNET_II_HEADER_LENGTH
+        + IEEE_8023_LLC_SNAP_HEADER_LENGTH
+        + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+    assert_eq!(&frame[padding_start..padding_start + 2], padding.as_slice());
 }

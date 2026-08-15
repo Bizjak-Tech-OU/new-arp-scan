@@ -144,6 +144,14 @@ pub enum AppError {
         /// Human-readable explanation for operators.
         reason: String,
     },
+    /// Custom `--padding` (plus ARP and optional LLC/SNAP) exceeds the IEEE 802.3 1500-octet MAC
+    /// client data maximum.
+    Ieee8023MacClientDataExceedsMaximum {
+        /// Combined LLC/SNAP (when used), ARP PDU, and custom padding length.
+        octet_count: usize,
+        /// IEEE 802.3 maximum MAC client data length (1500).
+        maximum: u16,
+    },
 }
 
 fn try_write_early_app_error_variants(
@@ -287,6 +295,13 @@ fn write_late_app_error_variants(
         } => write!(
             formatter,
             "single-target scan rejected {target_ipv4_address} on interface `{interface_name}`: {reason}"
+        ),
+        AppError::Ieee8023MacClientDataExceedsMaximum {
+            octet_count,
+            maximum,
+        } => write!(
+            formatter,
+            "IEEE 802.3 MAC client data is {octet_count} octets; maximum is {maximum} (reduce --padding, especially with --llc)"
         ),
         _ => write!(
             formatter,
@@ -1157,6 +1172,26 @@ mod tests {
         assert!(
             source.is_none(),
             "single scan target rejection should not chain a source error"
+        );
+    }
+
+    #[test]
+    fn display_includes_octet_counts_for_ieee_8023_mac_client_data_exceeds_maximum() {
+        // Arrange
+        let application_error = AppError::Ieee8023MacClientDataExceedsMaximum {
+            octet_count: 1501,
+            maximum: 1500,
+        };
+
+        // Act
+        let displayed = application_error.to_string();
+
+        // Assert
+        assert!(
+            displayed.contains("1501")
+                && displayed.contains("1500")
+                && displayed.contains("padding"),
+            "display should name the oversize payload and --padding, got: {displayed}"
         );
     }
 }

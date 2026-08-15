@@ -188,4 +188,15 @@ Resolved fields are encoded through [`AddressResolutionRequestLayout`](src/addre
 
 **Reason:** `--vlan`, `--llc`, and `--arpspa` left Ethernet addressing and the rest of the RFC 826 header fixed. Original `arp-scan` documents `--destaddr` as the commonly used Ethernet override, and treating `ar$sha` as distinct from the Ethernet source completes the receive-side RFC 826 contract on transmit.
 
-**Consequences:** QinQ / IEEE 802.1ad, bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and custom `--padding` (which can exceed the 60-octet buffer) remain deferred.
+**Consequences:** QinQ / IEEE 802.1ad, bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and `--prototype` remain deferred. Custom `--padding` and IEEE 802.1Q PCP/DEI are superseded below.
+
+## 2026-08-15 — `--padding` and IEEE 802.1Q PCP/DEI
+
+**Decision:** Operators can complete the remaining original `arp-scan` outgoing packet option and the rest of the IEEE 802.1Q TCI on `scan`:
+
+- **`--padding <HEX>`** matches original `arp-scan`: hex-encoded binary with an even number of digits and **no** `0x` prefix, appended after the 28-octet ARP PDU. The Ethernet frame is still zero-padded to 60 octets without FCS when shorter. With `--llc`, custom padding is included in the IEEE 802.3 length (MAC client data = LLC + SNAP + ARP + padding). Padding that would make MAC client data exceed 1500 octets is rejected (Ethernet II maximum 1472 padding octets; SNAP maximum 1464). Oversize payloads are not silently truncated.
+- **`--pcp <0..=7>`** and **`--dei`** require `--vlan`. They encode the IEEE 802.1Q TCI as `(PCP << 13) | (DEI << 12) | VID`. Omitted PCP is 0 and omitted DEI is 0, matching the previous VID-only send. VID 0 remains legal (priority tagging). Receive still exposes only the 12-bit VID.
+
+**Reason:** `--vlan` left PCP and DEI stuck at zero, so tagged frames could not express IEEE 802.1Q class of service. Custom `--padding` was the last original `arp-scan` outgoing packet option that still needed a `Vec` encode path once the 60-octet buffer was no longer a hard ceiling.
+
+**Consequences:** QinQ / IEEE 802.1ad (still rejected on receive), bundling a full IEEE OUI database, passive ACD / monitor mode, `libpcap`, JSON output, adaptive pacing, and `--prototype` remain deferred. Default `scan` / `--host` stay RFC 826 Ethernet II with interface SPA, PCP 0, DEI 0, and no custom padding.

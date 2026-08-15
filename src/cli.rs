@@ -19,8 +19,11 @@ EXAMPLES:
   Annotate MAC addresses with IEEE MA-L / MA-M / MA-S vendor names:
     new-arp-scan scan --interface eth0 --mac-vendor-file ieee-oui.txt
 
-  Send IEEE 802.1Q tagged ARP requests on VLAN 10:
-    new-arp-scan scan --interface eth0 --vlan 10
+  Send IEEE 802.1Q tagged ARP requests on VLAN 10 with PCP 5:
+    new-arp-scan scan --interface eth0 --vlan 10 --pcp 5
+
+  Append custom payload padding after the ARP PDU:
+    new-arp-scan scan --interface eth0 --padding deadbeef
 
   RFC 5227 ARP Probe (sender protocol address 0.0.0.0):
     new-arp-scan scan --interface eth0 --arpspa 0.0.0.0
@@ -81,14 +84,34 @@ pub struct ScanArguments {
     #[arg(long = "mac-vendor-file", value_name = "PATH")]
     pub mac_vendor_file: Option<std::path::PathBuf>,
     /// IEEE 802.1Q VLAN identifier (`0..=4095`). When set, each request is an Ethernet II ARP
-    /// frame with a single customer tag (TPID `0x8100`, PCP and DEI zero). When omitted, requests
-    /// are untagged.
+    /// frame with a single customer tag (TPID `0x8100`). PCP and DEI default to zero unless
+    /// `--pcp` / `--dei` are set. When omitted, requests are untagged.
     #[arg(
         long = "vlan",
         value_name = "VID",
         value_parser = clap::value_parser!(u16).range(0..=4095)
     )]
     pub vlan_identifier: Option<u16>,
+    /// IEEE 802.1Q Priority Code Point (`0..=7`). Requires `--vlan`. Default 0.
+    #[arg(
+        long = "pcp",
+        value_name = "PRIORITY",
+        value_parser = clap::value_parser!(u8).range(0..=7),
+        requires = "vlan_identifier"
+    )]
+    pub vlan_priority_code_point: Option<u8>,
+    /// Set the IEEE 802.1Q Drop Eligible Indicator. Requires `--vlan`.
+    #[arg(long = "dei", action = clap::ArgAction::SetTrue, requires = "vlan_identifier")]
+    pub vlan_drop_eligible_indicator: bool,
+    /// Hex-encoded octets appended after the 28-octet ARP PDU (no `0x` prefix, even number of
+    /// digits), matching original `arp-scan --padding`. The frame is still zero-padded to 60
+    /// octets when shorter. With `--llc`, these octets are included in the IEEE 802.3 length.
+    #[arg(
+        long = "padding",
+        value_name = "HEX",
+        value_parser = crate::application_command::parse_ethernet_padding_hex
+    )]
+    pub ethernet_padding: Option<Vec<u8>>,
     /// RFC 826 `ar$spa` (sender IPv4). Dotted quad, or `dest` to use each target address (RFC 5227
     /// Announcement). `0.0.0.0` is an RFC 5227 ARP Probe. When omitted, the interface IPv4 address
     /// is used.
@@ -1086,6 +1109,83 @@ mod tests {
     }
 
     #[test]
+    fn parses_scan_subcommand_with_vlan_pcp_dei_and_padding() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--vlan",
+            "10",
+            "--pcp",
+            "5",
+            "--dei",
+            "--padding",
+            "deadbeef",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        match parsed
+            .expect("parsing should succeed")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.vlan_identifier, Some(10));
+                assert_eq!(scan.vlan_priority_code_point, Some(5));
+                assert!(scan.vlan_drop_eligible_indicator);
+                assert_eq!(
+                    scan.ethernet_padding.as_deref(),
+                    Some([0xDE, 0xAD, 0xBE, 0xEF].as_slice())
+                );
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_pcp_or_dei_is_set_without_vlan() {
+        // Arrange
+        let pcp = ["new-arp-scan", "scan", "--pcp", "1"];
+        let dei = ["new-arp-scan", "scan", "--dei"];
+
+        // Act
+        let pcp_outcome = CliRoot::try_parse_from(pcp);
+        let dei_outcome = CliRoot::try_parse_from(dei);
+
+        // Assert
+        assert!(
+            pcp_outcome.is_err(),
+            "--pcp requires --vlan, got: {pcp_outcome:?}"
+        );
+        assert!(
+            dei_outcome.is_err(),
+            "--dei requires --vlan, got: {dei_outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_padding_is_not_even_hex() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--padding", "0xdead"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "0x-prefixed --padding should fail parsing, got: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn parses_scan_subcommand_with_arpspa_unspecified_as_rfc_5227_probe() {
         // Arrange
         let arguments = [
@@ -1315,6 +1415,10 @@ mod tests {
             "scan long help should name VLAN, arpspa, and llc flags, got:\n{help}"
         );
         assert!(
+            help.contains("--pcp") && help.contains("--dei") && help.contains("--padding"),
+            "scan long help should name IEEE 802.1Q PCP/DEI and --padding, got:\n{help}"
+        );
+        assert!(
             help.contains("--destaddr")
                 && help.contains("--srcaddr")
                 && help.contains("--arpsha")
@@ -1428,6 +1532,9 @@ mod tests {
                 assert_eq!(scan.arp_hardware_length, 6);
                 assert_eq!(scan.arp_protocol_length, 4);
                 assert_eq!(scan.arp_operation, 1);
+                assert!(scan.vlan_priority_code_point.is_none());
+                assert!(!scan.vlan_drop_eligible_indicator);
+                assert!(scan.ethernet_padding.is_none());
             }
             super::CliSubcommand::Interfaces => {
                 panic!("expected scan subcommand, got interfaces");

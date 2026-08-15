@@ -56,7 +56,9 @@ pub use application_outcome::ScanTimingSummary;
 pub use application_outcome::UsableInterfaceListingRow;
 pub use application_outcome::UsableInterfacesListOutcome;
 pub use error::AppError;
-pub use ethernet_frame::Ieee8021qVlanIdentifier;
+pub use ethernet_frame::{
+    Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier,
+};
 pub use ipv4_cidr::Ipv4Cidr;
 pub use ipv4_cidr::Ipv4HostAddressIterator;
 pub use mac_address::{MacAddress, MacAddressParseError};
@@ -78,8 +80,8 @@ pub use linux_scanner::perform_arp_probe;
 /// window after the last request is sent; the `pacing` field sleeps after each full round of target
 /// sends except the last round; the `attempts` field is how many such rounds run. The `wire` field
 /// selects IEEE 802.1Q tagging, RFC 826 `ar$spa` (including RFC 5227 Probe/Announcement),
-/// Ethernet `--destaddr`/`--srcaddr`, remaining RFC 826 `ar$*` fields, and RFC 1042 LLC/SNAP
-/// framing. When the scan
+/// Ethernet `--destaddr`/`--srcaddr`, remaining RFC 826 `ar$*` fields, RFC 1042 LLC/SNAP
+/// framing, IEEE 802.1Q PCP/DEI, and custom `--padding`. When the scan
 /// command omits an interface name, the library selects an interface automatically only when
 /// exactly one usable interface exists. On Linux, successful scans populate
 /// [`application_outcome::ScanOutcome::timing_summary`] with wall-clock timing, the resolved
@@ -175,6 +177,7 @@ fn run_address_resolution_scan(
     attempts: std::num::NonZeroU64,
     wire: ScanWireOptions,
 ) -> Result<ApplicationOutcome, AppError> {
+    wire.validate_ieee_8023_mac_client_data()?;
     if let Some(interface_name) = interface_name {
         interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
     }

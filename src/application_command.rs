@@ -5,10 +5,14 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use crate::address_resolution_protocol::{
-    ARP_ETHERNET_HARDWARE_ADDRESS_LENGTH, ARP_HARDWARE_TYPE_ETHERNET,
-    ARP_IPV4_PROTOCOL_ADDRESS_LENGTH, ARP_OPERATION_REQUEST, AddressResolutionRequestLayout,
+    ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH, ARP_ETHERNET_HARDWARE_ADDRESS_LENGTH,
+    ARP_HARDWARE_TYPE_ETHERNET, ARP_IPV4_PROTOCOL_ADDRESS_LENGTH, ARP_OPERATION_REQUEST,
+    AddressResolutionRequestLayout,
 };
-use crate::ethernet_frame::{ETHERNET_PROTOCOL_IPV4, Ieee8021qVlanIdentifier};
+use crate::ethernet_frame::{
+    ETHERNET_PROTOCOL_IPV4, IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH,
+    Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier,
+};
 use crate::mac_address::MacAddress;
 
 /// How transmitted ARP requests fill RFC 826 `ar$spa`.
@@ -95,10 +99,14 @@ where
 }
 
 /// On-wire options for transmitted ARP requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanWireOptions {
-    /// When set, transmit a single IEEE 802.1Q tag with this VLAN identifier (PCP and DEI zero).
+    /// When set, transmit a single IEEE 802.1Q tag with this VLAN identifier.
     pub vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    /// IEEE 802.1Q Priority Code Point. Ignored when [`Self::vlan_identifier`] is [`None`].
+    pub vlan_priority_code_point: Ieee8021qPriorityCodePoint,
+    /// IEEE 802.1Q Drop Eligible Indicator. Ignored when [`Self::vlan_identifier`] is [`None`].
+    pub vlan_drop_eligible_indicator: bool,
     /// Value encoded in RFC 826 `ar$spa`.
     pub sender_protocol_address: ArpSenderProtocolAddress,
     /// When true, encapsulate ARP in IEEE 802.3 with RFC 1042 LLC/SNAP instead of Ethernet II.
@@ -121,12 +129,17 @@ pub struct ScanWireOptions {
     pub arp_sender_hardware: Option<MacAddress>,
     /// RFC 826 `ar$tha`. [`None`] means all zeroes.
     pub arp_target_hardware: Option<MacAddress>,
+    /// Octets appended after the 28-octet ARP PDU (`--padding`). IEEE 802.3 minimum-frame zeroes
+    /// are applied after this payload when the frame is still shorter than 60 octets.
+    pub padding: Vec<u8>,
 }
 
 impl Default for ScanWireOptions {
     fn default() -> Self {
         Self {
             vlan_identifier: None,
+            vlan_priority_code_point: Ieee8021qPriorityCodePoint::ZERO,
+            vlan_drop_eligible_indicator: false,
             sender_protocol_address: ArpSenderProtocolAddress::Interface,
             llc_snap: false,
             ethernet_destination: None,
@@ -138,6 +151,7 @@ impl Default for ScanWireOptions {
             arp_operation: ARP_OPERATION_REQUEST,
             arp_sender_hardware: None,
             arp_target_hardware: None,
+            padding: Vec::new(),
         }
     }
 }
@@ -146,15 +160,21 @@ impl ScanWireOptions {
     /// Resolves CLI/library wire options against one interface and target into an on-wire layout.
     #[must_use]
     pub(crate) fn address_resolution_request_layout(
-        self,
+        &self,
         interface_mac_address: MacAddress,
         sender_protocol_address: Ipv4Addr,
         target_protocol_address: Ipv4Addr,
-    ) -> AddressResolutionRequestLayout {
+    ) -> AddressResolutionRequestLayout<'_> {
         AddressResolutionRequestLayout {
             ethernet_destination: self.ethernet_destination.unwrap_or(MacAddress::BROADCAST),
             ethernet_source: self.ethernet_source.unwrap_or(interface_mac_address),
-            vlan_identifier: self.vlan_identifier,
+            vlan_tag: self.vlan_identifier.map(|vlan_identifier| {
+                Ieee8021qTagControlInformation::new(
+                    self.vlan_priority_code_point,
+                    self.vlan_drop_eligible_indicator,
+                    vlan_identifier,
+                )
+            }),
             llc_snap: self.llc_snap,
             hardware_type: self.arp_hardware_type,
             protocol_type: self.arp_protocol_type,
@@ -165,8 +185,91 @@ impl ScanWireOptions {
             sender_protocol: sender_protocol_address,
             target_hardware: self.arp_target_hardware.unwrap_or(MacAddress::ZERO),
             target_protocol: target_protocol_address,
+            padding: &self.padding,
         }
     }
+
+    /// IEEE 802.3 MAC client data length for one transmitted request (LLC/SNAP, ARP, and padding).
+    #[must_use]
+    pub fn ieee_8023_mac_client_data_octet_count(&self) -> usize {
+        let arp_and_padding =
+            ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH.saturating_add(self.padding.len());
+        if self.llc_snap {
+            IEEE_8023_LLC_SNAP_HEADER_LENGTH.saturating_add(arp_and_padding)
+        } else {
+            arp_and_padding
+        }
+    }
+
+    /// Rejects custom padding that would make MAC client data exceed 1500 octets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::AppError::Ieee8023MacClientDataExceedsMaximum`] when LLC/SNAP (if
+    /// used), the 28-octet ARP PDU, and [`Self::padding`] exceed [`IEEE_8023_MAXIMUM_LENGTH`].
+    pub fn validate_ieee_8023_mac_client_data(&self) -> Result<(), crate::error::AppError> {
+        let octet_count = self.ieee_8023_mac_client_data_octet_count();
+        if octet_count > usize::from(IEEE_8023_MAXIMUM_LENGTH) {
+            Err(
+                crate::error::AppError::Ieee8023MacClientDataExceedsMaximum {
+                    octet_count,
+                    maximum: IEEE_8023_MAXIMUM_LENGTH,
+                },
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Parses original `arp-scan` `--padding` hex: even number of digits, no `0x` prefix.
+///
+/// # Errors
+///
+/// Returns a message when `token` is empty, has a `0x` prefix, has an odd number of digits,
+/// contains a non-hexadecimal character, or decodes to more than 1472 octets (Ethernet II ARP
+/// maximum: IEEE 802.3 MAC client data 1500 minus the 28-octet ARP PDU). SNAP scans may still
+/// reject a shorter oversize payload in [`ScanWireOptions::validate_ieee_8023_mac_client_data`].
+pub fn parse_ethernet_padding_hex(token: &str) -> Result<Vec<u8>, String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "invalid --padding value: expected an even number of hexadecimal digits".to_string(),
+        );
+    }
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        return Err("invalid --padding value: hex digits must not include a 0x prefix".to_string());
+    }
+    if trimmed.len() % 2 != 0 {
+        return Err(
+            "invalid --padding value: expected an even number of hexadecimal digits".to_string(),
+        );
+    }
+    if !trimmed.bytes().all(|octet| octet.is_ascii_hexdigit()) {
+        return Err("invalid --padding value: expected hexadecimal digits".to_string());
+    }
+
+    let maximum_octets =
+        crate::address_resolution_protocol::maximum_arp_request_padding_octet_count(false);
+    let octet_count = trimmed.len() / 2;
+    if octet_count > maximum_octets {
+        return Err(format!(
+            "invalid --padding value: {octet_count} octets exceeds the IEEE 802.3 MAC client data maximum after the 28-octet ARP payload ({maximum_octets} octets)"
+        ));
+    }
+
+    let digits = trimmed.as_bytes();
+    let mut padding = Vec::with_capacity(octet_count);
+    let mut index = 0;
+    while index < digits.len() {
+        let pair = std::str::from_utf8(&digits[index..index + 2])
+            .map_err(|_| "invalid --padding value: expected hexadecimal digits".to_string())?;
+        let octet = u8::from_str_radix(pair, 16)
+            .map_err(|_| "invalid --padding value: expected hexadecimal digits".to_string())?;
+        padding.push(octet);
+        index += 2;
+    }
+    Ok(padding)
 }
 
 /// Default global receive window after the last address resolution request is sent.
@@ -205,9 +308,10 @@ pub enum ApplicationCommand {
 mod tests {
     use super::{
         ApplicationCommand, ArpSenderProtocolAddress, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,
-        DEFAULT_SCAN_TIMEOUT, ScanWireOptions, parse_u8_cli_token, parse_u16_cli_token,
+        DEFAULT_SCAN_TIMEOUT, ScanWireOptions, parse_ethernet_padding_hex, parse_u8_cli_token,
+        parse_u16_cli_token,
     };
-    use crate::ethernet_frame::Ieee8021qVlanIdentifier;
+    use crate::ethernet_frame::{Ieee8021qPriorityCodePoint, Ieee8021qVlanIdentifier};
     use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
     use std::num::NonZeroU64;
@@ -734,8 +838,8 @@ mod tests {
         let tpa = Ipv4Addr::new(192, 168, 1, 50);
 
         // Act
-        let layout =
-            ScanWireOptions::default().address_resolution_request_layout(interface_mac, spa, tpa);
+        let wire = ScanWireOptions::default();
+        let layout = wire.address_resolution_request_layout(interface_mac, spa, tpa);
 
         // Assert
         assert_eq!(layout.ethernet_destination, MacAddress::BROADCAST);
@@ -780,5 +884,81 @@ mod tests {
         assert_eq!(layout.target_hardware, target_hardware);
         assert_eq!(layout.hardware_type, 6);
         assert_ne!(layout.ethernet_source, layout.sender_hardware);
+    }
+
+    #[test]
+    fn parse_ethernet_padding_hex_accepts_even_digits_without_prefix() {
+        // Arrange
+        // Act
+        let padding = parse_ethernet_padding_hex("deadBEEF");
+
+        // Assert
+        assert_eq!(padding, Ok(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    }
+
+    #[test]
+    fn parse_ethernet_padding_hex_rejects_prefix_odd_length_and_non_hex() {
+        // Arrange
+        // Act
+        let prefixed = parse_ethernet_padding_hex("0xdead");
+        let odd = parse_ethernet_padding_hex("abc");
+        let not_hex = parse_ethernet_padding_hex("gg");
+
+        // Assert
+        assert!(
+            prefixed
+                .expect_err("0x prefix is not original arp-scan hex")
+                .contains("0x"),
+            "prefixed padding should mention the 0x restriction"
+        );
+        assert!(odd.expect_err("odd length").contains("even"));
+        assert!(not_hex.is_err(), "non-hex digits should fail");
+    }
+
+    #[test]
+    fn request_layout_applies_vlan_pcp_dei_and_padding() {
+        // Arrange
+        let interface_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let wire = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+            vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(5).expect("PCP 5 fits"),
+            vlan_drop_eligible_indicator: true,
+            padding: vec![0xDE, 0xAD],
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let layout = wire.address_resolution_request_layout(
+            interface_mac,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
+
+        // Assert
+        let tag = layout.vlan_tag.expect("VLAN tag should be present");
+        assert_eq!(tag.as_u16(), 0xB00A);
+        assert_eq!(layout.padding, &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn snap_padding_that_exceeds_ieee_8023_maximum_is_rejected() {
+        // Arrange
+        let wire = ScanWireOptions {
+            llc_snap: true,
+            padding: vec![0; 1465],
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let outcome = wire.validate_ieee_8023_mac_client_data();
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::error::AppError::Ieee8023MacClientDataExceedsMaximum { .. })
+            ),
+            "SNAP MAC client data of 8+28+1465 must exceed 1500, got: {outcome:?}"
+        );
     }
 }
