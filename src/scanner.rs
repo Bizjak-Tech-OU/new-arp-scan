@@ -1193,7 +1193,8 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
             sender_mac,
             sender_ip,
             Ipv4Addr::new(192, 168, 1, 1),
-        );
+        )
+        .to_vec();
         let opcode_offset = ETHERNET_II_HEADER_LENGTH + 6;
         frame[opcode_offset..opcode_offset + 2].copy_from_slice(&opcode.to_be_bytes());
         frame

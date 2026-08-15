@@ -506,6 +506,27 @@ pub(crate) fn try_parse_address_resolution_ipv4_over_ethernet(
 /// A single IEEE 802.1Q tag and RFC 1042 LLC/SNAP encapsulation are accepted. Sender hardware and
 /// protocol addresses (`ar$sha`, `ar$spa`) are the values returned, matching RFC 826.
 ///
+/// Well-formed ARP that is not a reply (for example an RFC 826 request) is rejected here. The
+/// scanner records opcode 2 only, so those frames are not treated as malformed capture noise.
+///
+/// ```
+/// use new_arp_scan::{
+///     MacAddress, build_address_resolution_request_ethernet_frame,
+///     try_parse_address_resolution_reply_ipv4_over_ethernet,
+/// };
+/// use std::net::Ipv4Addr;
+///
+/// let frame = build_address_resolution_request_ethernet_frame(
+///     MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]),
+///     Ipv4Addr::new(192, 168, 1, 1),
+///     Ipv4Addr::new(192, 168, 1, 2),
+/// );
+/// assert_eq!(
+///     try_parse_address_resolution_reply_ipv4_over_ethernet(&frame),
+///     Err("address resolution opcode is a request, not a reply")
+/// );
+/// ```
+///
 /// # Errors
 ///
 /// Returns a static message when the Ethernet header, `EtherType`, or ARP fields are invalid, when

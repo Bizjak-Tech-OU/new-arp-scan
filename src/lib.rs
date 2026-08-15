@@ -44,6 +44,7 @@ pub use address_resolution_protocol::{
     build_address_resolution_announcement_ethernet_frame,
     build_address_resolution_probe_ethernet_frame, build_address_resolution_request_ethernet_frame,
     build_address_resolution_request_ethernet_frame_with_optional_ieee_8021q_tag,
+    try_parse_address_resolution_reply_ipv4_over_ethernet,
 };
 pub use application_command::{
     ApplicationCommand, ArpSenderProtocolAddress, DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_PACING,

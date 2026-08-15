@@ -567,7 +567,10 @@ mod tests {
         assert_eq!(&frame[18..], payload.as_slice());
         let parsed = try_parse_ethernet_frame(&frame).expect("tagged encoding should parse");
         assert_eq!(parsed.vlan_identifier, Some(10));
-        assert_eq!(parsed.vlan_tag.map(|tag| tag.as_u16()), Some(10));
+        assert_eq!(
+            parsed.vlan_tag.map(Ieee8021qTagControlInformation::as_u16),
+            Some(10)
+        );
         assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
         assert_eq!(parsed.payload, payload.as_slice());
     }
