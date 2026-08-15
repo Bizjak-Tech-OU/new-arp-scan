@@ -1559,4 +1559,110 @@ mod tests {
             "invalid --destaddr should fail parsing, got: {outcome:?}"
         );
     }
+
+    #[test]
+    fn returns_error_when_destaddr_mixes_colon_and_hyphen_separators() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--destaddr", "00:11-22:33:44:55"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "mixed MAC separators should fail parsing, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_pcp_exceeds_three_bits() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--vlan", "1", "--pcp", "8"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(outcome.is_err(), "PCP 8 is outside 0..=7, got: {outcome:?}");
+    }
+
+    #[test]
+    fn accepts_pcp_zero_with_vlan_and_without_dei() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--vlan", "1", "--pcp", "0"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        match parsed
+            .expect("PCP 0 is a legal 3-bit value")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.vlan_identifier, Some(1));
+                assert_eq!(scan.vlan_priority_code_point, Some(0));
+                assert!(!scan.vlan_drop_eligible_indicator);
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_scan_subcommand_with_vlan_and_llc_together() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--vlan", "10", "--llc"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        match parsed
+            .expect("VLAN plus SNAP should parse")
+            .subcommand
+            .expect("subcommand should be present")
+        {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.vlan_identifier, Some(10));
+                assert!(scan.llc_snap);
+            }
+            super::CliSubcommand::Interfaces => {
+                panic!("expected scan subcommand, got interfaces");
+            }
+        }
+    }
+
+    #[test]
+    fn returns_error_when_arphrd_exceeds_sixteen_bits() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--arphrd", "0x10000"];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "ar$hrd 0x10000 exceeds u16, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn returns_error_when_padding_is_empty() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--padding", ""];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert!(
+            outcome.is_err(),
+            "empty --padding should fail parsing, got: {outcome:?}"
+        );
+    }
 }

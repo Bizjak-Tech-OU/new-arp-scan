@@ -13,10 +13,11 @@ use crate::address_resolution_protocol::{
 };
 use crate::application_command::{ArpSenderProtocolAddress, ScanWireOptions};
 use crate::ethernet_frame::{
-    ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG, EthernetFraming,
-    IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH, Ieee8021qPriorityCodePoint,
-    Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE,
-    encode_ethernet_ii_frame, try_parse_ethernet_frame,
+    ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG,
+    ETHERNET_PROTOCOL_VLAN_TAG_SERVICE, EthernetFraming, IEEE_8023_LLC_SNAP_HEADER_LENGTH,
+    IEEE_8023_MAXIMUM_LENGTH, Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation,
+    Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame,
+    try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
 use crate::mac_vendor_registry::MacVendorRegistry;
@@ -456,4 +457,138 @@ fn ieee_8023_custom_padding_is_included_in_snap_length_and_still_meets_minimum_f
         + IEEE_8023_LLC_SNAP_HEADER_LENGTH
         + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
     assert_eq!(&frame[padding_start..padding_start + 2], padding.as_slice());
+}
+
+#[test]
+fn ieee_8021ad_and_unofficial_qinq_tpids_are_rejected() {
+    // Arrange
+    let destination = MacAddress::BROADCAST;
+    let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+    let inner = [0x00, 0x01, 0x08, 0x06];
+    let service = encode_ethernet_ii_frame(
+        destination,
+        source,
+        ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+        &inner,
+    );
+    let unofficial = encode_ethernet_ii_frame(destination, source, 0x9100, &inner);
+
+    // Act
+    let service_outcome = try_parse_ethernet_frame(&service);
+    let unofficial_outcome = try_parse_ethernet_frame(&unofficial);
+
+    // Assert
+    assert!(
+        service_outcome
+            .expect_err("IEEE 802.1ad must be rejected")
+            .contains("802.1ad or QinQ")
+    );
+    assert!(
+        unofficial_outcome
+            .expect_err("unofficial QinQ TPID 0x9100 must be rejected")
+            .contains("802.1ad or QinQ")
+    );
+}
+
+#[test]
+fn rfc_5494_reserved_hardware_type_zero_is_rejected() {
+    // Arrange
+    let mut frame = build_address_resolution_request_ethernet_frame(
+        MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
+    frame[ETHERNET_II_HEADER_LENGTH..ETHERNET_II_HEADER_LENGTH + 2]
+        .copy_from_slice(&0u16.to_be_bytes());
+
+    // Act
+    let outcome = try_parse_address_resolution_ipv4_over_ethernet(&frame);
+
+    // Assert
+    assert_eq!(
+        outcome.expect_err("reserved hardware type 0 should fail"),
+        "address resolution hardware type is reserved by RFC 5494"
+    );
+}
+
+#[test]
+fn rfc_5494_reserved_opcode_zero_is_rejected() {
+    // Arrange
+    let mut frame = build_address_resolution_request_ethernet_frame(
+        MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
+    let opcode_offset = ETHERNET_II_HEADER_LENGTH + 6;
+    frame[opcode_offset..opcode_offset + 2].copy_from_slice(&0u16.to_be_bytes());
+
+    // Act
+    let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+    // Assert
+    assert_eq!(
+        outcome.expect_err("reserved opcode 0 should fail"),
+        "address resolution opcode is reserved by RFC 5494"
+    );
+}
+
+#[test]
+fn rfc_826_reply_uses_sender_hardware_not_ethernet_source() {
+    // Arrange
+    let ethernet_source = MacAddress::from_octets([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let arp_sender = MacAddress::from_octets([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    let sender_ip = Ipv4Addr::new(10, 0, 0, 5);
+    let mut frame = build_address_resolution_request_ethernet_frame(
+        arp_sender,
+        sender_ip,
+        Ipv4Addr::new(10, 0, 0, 1),
+    );
+    frame[6..12].copy_from_slice(&ethernet_source.octets());
+    let opcode_offset = ETHERNET_II_HEADER_LENGTH + 6;
+    frame[opcode_offset..opcode_offset + 2].copy_from_slice(&2u16.to_be_bytes());
+
+    // Act
+    let (ip, mac) = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame)
+        .expect("reply should parse using ar$sha");
+
+    // Assert
+    assert_eq!(ip, sender_ip);
+    assert_eq!(mac, arp_sender);
+    assert_ne!(mac, ethernet_source);
+}
+
+#[test]
+fn rfc_1042_llc_snap_reply_is_accepted() {
+    // Arrange
+    let source_mac = MacAddress::from_octets([0xAA; 6]);
+    let source_ip = Ipv4Addr::new(10, 0, 0, 5);
+    let mut frame = vec![0u8; 128];
+    frame[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+    frame[6..12].copy_from_slice(&source_mac.octets());
+    frame[12..14].copy_from_slice(&46u16.to_be_bytes());
+    frame[14] = 0xAA;
+    frame[15] = 0xAA;
+    frame[16] = 0x03;
+    frame[17..20].copy_from_slice(&[0, 0, 0]);
+    frame[20] = 0x08;
+    frame[21] = 0x06;
+    let arp_start = 22;
+    let arp = &mut frame[arp_start..arp_start + ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH];
+    arp[0..2].copy_from_slice(&1u16.to_be_bytes());
+    arp[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
+    arp[4] = 6;
+    arp[5] = 4;
+    arp[6..8].copy_from_slice(&2u16.to_be_bytes());
+    arp[8..14].copy_from_slice(&source_mac.octets());
+    arp[14..18].copy_from_slice(&source_ip.octets());
+    arp[18..24].fill(0);
+    arp[24..28].copy_from_slice(&[10, 0, 0, 1]);
+
+    // Act
+    let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+    // Assert
+    let (ip, mac) = outcome.expect("RFC 1042 SNAP ARP reply should parse");
+    assert_eq!(ip, source_ip);
+    assert_eq!(mac, source_mac);
 }

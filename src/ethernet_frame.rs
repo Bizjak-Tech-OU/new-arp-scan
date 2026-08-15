@@ -905,4 +905,150 @@ mod tests {
             "IEEE 802.1Q tag is truncated"
         );
     }
+
+    #[test]
+    fn parse_rejects_unofficial_qinq_tpids() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let inner = [0x00, 0x01, 0x08, 0x06];
+        let tpids = [
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9200,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300,
+        ];
+        let frames: Vec<Vec<u8>> = tpids
+            .iter()
+            .map(|tpid| encode_ethernet_ii_frame(destination, source, *tpid, &inner))
+            .collect();
+
+        // Act
+        let outcomes: Vec<_> = frames
+            .iter()
+            .map(|frame| try_parse_ethernet_frame(frame))
+            .collect();
+
+        // Assert
+        for (tpid, outcome) in tpids.iter().zip(outcomes) {
+            assert!(
+                outcome
+                    .expect_err("unofficial QinQ TPID should be rejected")
+                    .contains("802.1ad or QinQ"),
+                "TPID {tpid:#06x} should be rejected as QinQ"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_ieee_8021ad_as_inner_type_after_customer_tag() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let mut inner = Vec::from(0x000Au16.to_be_bytes());
+        inner.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG_SERVICE.to_be_bytes());
+        inner.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+        let frame =
+            encode_ethernet_ii_frame(destination, source, ETHERNET_PROTOCOL_VLAN_TAG, &inner);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&frame);
+
+        // Assert
+        assert!(
+            outcome
+                .expect_err("inner 802.1ad should be rejected as stacked VLAN")
+                .contains("stacked VLAN"),
+            "error should mention stacked VLAN, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_truncated_rfc_1042_llc_snap_header() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let frame = encode_ethernet_ii_frame(destination, source, 46, &[0xAA, 0xAA, 0x03]);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("truncated SNAP should fail"),
+            "IEEE 802.3 LLC/SNAP header is truncated"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_snap_when_organizationally_unique_identifier_is_not_rfc_1042() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let payload = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x01, 0x08, 0x06];
+        let frame = encode_ethernet_ii_frame(destination, source, 46, &payload);
+
+        // Act
+        let outcome = try_parse_ethernet_frame(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("non-zero SNAP OUI should fail"),
+            "SNAP organizationally unique identifier is not RFC 1042 Ethernet"
+        );
+    }
+
+    #[test]
+    fn parse_decodes_null_vlan_identifier_with_priority_code_point_and_drop_eligible() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
+        let tag = Ieee8021qTagControlInformation::new(
+            Ieee8021qPriorityCodePoint::new(7).expect("PCP 7 fits"),
+            true,
+            Ieee8021qVlanIdentifier::new(0).expect("null VID is legal"),
+        );
+        let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+            destination,
+            source,
+            Some(tag),
+            ETHERNET_PROTOCOL_ARP,
+            &[0x99],
+        );
+
+        // Act
+        let parsed = try_parse_ethernet_frame(&frame).expect("priority-tagged frame should parse");
+
+        // Assert
+        assert_eq!(tag.as_u16(), 0xF000);
+        assert_eq!(parsed.vlan_identifier, Some(0));
+        let vlan_tag = parsed.vlan_tag.expect("priority tagging should expose TCI");
+        assert_eq!(vlan_tag.priority_code_point.as_u8(), 7);
+        assert!(vlan_tag.drop_eligible_indicator);
+        assert_eq!(vlan_tag.vlan_identifier.as_u16(), 0);
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+    }
+
+    #[test]
+    fn encode_rfc_1042_llc_snap_uses_maximum_ieee_8023_length_when_mac_client_data_is_full() {
+        // Arrange
+        let destination = MacAddress::BROADCAST;
+        let source = MacAddress::from_octets([2, 0, 0, 0, 0, 1]);
+        let payload =
+            vec![0xAAu8; usize::from(IEEE_8023_MAXIMUM_LENGTH) - IEEE_8023_LLC_SNAP_HEADER_LENGTH];
+
+        // Act
+        let frame = encode_ieee_8023_rfc_1042_llc_snap_frame(
+            destination,
+            source,
+            None,
+            ETHERNET_PROTOCOL_ARP,
+            &payload,
+        );
+
+        // Assert
+        assert_eq!(&frame[12..14], &IEEE_8023_MAXIMUM_LENGTH.to_be_bytes());
+        let parsed = try_parse_ethernet_frame(&frame).expect("maximum-length SNAP should parse");
+        assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
+        assert_eq!(parsed.payload, payload.as_slice());
+    }
 }

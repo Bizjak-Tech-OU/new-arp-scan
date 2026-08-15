@@ -549,6 +549,7 @@ pub fn try_parse_address_resolution_reply_ipv4_over_ethernet(
 #[cfg(test)]
 mod tests {
     use super::ADDRESS_RESOLUTION_PROTOCOL_IPV4_PAYLOAD_LENGTH;
+    use super::ARP_OPERATION_REPLY;
     use super::ARP_OPERATION_REQUEST;
     use super::MINIMUM_ETHERNET_FRAME_LENGTH_WITHOUT_FRAME_CHECK_SEQUENCE;
     use super::MINIMUM_ETHERNET_MAC_CLIENT_DATA_LENGTH;
@@ -1299,5 +1300,104 @@ mod tests {
         let (ip, mac) = outcome.expect("RFC 1042 SNAP ARP reply should parse");
         assert_eq!(ip, source_ip);
         assert_eq!(mac, source_mac);
+    }
+
+    #[test]
+    fn parses_valid_reply_through_general_ipv4_over_ethernet_parser() {
+        // Arrange
+        let source_mac = MacAddress::from_octets([0xAA; 6]);
+        let source_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let frame = reply_fixture(source_mac, source_ip);
+
+        // Act
+        let parsed = try_parse_address_resolution_ipv4_over_ethernet(&frame)
+            .expect("well-formed reply should parse");
+
+        // Assert
+        assert_eq!(parsed.opcode, ARP_OPERATION_REPLY);
+        assert_eq!(parsed.sender_protocol, source_ip);
+        assert_eq!(parsed.sender_hardware, source_mac);
+    }
+
+    #[test]
+    fn rejects_truncated_arp_payload_after_ethernet_header() {
+        // Arrange
+        let frame = crate::ethernet_frame::encode_ethernet_ii_frame(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+            crate::ethernet_frame::ETHERNET_PROTOCOL_ARP,
+            &[0u8; 10],
+        );
+
+        // Act
+        let outcome = try_parse_address_resolution_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("short ARP payload should fail"),
+            "address resolution payload is shorter than IPv4 over Ethernet"
+        );
+    }
+
+    #[test]
+    fn rejects_reply_when_arp_protocol_length_is_not_ipv4() {
+        // Arrange
+        let mut frame = reply_fixture(MacAddress::from_octets([9; 6]), Ipv4Addr::new(10, 0, 0, 2));
+        let arp_start = ETHERNET_II_HEADER_LENGTH;
+        frame[arp_start + 5] = 3;
+
+        // Act
+        let outcome = try_parse_address_resolution_reply_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("wrong protocol length should fail"),
+            "address resolution address lengths are not Ethernet plus IPv4"
+        );
+    }
+
+    #[test]
+    fn general_parser_rejects_rfc_5494_reserved_opcode_all_ones() {
+        // Arrange
+        let mut frame = reply_fixture(MacAddress::from_octets([9; 6]), Ipv4Addr::new(10, 0, 0, 2));
+        let arp_start = ETHERNET_II_HEADER_LENGTH;
+        frame[arp_start + 6..arp_start + 8].copy_from_slice(&65535u16.to_be_bytes());
+
+        // Act
+        let outcome = try_parse_address_resolution_ipv4_over_ethernet(&frame);
+
+        // Assert
+        assert_eq!(
+            outcome.expect_err("reserved opcode 65535 should fail the general parser"),
+            "address resolution opcode is reserved by RFC 5494"
+        );
+    }
+
+    #[test]
+    fn parses_rfc_1042_llc_snap_request_as_ipv4_over_ethernet_arp() {
+        // Arrange
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let frame = build_address_resolution_request_ethernet_frame_with_wire_options(
+            source_mac,
+            source_ip,
+            Ipv4Addr::new(192, 168, 1, 2),
+            None,
+            true,
+        );
+
+        // Act
+        let parsed = try_parse_address_resolution_ipv4_over_ethernet(&frame)
+            .expect("SNAP request should parse as well-formed ARP");
+
+        // Assert
+        assert_eq!(parsed.opcode, ARP_OPERATION_REQUEST);
+        assert_eq!(parsed.sender_protocol, source_ip);
+        assert_eq!(parsed.sender_hardware, source_mac);
+        assert_eq!(
+            try_parse_address_resolution_reply_ipv4_over_ethernet(&frame)
+                .expect_err("SNAP request must not parse as a reply"),
+            "address resolution opcode is a request, not a reply"
+        );
     }
 }

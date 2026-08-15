@@ -983,4 +983,135 @@ mod tests {
             "SNAP MAC client data of 8+28+1465 must exceed 1500, got: {outcome:?}"
         );
     }
+
+    #[test]
+    fn ethernet_ii_padding_at_ieee_8023_maximum_is_accepted_and_one_octet_over_is_rejected() {
+        // Arrange
+        let maximum = ScanWireOptions {
+            padding: vec![0; 1472],
+            ..ScanWireOptions::default()
+        };
+        let oversize = ScanWireOptions {
+            padding: vec![0; 1473],
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let accepted = maximum.validate_ieee_8023_mac_client_data();
+        let rejected = oversize.validate_ieee_8023_mac_client_data();
+
+        // Assert
+        assert!(
+            accepted.is_ok(),
+            "28+1472 octets is exactly 1500 MAC client data, got: {accepted:?}"
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(crate::error::AppError::Ieee8023MacClientDataExceedsMaximum { .. })
+            ),
+            "28+1473 octets must exceed 1500, got: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ethernet_padding_hex_rejects_empty_uppercase_prefix_and_oversize() {
+        // Arrange
+        // Act
+        let empty = parse_ethernet_padding_hex("");
+        let whitespace = parse_ethernet_padding_hex("  ");
+        let uppercase_prefix = parse_ethernet_padding_hex("0Xdead");
+        let oversize = parse_ethernet_padding_hex(&"aa".repeat(1473));
+        let maximum = parse_ethernet_padding_hex(&"aa".repeat(1472));
+
+        // Assert
+        assert!(
+            empty
+                .expect_err("empty padding should fail")
+                .contains("even number"),
+            "empty padding should mention even hex digits"
+        );
+        assert!(whitespace.is_err(), "whitespace-only padding should fail");
+        assert!(
+            uppercase_prefix
+                .expect_err("0X prefix is not original arp-scan hex")
+                .contains("0x"),
+            "uppercase 0X prefix should be rejected"
+        );
+        assert!(
+            oversize
+                .expect_err("1473 padding octets exceed Ethernet II maximum")
+                .contains("1473"),
+            "oversize padding should name the octet count"
+        );
+        assert_eq!(
+            maximum
+                .expect("1472 padding octets is the Ethernet II maximum")
+                .as_slice()
+                .len(),
+            1472
+        );
+    }
+
+    #[test]
+    fn parse_u8_cli_token_rejects_empty_and_non_integer_tokens() {
+        // Arrange
+        // Act
+        let empty = parse_u8_cli_token("");
+        let garbage = parse_u8_cli_token("not-a-number");
+        let hexadecimal = parse_u8_cli_token("0X0a");
+
+        // Assert
+        assert!(empty.is_err(), "empty 8-bit token should fail");
+        assert!(garbage.is_err(), "non-integer 8-bit token should fail");
+        assert_eq!(hexadecimal, Ok(10), "0X prefix should parse as hexadecimal");
+        let invalid_hex = parse_u8_cli_token("0xzz");
+        assert!(
+            invalid_hex
+                .expect_err("0xzz is not hexadecimal")
+                .contains("hexadecimal"),
+            "invalid hex after 0x should mention hexadecimal"
+        );
+    }
+
+    #[test]
+    fn scan_command_variants_compare_unequal_when_padding_or_pcp_differs() {
+        // Arrange
+        let base = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions::default(),
+        };
+        let padding = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions {
+                padding: vec![0xAA],
+                ..ScanWireOptions::default()
+            },
+        };
+        let priority = ApplicationCommand::Scan {
+            interface_name: Some("eth0".to_string()),
+            target_ipv4_address: None,
+            timeout: DEFAULT_SCAN_TIMEOUT,
+            pacing: DEFAULT_SCAN_PACING,
+            attempts: DEFAULT_SCAN_ATTEMPTS,
+            wire: ScanWireOptions {
+                vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(1).expect("PCP 1 fits"),
+                ..ScanWireOptions::default()
+            },
+        };
+
+        // Act
+        // Assert
+        assert_ne!(base, padding);
+        assert_ne!(base, priority);
+        assert_ne!(padding, priority);
+    }
 }
