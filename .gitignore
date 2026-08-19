@@ -2,6 +2,7 @@
 .idea
 .vscode
 .cursor
+.claude
 .zed
 
 # Cargo

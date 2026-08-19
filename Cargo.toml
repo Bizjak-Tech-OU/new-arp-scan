@@ -2,10 +2,11 @@
 name = "new-arp-scan"
 version = "0.0.2"
 edition = "2024"
+rust-version = "1.97"
 license = "AGPL-3.0-only"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive", "std"] }
+clap = { version = "4.6", features = ["derive", "std"] }
 libc = "0.2"
 
 [lints.rust]
