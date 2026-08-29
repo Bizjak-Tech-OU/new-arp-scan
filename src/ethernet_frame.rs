@@ -1,9 +1,17 @@
 //! Ethernet II frame encoding and defensive parsing.
 //!
-//! Encoders return exactly 14 octets of header plus the caller-supplied payload with no automatic
+//! Encoders return the header octets plus the caller-supplied payload with no automatic
 //! minimum-frame padding. Parsers distinguish IEEE 802.3 length fields from Ethernet II `EtherType`
-//! values, decode a single IEEE 802.1Q tag (PCP, DEI, and VID), accept RFC 1042 LLC/SNAP ARP
-//! encapsulation, and reject stacked VLAN tags so higher layers never misread a shifted layout.
+//! values, decode either a single IEEE 802.1Q customer tag (TPID `0x8100`) or one IEEE 802.1Q
+//! service tag (TPID `0x88A8`) wrapping exactly one customer tag, accept RFC 1042 LLC/SNAP ARP
+//! encapsulation, and reject every other tag arrangement so higher layers never misread a shifted
+//! layout.
+//!
+//! The two-tag form is the IEEE 802.1ad Provider Bridge model later incorporated into IEEE 802.1Q:
+//! an outer service tag (S-TAG) whose TPID is the IANA-registered `EtherType` 34984 (`0x88A8`,
+//! "IEEE Std 802.1Q - Service VLAN tag identifier (S-Tag)"), then an inner customer tag (C-TAG)
+//! with TPID `0x8100`, each carrying its own Tag Control Information. Deeper stacks, the reverse
+//! order, and the unofficial vendor TPIDs `0x9100` / `0x9200` / `0x9300` are all rejected.
 
 use crate::mac_address::MacAddress;
 
@@ -12,6 +20,9 @@ pub const ETHERNET_II_HEADER_LENGTH: usize = 14;
 
 /// Extra octets added by a single IEEE 802.1Q tag (TPID + TCI).
 pub const IEEE_8021Q_TAG_LENGTH: usize = 4;
+
+/// Extra octets added by an IEEE 802.1Q service tag stacked on a customer tag (S-TAG + C-TAG).
+pub const IEEE_8021AD_TAG_STACK_LENGTH: usize = IEEE_8021Q_TAG_LENGTH * 2;
 
 /// Length of an IEEE 802.2 LLC header plus RFC 1042 SNAP header (DSAP, SSAP, control, OUI, type).
 pub const IEEE_8023_LLC_SNAP_HEADER_LENGTH: usize = 8;
@@ -26,7 +37,10 @@ pub const MINIMUM_ETHERNET_II_ETHERTYPE: u16 = 1536;
 /// `EtherType` for IEEE 802.1Q VLAN tagging (`ETH_P_8021Q` in `linux/if_ether.h`).
 pub const ETHERNET_PROTOCOL_VLAN_TAG: u16 = 0x8100;
 
-/// `EtherType` for IEEE 802.1ad service VLAN tagging (`ETH_P_8021AD`).
+/// `EtherType` for IEEE 802.1Q service VLAN tagging / IEEE 802.1ad S-TAG (`ETH_P_8021AD`).
+///
+/// IANA IEEE 802 Numbers registers decimal 34984 as "IEEE Std 802.1Q - Service VLAN tag identifier
+/// (S-Tag)". Linux `linux/if_ether.h` spells the same value `ETH_P_8021AD`.
 pub const ETHERNET_PROTOCOL_VLAN_TAG_SERVICE: u16 = 0x88A8;
 
 /// Unofficial stacked-VLAN TPID `0x9100` still seen on some switches.
@@ -188,6 +202,79 @@ impl From<Ieee8021qVlanIdentifier> for Ieee8021qTagControlInformation {
     }
 }
 
+/// The VLAN tags carried by one transmitted frame.
+///
+/// This models the only two arrangements the encoders and parser accept, so a service tag without
+/// its customer tag cannot be constructed: a lone IEEE 802.1Q customer tag (TPID `0x8100`), or an
+/// IEEE 802.1Q service tag (TPID `0x88A8`) wrapping exactly one customer tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ieee8021qTagStack {
+    /// One customer tag (C-TAG), TPID `0x8100`.
+    Customer(Ieee8021qTagControlInformation),
+    /// One service tag (S-TAG, TPID `0x88A8`) followed by one customer tag (C-TAG, TPID `0x8100`).
+    ServiceAndCustomer {
+        /// Outer service Tag Control Information.
+        service: Ieee8021qTagControlInformation,
+        /// Inner customer Tag Control Information.
+        customer: Ieee8021qTagControlInformation,
+    },
+}
+
+impl Ieee8021qTagStack {
+    /// Builds the stack from an optional service TCI and a required customer TCI.
+    #[must_use]
+    pub const fn new(
+        service: Option<Ieee8021qTagControlInformation>,
+        customer: Ieee8021qTagControlInformation,
+    ) -> Self {
+        match service {
+            Some(service) => Self::ServiceAndCustomer { service, customer },
+            None => Self::Customer(customer),
+        }
+    }
+
+    /// Returns the outer service Tag Control Information, when the stack carries an S-TAG.
+    #[must_use]
+    pub const fn service_tag_control_information(self) -> Option<Ieee8021qTagControlInformation> {
+        match self {
+            Self::Customer(_) => None,
+            Self::ServiceAndCustomer { service, .. } => Some(service),
+        }
+    }
+
+    /// Returns the inner customer Tag Control Information, which is always present.
+    #[must_use]
+    pub const fn customer_tag_control_information(self) -> Ieee8021qTagControlInformation {
+        match self {
+            Self::Customer(customer) | Self::ServiceAndCustomer { customer, .. } => customer,
+        }
+    }
+
+    /// Octets this stack adds to an Ethernet header.
+    #[must_use]
+    pub const fn encoded_octet_count(self) -> usize {
+        match self {
+            Self::Customer(_) => IEEE_8021Q_TAG_LENGTH,
+            Self::ServiceAndCustomer { .. } => IEEE_8021AD_TAG_STACK_LENGTH,
+        }
+    }
+
+    /// Returns the outermost TPID this stack puts in the length/type field at offset 12.
+    #[must_use]
+    pub const fn outer_tag_protocol_identifier(self) -> u16 {
+        match self {
+            Self::Customer(_) => ETHERNET_PROTOCOL_VLAN_TAG,
+            Self::ServiceAndCustomer { .. } => ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+        }
+    }
+}
+
+impl From<Ieee8021qTagControlInformation> for Ieee8021qTagStack {
+    fn from(customer: Ieee8021qTagControlInformation) -> Self {
+        Self::Customer(customer)
+    }
+}
+
 /// `EtherType` for IPv4 (`ETH_P_IP`).
 pub const ETHERNET_PROTOCOL_IPV4: u16 = 0x0800;
 
@@ -221,9 +308,13 @@ pub struct ParsedEthernetFrame<'a> {
     pub source: MacAddress,
     /// Inner `EtherType` in host byte order (after stripping one 802.1Q tag and/or SNAP).
     pub ether_type: u16,
-    /// IEEE 802.1Q Tag Control Information when a single customer tag was present.
+    /// IEEE 802.1Q service Tag Control Information when an outer S-TAG (TPID `0x88A8`) was
+    /// present. Always accompanied by [`Self::vlan_tag`]; an S-TAG alone does not parse.
+    pub service_vlan_tag: Option<Ieee8021qTagControlInformation>,
+    /// IEEE 802.1Q customer Tag Control Information when a customer tag (TPID `0x8100`) was
+    /// present, whether alone or inside a service tag.
     pub vlan_tag: Option<Ieee8021qTagControlInformation>,
-    /// IEEE 802.1Q VLAN identifier when a single customer tag was present (low 12 TCI bits).
+    /// Customer IEEE 802.1Q VLAN identifier when a customer tag was present (low 12 TCI bits).
     pub vlan_identifier: Option<u16>,
     /// Framing used to reach [`Self::ether_type`].
     pub framing: EthernetFraming,
@@ -253,12 +344,14 @@ pub fn encode_ethernet_ii_frame(
     frame
 }
 
-/// Builds an Ethernet II frame, optionally inserting a single IEEE 802.1Q tag after the source
+/// Builds an Ethernet II frame, optionally inserting an IEEE 802.1Q tag stack after the source
 /// address.
 ///
-/// When `vlan_tag` is [`None`], this matches [`encode_ethernet_ii_frame`]. When it is [`Some`], the
-/// header is destination, source, TPID `0x8100`, the 16-bit TCI (PCP, DEI, and VID), inner
-/// `EtherType`, then `payload`. No minimum-frame padding is applied.
+/// When `vlan_tag` is [`None`], this matches [`encode_ethernet_ii_frame`]. For
+/// [`Ieee8021qTagStack::Customer`] the header is destination, source, TPID `0x8100`, the 16-bit
+/// TCI, inner `EtherType`, then `payload`. For [`Ieee8021qTagStack::ServiceAndCustomer`] the
+/// header is destination, source, TPID `0x88A8`, the service TCI, TPID `0x8100`, the customer TCI,
+/// inner `EtherType`, then `payload`. No minimum-frame padding is applied.
 ///
 /// # Panics
 ///
@@ -267,7 +360,7 @@ pub fn encode_ethernet_ii_frame(
 pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
     destination: MacAddress,
     source: MacAddress,
-    vlan_tag: Option<Ieee8021qTagControlInformation>,
+    vlan_tag: Option<Ieee8021qTagStack>,
     ether_type: u16,
     payload: &[u8],
 ) -> Vec<u8> {
@@ -275,21 +368,24 @@ pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
         return encode_ethernet_ii_frame(destination, source, ether_type, payload);
     };
 
-    let tagged_header_length = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
+    let tagged_header_length = ETHERNET_II_HEADER_LENGTH + vlan_tag.encoded_octet_count();
     let mut frame = Vec::with_capacity(tagged_header_length + payload.len());
     frame.extend_from_slice(&destination.octets());
     frame.extend_from_slice(&source.octets());
-    append_ieee_8021q_tag(&mut frame, vlan_tag);
+    append_ieee_8021q_tag_stack(&mut frame, vlan_tag);
     frame.extend_from_slice(&ether_type.to_be_bytes());
     frame.extend_from_slice(payload);
     frame
 }
 
-/// Builds an IEEE 802.3 frame with RFC 1042 LLC/SNAP encapsulation and an optional IEEE 802.1Q tag.
+/// Builds an IEEE 802.3 frame with RFC 1042 LLC/SNAP encapsulation and an optional IEEE 802.1Q tag
+/// stack.
 ///
-/// Layout is destination, source, optional TPID/TCI, a length field equal to LLC + SNAP +
-/// `payload` (the MAC client data following the length field), then `AA AA 03 00 00 00`, the inner
-/// `EtherType`, then `payload`. No minimum-frame padding is applied.
+/// Layout is destination, source, the optional tag stack (one customer tag, or a service tag then
+/// a customer tag), a length field equal to LLC + SNAP + `payload` (the MAC client data following
+/// the length field), then `AA AA 03 00 00 00`, the inner `EtherType`, then `payload`. VLAN tags
+/// sit before the length field and are therefore not counted in it. No minimum-frame padding is
+/// applied.
 ///
 /// # Panics
 ///
@@ -299,22 +395,20 @@ pub fn encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
 pub fn encode_ieee_8023_rfc_1042_llc_snap_frame(
     destination: MacAddress,
     source: MacAddress,
-    vlan_tag: Option<Ieee8021qTagControlInformation>,
+    vlan_tag: Option<Ieee8021qTagStack>,
     ether_type: u16,
     payload: &[u8],
 ) -> Vec<u8> {
     let mac_client_data_length = IEEE_8023_LLC_SNAP_HEADER_LENGTH.saturating_add(payload.len());
     let length_field = u16::try_from(mac_client_data_length).unwrap_or(IEEE_8023_MAXIMUM_LENGTH);
-    let tagged_header_length = match vlan_tag {
-        Some(_) => ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH,
-        None => ETHERNET_II_HEADER_LENGTH,
-    };
+    let tagged_header_length =
+        ETHERNET_II_HEADER_LENGTH + vlan_tag.map_or(0, Ieee8021qTagStack::encoded_octet_count);
     let mut frame =
         Vec::with_capacity(tagged_header_length + IEEE_8023_LLC_SNAP_HEADER_LENGTH + payload.len());
     frame.extend_from_slice(&destination.octets());
     frame.extend_from_slice(&source.octets());
     if let Some(vlan_tag) = vlan_tag {
-        append_ieee_8021q_tag(&mut frame, vlan_tag);
+        append_ieee_8021q_tag_stack(&mut frame, vlan_tag);
     }
     frame.extend_from_slice(&length_field.to_be_bytes());
     frame.push(LLC_SNAP_ADDRESS);
@@ -326,22 +420,38 @@ pub fn encode_ieee_8023_rfc_1042_llc_snap_frame(
     frame
 }
 
-fn append_ieee_8021q_tag(frame: &mut Vec<u8>, vlan_tag: Ieee8021qTagControlInformation) {
-    frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
-    frame.extend_from_slice(&vlan_tag.as_u16().to_be_bytes());
+/// Appends the tag stack after the source address.
+///
+/// The first TPID written is [`Ieee8021qTagStack::outer_tag_protocol_identifier`], so the octets on
+/// the wire and the `sockaddr_ll` send protocol Linux uses for the same frame cannot disagree.
+fn append_ieee_8021q_tag_stack(frame: &mut Vec<u8>, vlan_tag: Ieee8021qTagStack) {
+    frame.extend_from_slice(&vlan_tag.outer_tag_protocol_identifier().to_be_bytes());
+    if let Some(service) = vlan_tag.service_tag_control_information() {
+        frame.extend_from_slice(&service.as_u16().to_be_bytes());
+        frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+    }
+    frame.extend_from_slice(
+        &vlan_tag
+            .customer_tag_control_information()
+            .as_u16()
+            .to_be_bytes(),
+    );
 }
 
-/// Parses destination, source, and the payload after Ethernet II, optional IEEE 802.1Q, and
-/// optional RFC 1042 LLC/SNAP headers.
+/// Parses destination, source, and the payload after Ethernet II, an optional IEEE 802.1Q tag
+/// stack, and optional RFC 1042 LLC/SNAP headers.
 ///
-/// Stacked VLAN tags (IEEE 802.1ad / double IEEE 802.1Q) are rejected so the inner `EtherType` is
-/// never read from the wrong offset. IEEE 802.3 length values that are not RFC 1042 SNAP are
-/// rejected.
+/// Exactly two tag arrangements are accepted: one customer tag (TPID `0x8100`), or one service tag
+/// (TPID `0x88A8`) immediately followed by one customer tag. Every other arrangement — a lone
+/// service tag, a customer tag outside a service tag, three or more tags, and the unofficial
+/// vendor TPIDs `0x9100` / `0x9200` / `0x9300` — is rejected so the inner `EtherType` is never read
+/// from the wrong offset. IEEE 802.3 length values that are not RFC 1042 SNAP are rejected.
 ///
 /// # Errors
 ///
-/// Returns a static message when `frame_slice` is too short, when tagging is stacked or uses an
-/// unsupported TPID, or when a length field does not introduce RFC 1042 SNAP.
+/// Returns a static message when `frame_slice` is too short, when a tag header is truncated, when
+/// tagging uses an unsupported TPID or an unsupported arrangement, or when a length field does not
+/// introduce RFC 1042 SNAP.
 ///
 /// # Panics
 ///
@@ -360,61 +470,149 @@ pub fn try_parse_ethernet_frame(
     let type_or_length = u16::from_be_bytes([frame_slice[12], frame_slice[13]]);
 
     let (vlan_tag, inner_type_or_length, payload_start) =
-        decode_optional_ieee_8021q_tag(frame_slice, type_or_length)?;
+        decode_optional_ieee_8021q_tag_stack(frame_slice, type_or_length)?;
     let (ether_type, payload_start, framing) =
         decode_ethertype_or_ieee_8023_snap(frame_slice, inner_type_or_length, payload_start)?;
 
+    let customer_tag = vlan_tag.map(Ieee8021qTagStack::customer_tag_control_information);
     Ok(ParsedEthernetFrame {
         destination: MacAddress::from_octets(destination_octets),
         source: MacAddress::from_octets(source_octets),
         ether_type,
-        vlan_tag,
-        vlan_identifier: vlan_tag.map(|tag| tag.vlan_identifier.as_u16()),
+        service_vlan_tag: vlan_tag.and_then(Ieee8021qTagStack::service_tag_control_information),
+        vlan_tag: customer_tag,
+        vlan_identifier: customer_tag.map(|tag| tag.vlan_identifier.as_u16()),
         framing,
         payload: &frame_slice[payload_start..],
     })
 }
 
-fn decode_optional_ieee_8021q_tag(
+/// Reads the 16-bit field at `offset`, or reports `truncation_message` when it is not fully present.
+fn read_u16_at(
+    frame_slice: &[u8],
+    offset: usize,
+    truncation_message: &'static str,
+) -> Result<u16, &'static str> {
+    let field = frame_slice
+        .get(offset..offset.saturating_add(2))
+        .ok_or(truncation_message)?;
+    Ok(u16::from_be_bytes([field[0], field[1]]))
+}
+
+/// Decodes the optional IEEE 802.1Q tag stack that follows the source address.
+///
+/// Returns the decoded stack, the length/type field that follows it, and the offset at which that
+/// field's payload begins.
+fn decode_optional_ieee_8021q_tag_stack(
     frame_slice: &[u8],
     type_or_length: u16,
-) -> Result<(Option<Ieee8021qTagControlInformation>, u16, usize), &'static str> {
+) -> Result<(Option<Ieee8021qTagStack>, u16, usize), &'static str> {
     if is_unsupported_vlan_tpid(type_or_length) {
-        return Err(
-            "Ethernet frame uses IEEE 802.1ad or QinQ tagging; a single IEEE 802.1Q tag is required here",
-        );
+        return Err(UNSUPPORTED_QINQ_TPID_MESSAGE);
+    }
+
+    if type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_SERVICE {
+        return decode_ieee_8021ad_service_and_customer_tags(frame_slice);
     }
 
     if type_or_length != ETHERNET_PROTOCOL_VLAN_TAG {
         return Ok((None, type_or_length, ETHERNET_II_HEADER_LENGTH));
     }
 
-    let tagged_header_length = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
-    if frame_slice.len() < tagged_header_length {
-        return Err("IEEE 802.1Q tag is truncated");
-    }
-
-    let tag_control_information = u16::from_be_bytes([frame_slice[14], frame_slice[15]]);
-    let inner_type_or_length = u16::from_be_bytes([frame_slice[16], frame_slice[17]]);
+    let customer = Ieee8021qTagControlInformation::from_tag_control_information(read_u16_at(
+        frame_slice,
+        ETHERNET_II_HEADER_LENGTH,
+        "IEEE 802.1Q tag is truncated",
+    )?);
+    let payload_start = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
+    let inner_type_or_length = read_u16_at(
+        frame_slice,
+        ETHERNET_II_HEADER_LENGTH + 2,
+        "IEEE 802.1Q tag is truncated",
+    )?;
 
     if inner_type_or_length == ETHERNET_PROTOCOL_VLAN_TAG
+        || inner_type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_SERVICE
         || is_unsupported_vlan_tpid(inner_type_or_length)
     {
-        return Err(
-            "Ethernet frame uses stacked VLAN tagging; a single IEEE 802.1Q tag is required here",
-        );
+        return Err(STACKED_CUSTOMER_TAG_MESSAGE);
     }
 
     Ok((
-        Some(Ieee8021qTagControlInformation::from_tag_control_information(tag_control_information)),
+        Some(Ieee8021qTagStack::Customer(customer)),
         inner_type_or_length,
-        tagged_header_length,
+        payload_start,
     ))
 }
 
+/// Decodes an IEEE 802.1Q service tag (`0x88A8`) that must be followed by exactly one customer tag.
+fn decode_ieee_8021ad_service_and_customer_tags(
+    frame_slice: &[u8],
+) -> Result<(Option<Ieee8021qTagStack>, u16, usize), &'static str> {
+    let service = Ieee8021qTagControlInformation::from_tag_control_information(read_u16_at(
+        frame_slice,
+        ETHERNET_II_HEADER_LENGTH,
+        SERVICE_TAG_TRUNCATED_MESSAGE,
+    )?);
+    let customer_tag_protocol_identifier = read_u16_at(
+        frame_slice,
+        ETHERNET_II_HEADER_LENGTH + 2,
+        SERVICE_TAG_TRUNCATED_MESSAGE,
+    )?;
+    if customer_tag_protocol_identifier != ETHERNET_PROTOCOL_VLAN_TAG {
+        return Err(SERVICE_TAG_WITHOUT_CUSTOMER_TAG_MESSAGE);
+    }
+
+    let customer_tag_offset = ETHERNET_II_HEADER_LENGTH + IEEE_8021Q_TAG_LENGTH;
+    let customer = Ieee8021qTagControlInformation::from_tag_control_information(read_u16_at(
+        frame_slice,
+        customer_tag_offset,
+        CUSTOMER_TAG_TRUNCATED_MESSAGE,
+    )?);
+    let payload_start = ETHERNET_II_HEADER_LENGTH + IEEE_8021AD_TAG_STACK_LENGTH;
+    let inner_type_or_length = read_u16_at(
+        frame_slice,
+        customer_tag_offset + 2,
+        CUSTOMER_TAG_TRUNCATED_MESSAGE,
+    )?;
+
+    if inner_type_or_length == ETHERNET_PROTOCOL_VLAN_TAG
+        || inner_type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_SERVICE
+        || is_unsupported_vlan_tpid(inner_type_or_length)
+    {
+        return Err(TAG_STACK_TOO_DEEP_MESSAGE);
+    }
+
+    Ok((
+        Some(Ieee8021qTagStack::ServiceAndCustomer { service, customer }),
+        inner_type_or_length,
+        payload_start,
+    ))
+}
+
+/// Rejection message for the unofficial vendor `QinQ` TPIDs `0x9100` / `0x9200` / `0x9300`.
+const UNSUPPORTED_QINQ_TPID_MESSAGE: &str = "Ethernet frame uses an unofficial QinQ TPID; only IEEE 802.1Q 0x8100 and 0x88A8 tagging is supported here";
+
+/// Rejection message for a customer tag directly inside another customer tag.
+const STACKED_CUSTOMER_TAG_MESSAGE: &str = "Ethernet frame stacks a VLAN tag inside an IEEE 802.1Q customer tag; only 0x88A8 may wrap 0x8100";
+
+/// Rejection message for a service tag whose Tag Control Information or inner TPID is cut off.
+const SERVICE_TAG_TRUNCATED_MESSAGE: &str = "IEEE 802.1Q service tag is truncated";
+
+/// Rejection message for a customer tag inside a service tag whose fields are cut off.
+const CUSTOMER_TAG_TRUNCATED_MESSAGE: &str =
+    "IEEE 802.1Q customer tag inside a service tag is truncated";
+
+/// Rejection message for `0x88A8` that is not followed by a `0x8100` customer tag.
+const SERVICE_TAG_WITHOUT_CUSTOMER_TAG_MESSAGE: &str =
+    "IEEE 802.1Q service tag is not followed by an IEEE 802.1Q customer tag";
+
+/// Rejection message for a third tag after a legal service-plus-customer pair.
+const TAG_STACK_TOO_DEEP_MESSAGE: &str =
+    "Ethernet frame stacks more than one IEEE 802.1Q service tag and one customer tag";
+
 fn is_unsupported_vlan_tpid(type_or_length: u16) -> bool {
-    type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_SERVICE
-        || type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100
+    type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100
         || type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9200
         || type_or_length == ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300
 }
@@ -475,6 +673,7 @@ mod tests {
     use super::IEEE_8023_MAXIMUM_LENGTH;
     use super::Ieee8021qPriorityCodePoint;
     use super::Ieee8021qTagControlInformation;
+    use super::Ieee8021qTagStack;
     use super::Ieee8021qVlanIdentifier;
     use super::MINIMUM_ETHERNET_II_ETHERTYPE;
     use super::encode_ethernet_ii_frame;
@@ -548,8 +747,8 @@ mod tests {
         let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
             destination,
             source,
-            Some(Ieee8021qTagControlInformation::from_vlan_identifier(
-                vlan_identifier,
+            Some(Ieee8021qTagStack::Customer(
+                Ieee8021qTagControlInformation::from_vlan_identifier(vlan_identifier),
             )),
             ETHERNET_PROTOCOL_ARP,
             &payload,
@@ -620,8 +819,8 @@ mod tests {
         let frame = encode_ieee_8023_rfc_1042_llc_snap_frame(
             destination,
             source,
-            Some(Ieee8021qTagControlInformation::from_vlan_identifier(
-                vlan_identifier,
+            Some(Ieee8021qTagStack::Customer(
+                Ieee8021qTagControlInformation::from_vlan_identifier(vlan_identifier),
             )),
             ETHERNET_PROTOCOL_ARP,
             &payload,
@@ -779,8 +978,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_ieee_8021ad_service_tag() {
-        // Arrange
+    fn parse_rejects_service_tag_that_is_not_followed_by_a_customer_tag() {
+        // Arrange: 0x88A8, a service TCI, then ARP directly instead of a 0x8100 customer tag.
         let destination = MacAddress::BROADCAST;
         let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
         let inner = [0x00, 0x01, 0x08, 0x06];
@@ -795,11 +994,10 @@ mod tests {
         let outcome = try_parse_ethernet_frame(&wire);
 
         // Assert
-        assert!(
-            outcome
-                .expect_err("802.1ad should be rejected")
-                .contains("802.1ad"),
-            "error should mention 802.1ad, got: {outcome:?}"
+        assert_eq!(
+            outcome.expect_err("a lone service tag should be rejected"),
+            "IEEE 802.1Q service tag is not followed by an IEEE 802.1Q customer tag",
+            "an S-TAG without its C-TAG must not be read as untagged ARP"
         );
     }
 
@@ -816,11 +1014,10 @@ mod tests {
         let outcome = try_parse_ethernet_frame(&wire);
 
         // Assert
-        assert!(
-            outcome
-                .expect_err("QinQ customer stack should be rejected")
-                .contains("stacked VLAN"),
-            "error should mention stacked VLAN, got: {outcome:?}"
+        assert_eq!(
+            outcome.expect_err("two stacked customer tags should be rejected"),
+            "Ethernet frame stacks a VLAN tag inside an IEEE 802.1Q customer tag; only 0x88A8 may wrap 0x8100",
+            "0x8100 inside 0x8100 is vendor QinQ, not the IEEE S-TAG/C-TAG pair"
         );
     }
 
@@ -930,11 +1127,10 @@ mod tests {
 
         // Assert
         for (tpid, outcome) in tpids.iter().zip(outcomes) {
-            assert!(
-                outcome
-                    .expect_err("unofficial QinQ TPID should be rejected")
-                    .contains("802.1ad or QinQ"),
-                "TPID {tpid:#06x} should be rejected as QinQ"
+            assert_eq!(
+                outcome.expect_err("unofficial QinQ TPID should be rejected"),
+                "Ethernet frame uses an unofficial QinQ TPID; only IEEE 802.1Q 0x8100 and 0x88A8 tagging is supported here",
+                "TPID {tpid:#06x} is not an officially registered EtherType and must stay rejected"
             );
         }
     }
@@ -954,11 +1150,10 @@ mod tests {
         let outcome = try_parse_ethernet_frame(&frame);
 
         // Assert
-        assert!(
-            outcome
-                .expect_err("inner 802.1ad should be rejected as stacked VLAN")
-                .contains("stacked VLAN"),
-            "error should mention stacked VLAN, got: {outcome:?}"
+        assert_eq!(
+            outcome.expect_err("a service tag inside a customer tag should be rejected"),
+            "Ethernet frame stacks a VLAN tag inside an IEEE 802.1Q customer tag; only 0x88A8 may wrap 0x8100",
+            "IEEE 802.1ad orders the S-TAG outside the C-TAG; the reverse order is not accepted"
         );
     }
 
@@ -1010,7 +1205,7 @@ mod tests {
         let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
             destination,
             source,
-            Some(tag),
+            Some(Ieee8021qTagStack::Customer(tag)),
             ETHERNET_PROTOCOL_ARP,
             &[0x99],
         );
