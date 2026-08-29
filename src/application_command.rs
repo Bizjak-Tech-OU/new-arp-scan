@@ -11,7 +11,8 @@ use crate::address_resolution_protocol::{
 };
 use crate::ethernet_frame::{
     ETHERNET_PROTOCOL_IPV4, IEEE_8023_LLC_SNAP_HEADER_LENGTH, IEEE_8023_MAXIMUM_LENGTH,
-    Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier,
+    Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation, Ieee8021qTagStack,
+    Ieee8021qVlanIdentifier,
 };
 use crate::mac_address::MacAddress;
 
@@ -101,12 +102,24 @@ where
 /// On-wire options for transmitted ARP requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanWireOptions {
-    /// When set, transmit a single IEEE 802.1Q tag with this VLAN identifier.
+    /// When set, transmit an IEEE 802.1Q customer tag (TPID `0x8100`) with this VLAN identifier.
     pub vlan_identifier: Option<Ieee8021qVlanIdentifier>,
-    /// IEEE 802.1Q Priority Code Point. Ignored when [`Self::vlan_identifier`] is [`None`].
+    /// IEEE 802.1Q customer Priority Code Point. Ignored when [`Self::vlan_identifier`] is
+    /// [`None`].
     pub vlan_priority_code_point: Ieee8021qPriorityCodePoint,
-    /// IEEE 802.1Q Drop Eligible Indicator. Ignored when [`Self::vlan_identifier`] is [`None`].
+    /// IEEE 802.1Q customer Drop Eligible Indicator. Ignored when [`Self::vlan_identifier`] is
+    /// [`None`].
     pub vlan_drop_eligible_indicator: bool,
+    /// When set, wrap the customer tag in an IEEE 802.1Q service tag (S-TAG, TPID `0x88A8`) with
+    /// this VLAN identifier. Requires [`Self::vlan_identifier`]; see
+    /// [`Self::validate_ieee_8021q_tag_stack`].
+    pub service_vlan_identifier: Option<Ieee8021qVlanIdentifier>,
+    /// IEEE 802.1Q service Priority Code Point. Ignored when [`Self::service_vlan_identifier`] is
+    /// [`None`].
+    pub service_vlan_priority_code_point: Ieee8021qPriorityCodePoint,
+    /// IEEE 802.1Q service Drop Eligible Indicator. Ignored when
+    /// [`Self::service_vlan_identifier`] is [`None`].
+    pub service_vlan_drop_eligible_indicator: bool,
     /// Value encoded in RFC 826 `ar$spa`.
     pub sender_protocol_address: ArpSenderProtocolAddress,
     /// When true, encapsulate ARP in IEEE 802.3 with RFC 1042 LLC/SNAP instead of Ethernet II.
@@ -140,6 +153,9 @@ impl Default for ScanWireOptions {
             vlan_identifier: None,
             vlan_priority_code_point: Ieee8021qPriorityCodePoint::ZERO,
             vlan_drop_eligible_indicator: false,
+            service_vlan_identifier: None,
+            service_vlan_priority_code_point: Ieee8021qPriorityCodePoint::ZERO,
+            service_vlan_drop_eligible_indicator: false,
             sender_protocol_address: ArpSenderProtocolAddress::Interface,
             llc_snap: false,
             ethernet_destination: None,
@@ -168,13 +184,7 @@ impl ScanWireOptions {
         AddressResolutionRequestLayout {
             ethernet_destination: self.ethernet_destination.unwrap_or(MacAddress::BROADCAST),
             ethernet_source: self.ethernet_source.unwrap_or(interface_mac_address),
-            vlan_tag: self.vlan_identifier.map(|vlan_identifier| {
-                Ieee8021qTagControlInformation::new(
-                    self.vlan_priority_code_point,
-                    self.vlan_drop_eligible_indicator,
-                    vlan_identifier,
-                )
-            }),
+            vlan_tag: self.ieee_8021q_tag_stack(),
             llc_snap: self.llc_snap,
             hardware_type: self.arp_hardware_type,
             protocol_type: self.arp_protocol_type,
@@ -189,7 +199,52 @@ impl ScanWireOptions {
         }
     }
 
+    /// Resolves the configured VLAN tagging into the encodable tag stack.
+    ///
+    /// Returns [`None`] when no customer tag is configured. A service tag without a customer tag
+    /// cannot be encoded and is reported by [`Self::validate_ieee_8021q_tag_stack`]; it is dropped
+    /// here rather than silently emitted as a lone S-TAG.
+    #[must_use]
+    pub(crate) fn ieee_8021q_tag_stack(&self) -> Option<Ieee8021qTagStack> {
+        let customer = Ieee8021qTagControlInformation::new(
+            self.vlan_priority_code_point,
+            self.vlan_drop_eligible_indicator,
+            self.vlan_identifier?,
+        );
+        let service = self.service_vlan_identifier.map(|service_vlan_identifier| {
+            Ieee8021qTagControlInformation::new(
+                self.service_vlan_priority_code_point,
+                self.service_vlan_drop_eligible_indicator,
+                service_vlan_identifier,
+            )
+        });
+        Some(Ieee8021qTagStack::new(service, customer))
+    }
+
+    /// Rejects an IEEE 802.1Q service tag that has no customer tag to wrap.
+    ///
+    /// IEEE 802.1ad provider bridging stacks an S-TAG (`0x88A8`) on a C-TAG (`0x8100`); a lone
+    /// S-TAG is not a frame this tool transmits, and the receive parser rejects it too. The CLI
+    /// blocks the combination with clap `requires`, so this guards library callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::AppError::ServiceVlanTagRequiresCustomerVlanTag`] when
+    /// [`Self::service_vlan_identifier`] is set while [`Self::vlan_identifier`] is [`None`].
+    pub fn validate_ieee_8021q_tag_stack(&self) -> Result<(), crate::error::AppError> {
+        match (self.service_vlan_identifier, self.vlan_identifier) {
+            (Some(service_vlan_identifier), None) => Err(
+                crate::error::AppError::ServiceVlanTagRequiresCustomerVlanTag {
+                    service_vlan_identifier: service_vlan_identifier.as_u16(),
+                },
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// IEEE 802.3 MAC client data length for one transmitted request (LLC/SNAP, ARP, and padding).
+    ///
+    /// VLAN tags sit before the IEEE 802.3 length field and are therefore not counted here.
     #[must_use]
     pub fn ieee_8023_mac_client_data_octet_count(&self) -> usize {
         let arp_and_padding =
@@ -316,7 +371,8 @@ pub enum ApplicationCommand {
         pacing: Duration,
         /// Total request rounds: each round sends one broadcast request per target.
         attempts: NonZeroU64,
-        /// IEEE 802.1Q tag, RFC 826 field overrides, Ethernet addressing, and RFC 1042 LLC/SNAP.
+        /// IEEE 802.1Q tagging (customer and optional service tag), RFC 826 field overrides,
+        /// Ethernet addressing, and RFC 1042 LLC/SNAP.
         wire: ScanWireOptions,
     },
     /// List interfaces that are usable for ARP scanning on Linux.
@@ -958,7 +1014,16 @@ mod tests {
 
         // Assert
         let tag = layout.vlan_tag.expect("VLAN tag should be present");
-        assert_eq!(tag.as_u16(), 0xB00A);
+        assert_eq!(
+            tag.customer_tag_control_information().as_u16(),
+            0xB00A,
+            "PCP 5, DEI 1, VID 10 should encode as customer TCI 0xB00A"
+        );
+        assert_eq!(
+            tag.service_tag_control_information(),
+            None,
+            "no --svlan means no service tag"
+        );
         assert_eq!(layout.padding, &[0xDE, 0xAD]);
     }
 

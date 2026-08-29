@@ -354,6 +354,7 @@ pub(crate) fn collect_scan_over_endpoint(
     pacing_between_scan_rounds: Duration,
     scan_round_count: NonZeroU64,
 ) -> Result<ScanOutcome, AppError> {
+    transmit.wire.validate_ieee_8021q_tag_stack()?;
     transmit.wire.validate_ieee_8023_mac_client_data()?;
     let mut warnings = Vec::new();
 
@@ -1234,7 +1235,7 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
     use crate::ethernet_frame::{
         ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4,
         ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation,
-        Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
+        Ieee8021qTagStack, Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
         encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
         encode_ieee_8023_rfc_1042_llc_snap_frame,
     };
@@ -2105,8 +2106,10 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
         let tagged = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
             MacAddress::BROADCAST,
             sender_mac,
-            Some(Ieee8021qTagControlInformation::from_vlan_identifier(
-                Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits"),
+            Some(Ieee8021qTagStack::Customer(
+                Ieee8021qTagControlInformation::from_vlan_identifier(
+                    Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits"),
+                ),
             )),
             ETHERNET_PROTOCOL_ARP,
             &arp_payload,

@@ -178,6 +178,7 @@ fn run_address_resolution_scan(
     attempts: std::num::NonZeroU64,
     wire: ScanWireOptions,
 ) -> Result<ApplicationOutcome, AppError> {
+    wire.validate_ieee_8021q_tag_stack()?;
     wire.validate_ieee_8023_mac_client_data()?;
     if let Some(interface_name) = interface_name {
         interface_validation::validate_interface_name_for_linux_packet_socket(interface_name)?;
