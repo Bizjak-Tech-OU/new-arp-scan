@@ -1,0 +1,27 @@
+[package]
+name = "new-arp-scan-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.new-arp-scan]
+path = ".."
+
+# An independent workspace so `cargo build`, `cargo test`, and
+# `cargo clippy --all-targets` in the crate root never try to build this package. libFuzzer needs
+# a nightly toolchain and a C++ sanitizer runtime, neither of which the stable CI jobs have.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_ethernet_arp"
+path = "fuzz_targets/parse_ethernet_arp.rs"
+test = false
+doc = false
+bench = false
