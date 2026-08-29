@@ -7,7 +7,6 @@ use std::os::fd::OwnedFd;
 use crate::address_resolution_protocol::ARP_HARDWARE_TYPE_ETHERNET;
 use crate::application_command::ScanWireOptions;
 use crate::error::AppError;
-use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
 use crate::interface_validation;
 use crate::link_layer_backend::LinkLayerEndpoint;
 use crate::linux_packet::{
@@ -98,17 +97,26 @@ pub(crate) fn validate_interface_flags_for_arp_scanning(
     Ok(())
 }
 
+/// Chooses the `AF_PACKET` capture protocol.
+///
+/// `ETH_P_ARP` only delivers frames whose length/type field is `0x0806`, so any framing that shifts
+/// or replaces that field — an IEEE 802.1Q customer tag, an IEEE 802.1ad service tag, or an IEEE
+/// 802.3 length with RFC 1042 SNAP — must fall back to `ETH_P_ALL` and filter in userspace.
 fn packet_socket_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
-    if wire.vlan_identifier.is_some() || wire.llc_snap {
+    if wire.vlan_identifier.is_some() || wire.service_vlan_identifier.is_some() || wire.llc_snap {
         ETHERNET_PROTOCOL_ALL
     } else {
         ETHERNET_PROTOCOL_ARP
     }
 }
 
+/// Chooses the `sockaddr_ll` send protocol, which is the outermost length/type value on the wire.
+///
+/// For a stacked frame that is the outer service TPID `0x88A8`, exactly as a single customer tag
+/// sends `0x8100`.
 fn link_layer_send_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
-    if wire.vlan_identifier.is_some() {
-        ETHERNET_PROTOCOL_VLAN_TAG
+    if let Some(vlan_tag) = wire.ieee_8021q_tag_stack() {
+        vlan_tag.outer_tag_protocol_identifier()
     } else if wire.llc_snap {
         ETHERNET_PROTOCOL_IEEE_802_2
     } else {
@@ -192,9 +200,10 @@ pub struct LinuxLinkLayerEndpoint {
 /// ARP scanning.
 ///
 /// When `wire` is untagged Ethernet II, the socket is bound to `ETH_P_ARP`. When it requests IEEE
-/// 802.1Q or RFC 1042 LLC/SNAP, the socket is bound to `ETH_P_ALL` so tagged and SNAP replies are
-/// delivered. The send destination protocol is `ETH_P_8021Q` for tagged frames, `ETH_P_802_2` for
-/// untagged SNAP, and `ETH_P_ARP` otherwise.
+/// 802.1Q tagging (customer or service) or RFC 1042 LLC/SNAP, the socket is bound to `ETH_P_ALL`
+/// so tagged and SNAP replies are delivered. The send destination protocol is `ETH_P_8021AD`
+/// (`0x88A8`) for service-tagged frames, `ETH_P_8021Q` (`0x8100`) for customer-tagged frames,
+/// `ETH_P_802_2` for untagged SNAP, and `ETH_P_ARP` otherwise.
 ///
 /// # Errors
 ///

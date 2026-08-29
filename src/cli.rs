@@ -22,6 +22,9 @@ EXAMPLES:
   Send IEEE 802.1Q tagged ARP requests on VLAN 10 with PCP 5:
     new-arp-scan scan --interface eth0 --vlan 10 --pcp 5
 
+  Send IEEE 802.1ad QinQ requests: service VLAN 100 wrapping customer VLAN 10:
+    new-arp-scan scan --interface eth0 --vlan 10 --svlan 100 --spcp 5
+
   Append custom payload padding after the ARP PDU:
     new-arp-scan scan --interface eth0 --padding deadbeef
 
@@ -103,6 +106,28 @@ pub struct ScanArguments {
     /// Set the IEEE 802.1Q Drop Eligible Indicator. Requires `--vlan`.
     #[arg(long = "dei", action = clap::ArgAction::SetTrue, requires = "vlan_identifier")]
     pub vlan_drop_eligible_indicator: bool,
+    /// IEEE 802.1Q service VLAN identifier (`0..=4095`) for IEEE 802.1ad provider bridging.
+    /// Requires `--vlan`. When set, each request carries an outer service tag (S-TAG, TPID
+    /// `0x88A8`) wrapping the `--vlan` customer tag (C-TAG, TPID `0x8100`). Service PCP and DEI
+    /// default to zero unless `--spcp` / `--sdei` are set.
+    #[arg(
+        long = "svlan",
+        value_name = "VID",
+        value_parser = clap::value_parser!(u16).range(0..=4095),
+        requires = "vlan_identifier"
+    )]
+    pub service_vlan_identifier: Option<u16>,
+    /// IEEE 802.1Q service tag Priority Code Point (`0..=7`). Requires `--svlan`. Default 0.
+    #[arg(
+        long = "spcp",
+        value_name = "PRIORITY",
+        value_parser = clap::value_parser!(u8).range(0..=7),
+        requires = "service_vlan_identifier"
+    )]
+    pub service_vlan_priority_code_point: Option<u8>,
+    /// Set the IEEE 802.1Q service tag Drop Eligible Indicator. Requires `--svlan`.
+    #[arg(long = "sdei", action = clap::ArgAction::SetTrue, requires = "service_vlan_identifier")]
+    pub service_vlan_drop_eligible_indicator: bool,
     /// Hex-encoded octets appended after the 28-octet ARP PDU (no `0x` prefix, even number of
     /// digits), matching original `arp-scan --padding`. The frame is still zero-padded to 60
     /// octets when shorter. With `--llc`, these octets are included in the IEEE 802.3 length.

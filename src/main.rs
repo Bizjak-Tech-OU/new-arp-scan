@@ -108,6 +108,20 @@ fn scan_wire_options_from_arguments(scan: &ScanArguments) -> ScanWireOptions {
             },
         ),
         vlan_drop_eligible_indicator: scan.vlan_drop_eligible_indicator,
+        service_vlan_identifier: scan.service_vlan_identifier.map(|service_vlan_identifier| {
+            Ieee8021qVlanIdentifier::new(service_vlan_identifier).expect(
+                "clap should reject service VLAN identifiers above 4095 before reaching the application run path",
+            )
+        }),
+        service_vlan_priority_code_point: scan.service_vlan_priority_code_point.map_or(
+            Ieee8021qPriorityCodePoint::ZERO,
+            |priority_code_point| {
+                Ieee8021qPriorityCodePoint::new(priority_code_point).expect(
+                    "clap should reject service Priority Code Points above 7 before reaching the application run path",
+                )
+            },
+        ),
+        service_vlan_drop_eligible_indicator: scan.service_vlan_drop_eligible_indicator,
         sender_protocol_address: scan
             .sender_protocol_address
             .unwrap_or(ArpSenderProtocolAddress::Interface),
