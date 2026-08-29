@@ -102,6 +102,13 @@ pub(crate) fn validate_interface_flags_for_arp_scanning(
 /// `ETH_P_ARP` only delivers frames whose length/type field is `0x0806`, so any framing that shifts
 /// or replaces that field — an IEEE 802.1Q customer tag, an IEEE 802.1ad service tag, or an IEEE
 /// 802.3 length with RFC 1042 SNAP — must fall back to `ETH_P_ALL` and filter in userspace.
+///
+/// Note that on ingress the kernel always moves the outermost VLAN tag (`0x8100` or `0x88A8`) into
+/// skb metadata before packet sockets see the frame (`skb_vlan_untag()`, Linux 3.16, commit
+/// `0d5501c1c828`), and the delivery protocol becomes whatever follows that tag — the inner
+/// `0x8100` for an IEEE 802.1ad reply. `ETH_P_ALL` is what matches those untagged-by-the-kernel
+/// shapes; the stripped outer TCI itself would only be recoverable via `PACKET_AUXDATA`, which
+/// this endpoint does not request.
 fn packet_socket_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
     if wire.vlan_identifier.is_some() || wire.service_vlan_identifier.is_some() || wire.llc_snap {
         ETHERNET_PROTOCOL_ALL
@@ -449,7 +456,8 @@ mod tests {
         // Assert
         assert_eq!(
             stacked_capture, ETHERNET_PROTOCOL_ALL,
-            "a QinQ scan must bind ETH_P_ALL so unstripped service-tagged frames are delivered"
+            "a QinQ scan must bind ETH_P_ALL: after the kernel untags the S-TAG the delivery \
+             protocol is the inner 0x8100, which ETH_P_ARP would never match"
         );
         assert_eq!(
             stacked_send, ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
