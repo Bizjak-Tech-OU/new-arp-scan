@@ -2530,6 +2530,55 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
     }
 
     #[test]
+    fn records_qinq_reply_whose_outer_service_tag_the_kernel_stripped() {
+        // Arrange: on Linux ingress the kernel always moves the outermost TPID + TCI into skb
+        // metadata before an `AF_PACKET` socket sees the frame (`skb_vlan_untag()`, Linux 3.16,
+        // commit 0d5501c1c828), so on a real IEEE 802.1ad trunk the reply arrives leading with the
+        // inner customer tag. Recording must not depend on seeing the service tag inline.
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let on_the_wire = service_tagged_frame(sender_mac, &arp_payload_of(&untagged), false);
+        let mut kernel_stripped = on_the_wire[..12].to_vec();
+        kernel_stripped.extend_from_slice(&on_the_wire[16..]);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![kernel_stripped],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(
+            outcome.discovered_hosts.len(),
+            1,
+            "a reply reduced to its customer tag by the kernel must still be recorded"
+        );
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "a kernel-untagged QinQ reply is not a malformed frame, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
     fn records_service_and_customer_tagged_rfc_1042_llc_snap_inbound_reply() {
         // Arrange
         let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 3]);
