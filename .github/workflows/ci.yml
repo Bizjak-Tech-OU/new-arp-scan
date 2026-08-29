@@ -23,7 +23,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Install stable Rust toolchain
+        # `rustup default stable` only *selects* the toolchain already in the runner image, which
+        # can lag the `rust-version` in Cargo.toml (macos-latest has shipped 1.97.1 against our
+        # 1.98 floor, failing the build before it starts). `rustup update stable` fetches the
+        # current release, matching the "always latest stable" policy in .claude/CLAUDE.md.
         run: |
+          rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
       - name: Show toolchain versions
@@ -46,7 +51,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Install stable Rust toolchain
+        # `rustup default stable` only *selects* the toolchain already in the runner image, which
+        # can lag the `rust-version` in Cargo.toml (macos-latest has shipped 1.97.1 against our
+        # 1.98 floor, failing the build before it starts). `rustup update stable` fetches the
+        # current release, matching the "always latest stable" policy in .claude/CLAUDE.md.
         run: |
+          rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
       - name: Show toolchain versions
