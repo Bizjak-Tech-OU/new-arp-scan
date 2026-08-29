@@ -7,7 +7,6 @@ use std::os::fd::OwnedFd;
 use crate::address_resolution_protocol::ARP_HARDWARE_TYPE_ETHERNET;
 use crate::application_command::ScanWireOptions;
 use crate::error::AppError;
-use crate::ethernet_frame::ETHERNET_PROTOCOL_VLAN_TAG;
 use crate::interface_validation;
 use crate::link_layer_backend::LinkLayerEndpoint;
 use crate::linux_packet::{
@@ -98,17 +97,33 @@ pub(crate) fn validate_interface_flags_for_arp_scanning(
     Ok(())
 }
 
+/// Chooses the `AF_PACKET` capture protocol.
+///
+/// `ETH_P_ARP` only delivers frames whose length/type field is `0x0806`, so any framing that shifts
+/// or replaces that field — an IEEE 802.1Q customer tag, an IEEE 802.1ad service tag, or an IEEE
+/// 802.3 length with RFC 1042 SNAP — must fall back to `ETH_P_ALL` and filter in userspace.
+///
+/// Note that on ingress the kernel always moves the outermost VLAN tag (`0x8100` or `0x88A8`) into
+/// skb metadata before packet sockets see the frame (`skb_vlan_untag()`, Linux 3.16, commit
+/// `0d5501c1c828`), and the delivery protocol becomes whatever follows that tag — the inner
+/// `0x8100` for an IEEE 802.1ad reply. `ETH_P_ALL` is what matches those untagged-by-the-kernel
+/// shapes; the stripped outer TCI itself would only be recoverable via `PACKET_AUXDATA`, which
+/// this endpoint does not request.
 fn packet_socket_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
-    if wire.vlan_identifier.is_some() || wire.llc_snap {
+    if wire.vlan_identifier.is_some() || wire.service_vlan_identifier.is_some() || wire.llc_snap {
         ETHERNET_PROTOCOL_ALL
     } else {
         ETHERNET_PROTOCOL_ARP
     }
 }
 
+/// Chooses the `sockaddr_ll` send protocol, which is the outermost length/type value on the wire.
+///
+/// For a stacked frame that is the outer service TPID `0x88A8`, exactly as a single customer tag
+/// sends `0x8100`.
 fn link_layer_send_protocol_for_wire_options(wire: &ScanWireOptions) -> u16 {
-    if wire.vlan_identifier.is_some() {
-        ETHERNET_PROTOCOL_VLAN_TAG
+    if let Some(vlan_tag) = wire.ieee_8021q_tag_stack() {
+        vlan_tag.outer_tag_protocol_identifier()
     } else if wire.llc_snap {
         ETHERNET_PROTOCOL_IEEE_802_2
     } else {
@@ -192,9 +207,10 @@ pub struct LinuxLinkLayerEndpoint {
 /// ARP scanning.
 ///
 /// When `wire` is untagged Ethernet II, the socket is bound to `ETH_P_ARP`. When it requests IEEE
-/// 802.1Q or RFC 1042 LLC/SNAP, the socket is bound to `ETH_P_ALL` so tagged and SNAP replies are
-/// delivered. The send destination protocol is `ETH_P_8021Q` for tagged frames, `ETH_P_802_2` for
-/// untagged SNAP, and `ETH_P_ARP` otherwise.
+/// 802.1Q tagging (customer or service) or RFC 1042 LLC/SNAP, the socket is bound to `ETH_P_ALL`
+/// so tagged and SNAP replies are delivered. The send destination protocol is `ETH_P_8021AD`
+/// (`0x88A8`) for service-tagged frames, `ETH_P_8021Q` (`0x8100`) for customer-tagged frames,
+/// `ETH_P_802_2` for untagged SNAP, and `ETH_P_ARP` otherwise.
 ///
 /// # Errors
 ///
@@ -280,7 +296,9 @@ mod tests {
     use super::validate_interface_flags_for_arp_scanning;
     use crate::application_command::ScanWireOptions;
     use crate::error::AppError;
-    use crate::ethernet_frame::{ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qVlanIdentifier};
+    use crate::ethernet_frame::{
+        ETHERNET_PROTOCOL_VLAN_TAG, ETHERNET_PROTOCOL_VLAN_TAG_SERVICE, Ieee8021qVlanIdentifier,
+    };
     use crate::linux_packet::{
         ETHERNET_PROTOCOL_ALL, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IEEE_802_2,
         INTERFACE_FLAG_LOOPBACK, INTERFACE_FLAG_NO_ARP, INTERFACE_FLAG_UP,
@@ -411,6 +429,70 @@ mod tests {
         assert_eq!(
             vlan_and_llc_send, ETHERNET_PROTOCOL_VLAN_TAG,
             "outer 802.1Q TPID is the send protocol when both VLAN and SNAP are set"
+        );
+    }
+
+    #[test]
+    fn service_tagged_scan_captures_eth_p_all_and_sends_with_the_outer_service_tpid() {
+        // Arrange
+        let customer = Ieee8021qVlanIdentifier::new(10).expect("C-VID 10 fits in 12 bits");
+        let service = Ieee8021qVlanIdentifier::new(100).expect("S-VID 100 fits in 12 bits");
+        let stacked = ScanWireOptions {
+            vlan_identifier: Some(customer),
+            service_vlan_identifier: Some(service),
+            ..ScanWireOptions::default()
+        };
+        let stacked_with_llc = ScanWireOptions {
+            llc_snap: true,
+            ..stacked.clone()
+        };
+
+        // Act
+        let stacked_capture = packet_socket_protocol_for_wire_options(&stacked);
+        let stacked_send = link_layer_send_protocol_for_wire_options(&stacked);
+        let stacked_with_llc_capture = packet_socket_protocol_for_wire_options(&stacked_with_llc);
+        let stacked_with_llc_send = link_layer_send_protocol_for_wire_options(&stacked_with_llc);
+
+        // Assert
+        assert_eq!(
+            stacked_capture, ETHERNET_PROTOCOL_ALL,
+            "a QinQ scan must bind ETH_P_ALL: after the kernel untags the S-TAG the delivery \
+             protocol is the inner 0x8100, which ETH_P_ARP would never match"
+        );
+        assert_eq!(
+            stacked_send, ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+            "a service-tagged send must use the outer TPID 0x88A8, not the inner 0x8100"
+        );
+        assert_eq!(
+            stacked_with_llc_capture, ETHERNET_PROTOCOL_ALL,
+            "adding --llc must not narrow the capture protocol"
+        );
+        assert_eq!(
+            stacked_with_llc_send, ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+            "the outer TPID still leads the frame when RFC 1042 SNAP is used inside the tags"
+        );
+    }
+
+    #[test]
+    fn capture_protocol_falls_back_to_eth_p_all_for_a_service_tag_even_without_a_customer_tag() {
+        // Arrange: this combination is rejected before transmit by
+        // `ScanWireOptions::validate_ieee_8021q_tag_stack`, but the capture choice must still be
+        // the permissive one rather than silently binding ETH_P_ARP.
+        let service_only = ScanWireOptions {
+            vlan_identifier: None,
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let capture = packet_socket_protocol_for_wire_options(&service_only);
+        let send = link_layer_send_protocol_for_wire_options(&service_only);
+
+        // Assert
+        assert_eq!(capture, ETHERNET_PROTOCOL_ALL);
+        assert_eq!(
+            send, ETHERNET_PROTOCOL_ARP,
+            "with no encodable tag stack the send protocol stays plain ARP"
         );
     }
 }

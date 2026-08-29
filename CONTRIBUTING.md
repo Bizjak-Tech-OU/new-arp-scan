@@ -59,7 +59,7 @@ If you believe `unsafe` is required, record the architectural justification in `
 
 ## Platform testing
 
-The crate supports **Linux** (`AF_PACKET` raw sockets) and **macOS** (Berkeley Packet Filter). Continuous integration runs the hermetic gate on **`macos-latest`** on every push and pull request to `master` (`.github/workflows/ci.yml`):
+The crate supports **Linux** (`AF_PACKET` raw sockets) and **macOS** (Berkeley Packet Filter). Continuous integration runs the hermetic gate on **both `ubuntu-latest` and `macos-latest`** on every push and pull request to `master` (`.github/workflows/ci.yml`). Both jobs are needed: the `cfg(target_os = "linux")` modules (`src/linux_socket.rs`, `src/linux_packet.rs`, and friends) are not compiled at all on macOS, and vice versa. Each job runs:
 
 ```sh
 cargo fmt --all -- --check
@@ -68,6 +68,15 @@ cargo test
 ```
 
 These are the same checks as `make lint` / `make test`, except CI uses `cargo fmt --all -- --check` (verify only, never rewrite).
+
+If you only have one platform to hand, you can still type-check and lint the other target's modules without running its tests:
+
+```sh
+rustup target add x86_64-unknown-linux-gnu   # from macOS; use aarch64-apple-darwin from Linux
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+```
+
+`cargo check` / `cargo clippy` do not link, so this needs no cross-linker. It catches compile and lint errors in the other platform's code, but it cannot run that platform's tests — CI does that.
 
 **Privileged live scans stay manual** — CI never opens a packet socket or BPF device for a real scan. To acceptance-test on hardware you control:
 
@@ -83,6 +92,18 @@ These are the same checks as `make lint` / `make test`, except CI uses `cargo fm
   `interfaces` needs no privileges; `scan` opens `/dev/bpf*` and fails with a "run with sudo" error otherwise. Verify frames with `tcpdump -ni en0 arp` in another terminal.
 
 - **Linux** (needs `CAP_NET_RAW`, typically via `sudo`): use the same commands with the appropriate interface (for example `eth0`). See [docs/linux-platform.md](docs/linux-platform.md).
+
+## Fuzzing
+
+The Ethernet / IEEE 802.1Q / RFC 1042 / RFC 826 decode chain is the crate's untrusted-input boundary, so it carries a `cargo-fuzz` target (`fuzz/fuzz_targets/parse_ethernet_arp.rs`). Like privileged live scans, **fuzzing is manual**: libFuzzer needs a nightly toolchain and a C++ sanitizer runtime that the stable CI jobs do not have, so `fuzz/` is a separate workspace that the root `cargo build` / `cargo test` / `cargo clippy --all-targets` never build.
+
+```sh
+cargo install cargo-fuzz          # once per machine
+rustup toolchain install nightly  # once per machine
+make fuzz                         # 60 s by default; FUZZ_SECONDS=300 make fuzz for longer
+```
+
+Run it after changing anything in `src/ethernet_frame.rs` or `src/address_resolution_protocol.rs`. See [fuzz/README.md](fuzz/README.md) for the corpus layout and how to reproduce a finding.
 
 When you change the developer workflow commands, update the `Makefile`, this file, and the CI workflow together so they stay aligned.
 

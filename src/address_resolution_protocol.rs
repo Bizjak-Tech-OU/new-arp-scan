@@ -2,7 +2,8 @@
 //!
 //! Request frames are built with an explicit Ethernet II header, a 28-byte ARP payload matching
 //! RFC 826, then zero-filled padding to the IEEE 802.3 minimum frame length without the frame
-//! check sequence. Parsers accept Ethernet II, a single IEEE 802.1Q tag, and RFC 1042 LLC/SNAP,
+//! check sequence. Parsers accept Ethernet II, one IEEE 802.1Q customer tag, one IEEE 802.1Q
+//! service tag wrapping one customer tag (IEEE 802.1ad), and RFC 1042 LLC/SNAP,
 //! and they reject RFC 5494 reserved hardware-type and opcode values. The public reply parser
 //! still requires opcode 2; a crate-internal parser accepts any non-reserved opcode so the scanner
 //! can ignore well-formed requests without treating them as malformed frames.
@@ -11,8 +12,8 @@ use std::net::Ipv4Addr;
 
 use crate::ethernet_frame::{
     ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4, IEEE_8023_LLC_SNAP_HEADER_LENGTH,
-    IEEE_8023_MAXIMUM_LENGTH, Ieee8021qTagControlInformation, Ieee8021qVlanIdentifier,
-    encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
+    IEEE_8023_MAXIMUM_LENGTH, Ieee8021qTagControlInformation, Ieee8021qTagStack,
+    Ieee8021qVlanIdentifier, encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
     encode_ieee_8023_rfc_1042_llc_snap_frame, try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
@@ -90,8 +91,8 @@ pub(crate) struct AddressResolutionRequestLayout<'a> {
     pub ethernet_destination: MacAddress,
     /// Ethernet source (`--srcaddr`, defaulting to the interface MAC).
     pub ethernet_source: MacAddress,
-    /// Optional IEEE 802.1Q customer tag (PCP, DEI, and VID).
-    pub vlan_tag: Option<Ieee8021qTagControlInformation>,
+    /// Optional IEEE 802.1Q tag stack: one customer tag, or a service tag wrapping a customer tag.
+    pub vlan_tag: Option<Ieee8021qTagStack>,
     /// RFC 1042 LLC/SNAP instead of Ethernet II.
     pub llc_snap: bool,
     /// RFC 826 `ar$hrd`.
@@ -250,7 +251,9 @@ pub fn build_address_resolution_request_ethernet_frame_with_wire_options(
         source_ipv4_address,
         target_ipv4_address,
     );
-    layout.vlan_tag = vlan_identifier.map(Ieee8021qTagControlInformation::from);
+    layout.vlan_tag = vlan_identifier
+        .map(Ieee8021qTagControlInformation::from)
+        .map(Ieee8021qTagStack::Customer);
     layout.llc_snap = llc_snap;
     copy_into_minimum_ethernet_frame(&encode_address_resolution_request_from_layout(layout))
 }
@@ -428,9 +431,10 @@ pub(crate) struct ParsedIpv4EthernetArp {
 /// Parses an IPv4 ARP packet from a raw Ethernet frame buffer.
 ///
 /// Trailing padding beyond the ARP payload is ignored once the fixed ARP fields are validated.
-/// A single IEEE 802.1Q tag and RFC 1042 LLC/SNAP encapsulation are accepted. Sender hardware and
-/// protocol addresses (`ar$sha`, `ar$spa`) are the values returned, matching RFC 826. Any
-/// non-reserved opcode is accepted, including requests.
+/// One IEEE 802.1Q customer tag, an IEEE 802.1Q service tag wrapping one customer tag, and RFC
+/// 1042 LLC/SNAP encapsulation are accepted. Sender hardware and protocol addresses (`ar$sha`,
+/// `ar$spa`) are the values returned, matching RFC 826. Any non-reserved opcode is accepted,
+/// including requests.
 ///
 /// # Errors
 ///
@@ -503,8 +507,9 @@ pub(crate) fn try_parse_address_resolution_ipv4_over_ethernet(
 /// Parses an IPv4 ARP reply from a raw Ethernet frame buffer.
 ///
 /// Trailing padding beyond the ARP payload is ignored once the fixed ARP fields are validated.
-/// A single IEEE 802.1Q tag and RFC 1042 LLC/SNAP encapsulation are accepted. Sender hardware and
-/// protocol addresses (`ar$sha`, `ar$spa`) are the values returned, matching RFC 826.
+/// One IEEE 802.1Q customer tag, an IEEE 802.1Q service tag wrapping one customer tag, and RFC
+/// 1042 LLC/SNAP encapsulation are accepted. Sender hardware and protocol addresses (`ar$sha`,
+/// `ar$spa`) are the values returned, matching RFC 826.
 ///
 /// Well-formed ARP that is not a reply (for example an RFC 826 request) is rejected here. The
 /// scanner records opcode 2 only, so those frames are not treated as malformed capture noise.
@@ -566,6 +571,7 @@ mod tests {
     use crate::ethernet_frame::IEEE_8023_LLC_SNAP_HEADER_LENGTH;
     use crate::ethernet_frame::Ieee8021qPriorityCodePoint;
     use crate::ethernet_frame::Ieee8021qTagControlInformation;
+    use crate::ethernet_frame::Ieee8021qTagStack;
     use crate::ethernet_frame::Ieee8021qVlanIdentifier;
     use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
@@ -831,10 +837,8 @@ mod tests {
         );
         let vlan_identifier = Ieee8021qVlanIdentifier::new(10).expect("VID 10 fits");
         let priority = Ieee8021qPriorityCodePoint::new(5).expect("PCP 5 fits");
-        layout.vlan_tag = Some(Ieee8021qTagControlInformation::new(
-            priority,
-            true,
-            vlan_identifier,
+        layout.vlan_tag = Some(Ieee8021qTagStack::Customer(
+            Ieee8021qTagControlInformation::new(priority, true, vlan_identifier),
         ));
 
         // Act

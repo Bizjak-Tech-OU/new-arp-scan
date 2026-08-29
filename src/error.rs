@@ -152,6 +152,12 @@ pub enum AppError {
         /// IEEE 802.3 maximum MAC client data length (1500).
         maximum: u16,
     },
+    /// An IEEE 802.1Q service tag (`--svlan`) was requested without the customer tag (`--vlan`)
+    /// that IEEE 802.1ad provider bridging requires it to wrap.
+    ServiceVlanTagRequiresCustomerVlanTag {
+        /// Service VLAN identifier that had no customer tag to wrap.
+        service_vlan_identifier: u16,
+    },
 }
 
 fn try_write_early_app_error_variants(
@@ -302,6 +308,12 @@ fn write_late_app_error_variants(
         } => write!(
             formatter,
             "IEEE 802.3 MAC client data is {octet_count} octets; maximum is {maximum} (reduce --padding, especially with --llc)"
+        ),
+        AppError::ServiceVlanTagRequiresCustomerVlanTag {
+            service_vlan_identifier,
+        } => write!(
+            formatter,
+            "IEEE 802.1Q service VLAN {service_vlan_identifier} needs a customer VLAN to wrap: set --vlan as well as --svlan"
         ),
         _ => write!(
             formatter,
