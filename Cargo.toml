@@ -9,6 +9,12 @@ license = "AGPL-3.0-only"
 clap = { version = "4.6", features = ["derive", "std"] }
 libc = "0.2"
 
+# Property-based testing only. `default-features = false` drops the `fork` and `timeout`
+# features, and with them the `rusty-fork` and `tempfile` transitive dependencies; `std` is the
+# only feature the invariant tests need.
+[dev-dependencies]
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+
 [lints.rust]
 warnings = "deny"
 unsafe_op_in_unsafe_fn = "deny"

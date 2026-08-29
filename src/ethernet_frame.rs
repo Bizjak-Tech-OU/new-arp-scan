@@ -1586,4 +1586,133 @@ mod tests {
             }
         }
     }
+
+    proptest::proptest! {
+        /// Both Tag Control Information fields survive encode then parse for every 16-bit value,
+        /// in both framings, with an arbitrary payload.
+        #[test]
+        fn service_and_customer_tag_control_information_round_trips(
+            service_bits in proptest::num::u16::ANY,
+            customer_bits in proptest::num::u16::ANY,
+            payload in proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+            use_llc_snap in proptest::bool::ANY,
+        ) {
+            let stack = Ieee8021qTagStack::ServiceAndCustomer {
+                service: Ieee8021qTagControlInformation::from_tag_control_information(service_bits),
+                customer: Ieee8021qTagControlInformation::from_tag_control_information(
+                    customer_bits,
+                ),
+            };
+            let encode = if use_llc_snap {
+                encode_ieee_8023_rfc_1042_llc_snap_frame
+            } else {
+                encode_ethernet_ii_frame_with_optional_ieee_8021q_tag
+            };
+            let frame = encode(
+                MacAddress::BROADCAST,
+                MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+                Some(stack),
+                ETHERNET_PROTOCOL_ARP,
+                &payload,
+            );
+
+            let parsed = try_parse_ethernet_frame(&frame)
+                .map_err(|reason| proptest::test_runner::TestCaseError::fail(reason.to_string()))?;
+            proptest::prop_assert_eq!(
+                parsed.service_vlan_tag.map(Ieee8021qTagControlInformation::as_u16),
+                Some(service_bits)
+            );
+            proptest::prop_assert_eq!(
+                parsed.vlan_tag.map(Ieee8021qTagControlInformation::as_u16),
+                Some(customer_bits)
+            );
+            proptest::prop_assert_eq!(parsed.vlan_identifier, Some(customer_bits & 0x0FFF));
+            proptest::prop_assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+            proptest::prop_assert_eq!(parsed.payload, &payload[..]);
+        }
+
+        /// A customer-only stack never grows a service tag, and its octet count never changes.
+        #[test]
+        fn customer_only_stack_never_decodes_as_service_tagged(
+            customer_bits in proptest::num::u16::ANY,
+            payload in proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+        ) {
+            let stack = Ieee8021qTagStack::Customer(
+                Ieee8021qTagControlInformation::from_tag_control_information(customer_bits),
+            );
+            let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+                MacAddress::BROADCAST,
+                MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+                Some(stack),
+                ETHERNET_PROTOCOL_ARP,
+                &payload,
+            );
+
+            let parsed = try_parse_ethernet_frame(&frame)
+                .map_err(|reason| proptest::test_runner::TestCaseError::fail(reason.to_string()))?;
+            proptest::prop_assert_eq!(parsed.service_vlan_tag, None);
+            proptest::prop_assert_eq!(
+                parsed.vlan_tag.map(Ieee8021qTagControlInformation::as_u16),
+                Some(customer_bits)
+            );
+        }
+
+        /// The parser never panics on arbitrary bytes, and it never reports a service tag without
+        /// the customer tag that IEEE 802.1ad requires it to wrap.
+        #[test]
+        fn parsing_arbitrary_bytes_never_panics_and_upholds_the_tag_stack_invariants(
+            frame in proptest::collection::vec(proptest::num::u8::ANY, 0..128),
+        ) {
+            if let Ok(parsed) = try_parse_ethernet_frame(&frame) {
+                proptest::prop_assert!(
+                    parsed.service_vlan_tag.is_none() || parsed.vlan_tag.is_some(),
+                    "a decoded service tag must always come with a customer tag"
+                );
+                proptest::prop_assert_eq!(
+                    parsed.vlan_identifier,
+                    parsed.vlan_tag.map(|tag| tag.vlan_identifier.as_u16())
+                );
+                let header = ETHERNET_II_HEADER_LENGTH
+                    + match (parsed.service_vlan_tag, parsed.vlan_tag) {
+                        (Some(_), _) => IEEE_8021AD_TAG_STACK_LENGTH,
+                        (None, Some(_)) => IEEE_8021Q_TAG_LENGTH,
+                        (None, None) => 0,
+                    };
+                let expected_payload_start = match parsed.framing {
+                    EthernetFraming::EthernetIi => header,
+                    EthernetFraming::Ieee8023LlcSnap => header + IEEE_8023_LLC_SNAP_HEADER_LENGTH,
+                };
+                proptest::prop_assert_eq!(
+                    parsed.payload.len(),
+                    frame.len() - expected_payload_start,
+                    "the payload must start exactly after the decoded headers"
+                );
+            }
+        }
+
+        /// Arbitrary bytes behind a well-formed S-TAG/C-TAG prefix either parse with both tags
+        /// decoded, or are rejected; they never decode as untagged or customer-only.
+        #[test]
+        fn a_well_formed_tag_stack_prefix_never_decodes_as_a_shallower_stack(
+            tail in proptest::collection::vec(proptest::num::u8::ANY, 0..64),
+        ) {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&MacAddress::BROADCAST.octets());
+            frame.extend_from_slice(&MacAddress::from_octets([2, 0, 0, 0, 0, 1]).octets());
+            frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG_SERVICE.to_be_bytes());
+            frame.extend_from_slice(&0xB064u16.to_be_bytes());
+            frame.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+            frame.extend_from_slice(&0x000Au16.to_be_bytes());
+            frame.extend_from_slice(&tail);
+
+            if let Ok(parsed) = try_parse_ethernet_frame(&frame) {
+                proptest::prop_assert_eq!(
+                    parsed.service_vlan_tag.map(|tag| tag.vlan_identifier.as_u16()),
+                    Some(100),
+                    "an accepted frame behind a valid S-TAG must report that S-TAG"
+                );
+                proptest::prop_assert_eq!(parsed.vlan_identifier, Some(10));
+            }
+        }
+    }
 }
