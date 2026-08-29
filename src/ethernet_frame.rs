@@ -668,6 +668,7 @@ mod tests {
     use super::ETHERNET_PROTOCOL_VLAN_TAG;
     use super::ETHERNET_PROTOCOL_VLAN_TAG_SERVICE;
     use super::EthernetFraming;
+    use super::IEEE_8021AD_TAG_STACK_LENGTH;
     use super::IEEE_8021Q_TAG_LENGTH;
     use super::IEEE_8023_LLC_SNAP_HEADER_LENGTH;
     use super::IEEE_8023_MAXIMUM_LENGTH;
@@ -1245,5 +1246,344 @@ mod tests {
         let parsed = try_parse_ethernet_frame(&frame).expect("maximum-length SNAP should parse");
         assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
         assert_eq!(parsed.payload, payload.as_slice());
+    }
+
+    /// Builds an S-TAG/C-TAG pair: service PCP 5, DEI 1, S-VID 100; customer PCP 0, DEI 0, C-VID 10.
+    fn service_and_customer_tag_stack() -> Ieee8021qTagStack {
+        Ieee8021qTagStack::ServiceAndCustomer {
+            service: Ieee8021qTagControlInformation::new(
+                Ieee8021qPriorityCodePoint::new(5).expect("PCP 5 fits in 3 bits"),
+                true,
+                Ieee8021qVlanIdentifier::new(100).expect("S-VID 100 fits in 12 bits"),
+            ),
+            customer: Ieee8021qTagControlInformation::from_vlan_identifier(
+                Ieee8021qVlanIdentifier::new(10).expect("C-VID 10 fits in 12 bits"),
+            ),
+        }
+    }
+
+    #[test]
+    fn tag_stack_reports_outer_tpid_encoded_length_and_both_tag_control_information_fields() {
+        // Arrange
+        let customer_only =
+            Ieee8021qTagStack::Customer(Ieee8021qTagControlInformation::from_vlan_identifier(
+                Ieee8021qVlanIdentifier::new(10).expect("C-VID 10 fits"),
+            ));
+        let stacked = service_and_customer_tag_stack();
+
+        // Act
+        // Assert
+        assert_eq!(
+            customer_only.outer_tag_protocol_identifier(),
+            ETHERNET_PROTOCOL_VLAN_TAG,
+            "a lone customer tag puts 0x8100 in the length/type field"
+        );
+        assert_eq!(
+            stacked.outer_tag_protocol_identifier(),
+            ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+            "a service tag puts 0x88A8 in the length/type field"
+        );
+        assert_eq!(customer_only.encoded_octet_count(), IEEE_8021Q_TAG_LENGTH);
+        assert_eq!(stacked.encoded_octet_count(), IEEE_8021AD_TAG_STACK_LENGTH);
+        assert_eq!(customer_only.service_tag_control_information(), None);
+        assert_eq!(
+            stacked
+                .service_tag_control_information()
+                .expect("stacked carries a service tag")
+                .as_u16(),
+            0xB064,
+            "service PCP 5, DEI 1, S-VID 100 encodes as TCI 0xB064"
+        );
+        assert_eq!(
+            stacked.customer_tag_control_information().as_u16(),
+            0x000A,
+            "customer PCP 0, DEI 0, C-VID 10 encodes as TCI 0x000A"
+        );
+        assert_eq!(
+            Ieee8021qTagStack::new(None, stacked.customer_tag_control_information()),
+            customer_only,
+            "no service TCI should build the customer-only stack"
+        );
+    }
+
+    #[test]
+    fn parse_decodes_service_and_customer_tag_control_information_for_ethernet_ii_arp() {
+        // Arrange: outer PCP 5 / DEI 1 / S-VID 100, inner PCP 0 / DEI 0 / C-VID 10, then ARP.
+        let frame = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+            Some(service_and_customer_tag_stack()),
+            ETHERNET_PROTOCOL_ARP,
+            &[0x99],
+        );
+
+        // Act
+        let parsed = try_parse_ethernet_frame(&frame).expect("S-TAG + C-TAG ARP should parse");
+
+        // Assert
+        assert_eq!(
+            &frame[12..14],
+            ETHERNET_PROTOCOL_VLAN_TAG_SERVICE.to_be_bytes(),
+            "the outer TPID must be the IANA service EtherType 34984"
+        );
+        assert_eq!(
+            &frame[14..16],
+            [0xB0, 0x64],
+            "outer TCI is PCP 5, DEI 1, 100"
+        );
+        assert_eq!(
+            &frame[16..18],
+            ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes(),
+            "the inner TPID must be the customer EtherType 33024"
+        );
+        assert_eq!(
+            &frame[18..20],
+            [0x00, 0x0A],
+            "inner TCI is PCP 0, DEI 0, 10"
+        );
+        assert_eq!(&frame[20..22], ETHERNET_PROTOCOL_ARP.to_be_bytes());
+
+        let service = parsed
+            .service_vlan_tag
+            .expect("service tag should be decoded");
+        assert_eq!(service.priority_code_point.as_u8(), 5);
+        assert!(service.drop_eligible_indicator);
+        assert_eq!(service.vlan_identifier.as_u16(), 100);
+        let customer = parsed.vlan_tag.expect("customer tag should be decoded");
+        assert_eq!(customer.priority_code_point.as_u8(), 0);
+        assert!(!customer.drop_eligible_indicator);
+        assert_eq!(customer.vlan_identifier.as_u16(), 10);
+        assert_eq!(
+            parsed.vlan_identifier,
+            Some(10),
+            "vlan_identifier stays the customer VID when a service tag is present"
+        );
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.framing, EthernetFraming::EthernetIi);
+        assert_eq!(parsed.payload, &[0x99]);
+    }
+
+    #[test]
+    fn parse_decodes_service_and_customer_tags_before_rfc_1042_llc_snap_arp() {
+        // Arrange
+        let frame = encode_ieee_8023_rfc_1042_llc_snap_frame(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+            Some(service_and_customer_tag_stack()),
+            ETHERNET_PROTOCOL_ARP,
+            &[0x99],
+        );
+
+        // Act
+        let parsed = try_parse_ethernet_frame(&frame).expect("S-TAG + C-TAG SNAP ARP should parse");
+
+        // Assert
+        assert_eq!(
+            u16::from_be_bytes([frame[20], frame[21]]),
+            u16::try_from(IEEE_8023_LLC_SNAP_HEADER_LENGTH + 1).expect("length fits u16"),
+            "the IEEE 802.3 length counts LLC + SNAP + payload only, never the VLAN tags"
+        );
+        assert_eq!(
+            parsed
+                .service_vlan_tag
+                .expect("service tag should be decoded")
+                .vlan_identifier
+                .as_u16(),
+            100
+        );
+        assert_eq!(parsed.vlan_identifier, Some(10));
+        assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+        assert_eq!(parsed.framing, EthernetFraming::Ieee8023LlcSnap);
+        assert_eq!(parsed.payload, &[0x99]);
+    }
+
+    #[test]
+    fn encode_and_parse_round_trip_every_tag_control_information_bit_in_both_framings() {
+        // Arrange: TCI values that exercise each field boundary, including both all-zero and
+        // all-ones 16-bit patterns.
+        let tag_control_information_values =
+            [0x0000u16, 0x0001, 0x0FFF, 0x1000, 0xE000, 0xF000, 0xFFFF];
+
+        for service_bits in tag_control_information_values {
+            for customer_bits in tag_control_information_values {
+                let stack = Ieee8021qTagStack::ServiceAndCustomer {
+                    service: Ieee8021qTagControlInformation::from_tag_control_information(
+                        service_bits,
+                    ),
+                    customer: Ieee8021qTagControlInformation::from_tag_control_information(
+                        customer_bits,
+                    ),
+                };
+
+                // Act
+                let ethernet_ii = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+                    MacAddress::BROADCAST,
+                    MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+                    Some(stack),
+                    ETHERNET_PROTOCOL_ARP,
+                    &[0x11, 0x22],
+                );
+                let snap = encode_ieee_8023_rfc_1042_llc_snap_frame(
+                    MacAddress::BROADCAST,
+                    MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+                    Some(stack),
+                    ETHERNET_PROTOCOL_ARP,
+                    &[0x11, 0x22],
+                );
+                let parsed_ethernet_ii =
+                    try_parse_ethernet_frame(&ethernet_ii).expect("Ethernet II should round-trip");
+                let parsed_snap = try_parse_ethernet_frame(&snap).expect("SNAP should round-trip");
+
+                // Assert
+                for parsed in [parsed_ethernet_ii, parsed_snap] {
+                    assert_eq!(
+                        parsed
+                            .service_vlan_tag
+                            .map(Ieee8021qTagControlInformation::as_u16),
+                        Some(service_bits),
+                        "service TCI {service_bits:#06x} should survive encode then parse"
+                    );
+                    assert_eq!(
+                        parsed.vlan_tag.map(Ieee8021qTagControlInformation::as_u16),
+                        Some(customer_bits),
+                        "customer TCI {customer_bits:#06x} should survive encode then parse"
+                    );
+                    assert_eq!(parsed.ether_type, ETHERNET_PROTOCOL_ARP);
+                    assert_eq!(parsed.payload, &[0x11, 0x22]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rejects_a_third_tag_after_a_legal_service_and_customer_pair() {
+        // Arrange: 0x88A8, 0x8100, then a third tag where the inner length/type belongs.
+        for third_tag in [
+            ETHERNET_PROTOCOL_VLAN_TAG,
+            ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9200,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300,
+        ] {
+            let mut inner = Vec::from(0xB064u16.to_be_bytes());
+            inner.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+            inner.extend_from_slice(&0x000Au16.to_be_bytes());
+            inner.extend_from_slice(&third_tag.to_be_bytes());
+            inner.extend_from_slice(&0x0003u16.to_be_bytes());
+            inner.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+            let frame = encode_ethernet_ii_frame(
+                MacAddress::BROADCAST,
+                MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+                ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+                &inner,
+            );
+
+            // Act
+            let outcome = try_parse_ethernet_frame(&frame);
+
+            // Assert
+            assert_eq!(
+                outcome.expect_err("a third tag should be rejected"),
+                "Ethernet frame stacks more than one IEEE 802.1Q service tag and one customer tag",
+                "tag {third_tag:#06x} after a legal S-TAG/C-TAG pair must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_a_service_tag_followed_by_any_tpid_that_is_not_the_customer_tag() {
+        // Arrange
+        for following_tpid in [
+            ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9100,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9200,
+            super::ETHERNET_PROTOCOL_VLAN_TAG_QINQ_9300,
+            ETHERNET_PROTOCOL_ARP,
+            ETHERNET_PROTOCOL_IPV4,
+            0x0024,
+        ] {
+            let mut inner = Vec::from(0xB064u16.to_be_bytes());
+            inner.extend_from_slice(&following_tpid.to_be_bytes());
+            inner.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+            let frame = encode_ethernet_ii_frame(
+                MacAddress::BROADCAST,
+                MacAddress::from_octets([1, 2, 3, 4, 5, 6]),
+                ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
+                &inner,
+            );
+
+            // Act
+            let outcome = try_parse_ethernet_frame(&frame);
+
+            // Assert
+            assert_eq!(
+                outcome.expect_err("only 0x8100 may follow a service tag"),
+                "IEEE 802.1Q service tag is not followed by an IEEE 802.1Q customer tag",
+                "an S-TAG followed by {following_tpid:#06x} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_service_and_customer_tag_headers_truncated_at_every_offset() {
+        // Arrange: a well-formed S-TAG/C-TAG ARP frame cut short one octet at a time, from just
+        // past the Ethernet header to just before the inner EtherType is complete.
+        let complete = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+            MacAddress::BROADCAST,
+            MacAddress::from_octets([2, 0, 0, 0, 0, 1]),
+            Some(service_and_customer_tag_stack()),
+            ETHERNET_PROTOCOL_ARP,
+            &[0x99],
+        );
+
+        for truncated_length in ETHERNET_II_HEADER_LENGTH..22 {
+            // Act
+            let outcome = try_parse_ethernet_frame(&complete[..truncated_length]);
+
+            // Assert
+            let reason = outcome.expect_err("a truncated tag stack should be rejected");
+            let expected = if truncated_length < 18 {
+                "IEEE 802.1Q service tag is truncated"
+            } else {
+                "IEEE 802.1Q customer tag inside a service tag is truncated"
+            };
+            assert_eq!(
+                reason, expected,
+                "a {truncated_length}-octet frame should report the truncated tag, not misparse it"
+            );
+        }
+
+        // A complete stack plus the inner EtherType is the first length that parses.
+        assert!(
+            try_parse_ethernet_frame(&complete[..22]).is_ok(),
+            "22 octets is a complete S-TAG, C-TAG, and inner EtherType"
+        );
+    }
+
+    #[test]
+    fn parse_never_panics_on_arbitrary_tag_shaped_prefixes() {
+        // Arrange: every 16-bit length/type value at offset 12, over frames of several lengths,
+        // including lengths that cut a tag header in half.
+        let source = MacAddress::from_octets([2, 0, 0, 0, 0, 1]);
+        for type_or_length in 0u16..=u16::MAX {
+            for frame_length in [14usize, 15, 17, 19, 21, 23, 30] {
+                let mut frame = Vec::with_capacity(frame_length);
+                frame.extend_from_slice(&MacAddress::BROADCAST.octets());
+                frame.extend_from_slice(&source.octets());
+                frame.extend_from_slice(&type_or_length.to_be_bytes());
+                frame.resize(frame_length, 0x81);
+
+                // Act
+                let outcome = try_parse_ethernet_frame(&frame);
+
+                // Assert
+                if let Ok(parsed) = outcome {
+                    assert!(
+                        parsed.service_vlan_tag.is_none() || parsed.vlan_tag.is_some(),
+                        "a decoded service tag must always come with a customer tag"
+                    );
+                }
+            }
+        }
     }
 }

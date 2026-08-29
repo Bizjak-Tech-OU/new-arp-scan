@@ -386,7 +386,10 @@ mod tests {
         DEFAULT_SCAN_TIMEOUT, EthernetPaddingOctets, ScanWireOptions, parse_ethernet_padding_hex,
         parse_u8_cli_token, parse_u16_cli_token,
     };
-    use crate::ethernet_frame::{Ieee8021qPriorityCodePoint, Ieee8021qVlanIdentifier};
+    use crate::ethernet_frame::{
+        Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation, Ieee8021qTagStack,
+        Ieee8021qVlanIdentifier,
+    };
     use crate::mac_address::MacAddress;
     use std::net::Ipv4Addr;
     use std::num::NonZeroU64;
@@ -1178,5 +1181,175 @@ mod tests {
         assert_ne!(base, padding);
         assert_ne!(base, priority);
         assert_ne!(padding, priority);
+    }
+
+    #[test]
+    fn tag_stack_is_none_without_a_customer_tag_and_carries_the_service_tag_with_one() {
+        // Arrange
+        let untagged = ScanWireOptions::default();
+        let customer_only = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+            ..ScanWireOptions::default()
+        };
+        let stacked = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+            service_vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(5)
+                .expect("PCP 5 fits"),
+            service_vlan_drop_eligible_indicator: true,
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let untagged_stack = untagged.ieee_8021q_tag_stack();
+        let customer_stack = customer_only.ieee_8021q_tag_stack();
+        let stacked_stack = stacked.ieee_8021q_tag_stack();
+
+        // Assert
+        assert!(untagged_stack.is_none(), "no --vlan means no tag stack");
+        assert_eq!(
+            customer_stack.and_then(Ieee8021qTagStack::service_tag_control_information),
+            None,
+            "--vlan alone must not synthesize a service tag"
+        );
+        assert_eq!(
+            stacked_stack
+                .and_then(Ieee8021qTagStack::service_tag_control_information)
+                .map(Ieee8021qTagControlInformation::as_u16),
+            Some(0xB064),
+            "service PCP 5, DEI 1, S-VID 100 should encode as TCI 0xB064"
+        );
+        assert_eq!(
+            stacked_stack.map(|stack| stack.customer_tag_control_information().as_u16()),
+            Some(0x000A)
+        );
+    }
+
+    #[test]
+    fn validate_tag_stack_accepts_untagged_customer_only_and_stacked_wire_options() {
+        // Arrange
+        let untagged = ScanWireOptions::default();
+        let customer_only = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(0),
+            ..ScanWireOptions::default()
+        };
+        let stacked = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(4095),
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(4095),
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let outcomes = [
+            untagged.validate_ieee_8021q_tag_stack(),
+            customer_only.validate_ieee_8021q_tag_stack(),
+            stacked.validate_ieee_8021q_tag_stack(),
+        ];
+
+        // Assert
+        for outcome in outcomes {
+            assert!(
+                outcome.is_ok(),
+                "a customer tag (or no tag at all) is always valid, got: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_tag_stack_rejects_a_service_tag_without_a_customer_tag() {
+        // Arrange: the library allows the field combination that clap `requires` blocks on the
+        // CLI, so it must be rejected before anything reaches the wire.
+        let wire = ScanWireOptions {
+            vlan_identifier: None,
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+            ..ScanWireOptions::default()
+        };
+
+        // Act
+        let outcome = wire.validate_ieee_8021q_tag_stack();
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(
+                    crate::error::AppError::ServiceVlanTagRequiresCustomerVlanTag {
+                        service_vlan_identifier: 100
+                    }
+                )
+            ),
+            "a lone service tag should name the offending S-VID, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn request_layout_stacks_the_service_tag_outside_the_customer_tag() {
+        // Arrange
+        let wire = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+            service_vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(5)
+                .expect("PCP 5 fits"),
+            service_vlan_drop_eligible_indicator: true,
+            ..ScanWireOptions::default()
+        };
+        let interface_mac = MacAddress::from_octets([2, 0, 0, 0, 0, 1]);
+
+        // Act
+        let layout = wire.address_resolution_request_layout(
+            interface_mac,
+            std::net::Ipv4Addr::new(192, 168, 1, 1),
+            std::net::Ipv4Addr::new(192, 168, 1, 50),
+        );
+
+        // Assert
+        let stack = layout.vlan_tag.expect("tag stack should be present");
+        assert_eq!(
+            stack.outer_tag_protocol_identifier(),
+            0x88A8,
+            "the outermost TPID on the wire is the service EtherType"
+        );
+        assert_eq!(
+            stack
+                .service_tag_control_information()
+                .expect("service tag present")
+                .vlan_identifier
+                .as_u16(),
+            100
+        );
+        assert_eq!(
+            stack
+                .customer_tag_control_information()
+                .vlan_identifier
+                .as_u16(),
+            10
+        );
+    }
+
+    #[test]
+    fn service_vlan_tagging_does_not_change_ieee_8023_mac_client_data_accounting() {
+        // Arrange: VLAN tags sit before the IEEE 802.3 length field, so they never count toward
+        // the 1500-octet MAC client data maximum.
+        let untagged = ScanWireOptions {
+            llc_snap: true,
+            padding: vec![0u8; 8],
+            ..ScanWireOptions::default()
+        };
+        let stacked = ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+            ..untagged.clone()
+        };
+
+        // Act
+        let untagged_octets = untagged.ieee_8023_mac_client_data_octet_count();
+        let stacked_octets = stacked.ieee_8023_mac_client_data_octet_count();
+
+        // Assert
+        assert_eq!(
+            untagged_octets, stacked_octets,
+            "an S-TAG and C-TAG must not shift the IEEE 802.3 length field value"
+        );
+        assert_eq!(stacked_octets, 8 + 28 + 8, "LLC/SNAP + ARP PDU + padding");
     }
 }

@@ -16,7 +16,8 @@ use crate::ethernet_frame::{
     ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_VLAN_TAG,
     ETHERNET_PROTOCOL_VLAN_TAG_SERVICE, EthernetFraming, IEEE_8023_LLC_SNAP_HEADER_LENGTH,
     IEEE_8023_MAXIMUM_LENGTH, Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation,
-    Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE, encode_ethernet_ii_frame,
+    Ieee8021qTagStack, Ieee8021qVlanIdentifier, MINIMUM_ETHERNET_II_ETHERTYPE,
+    encode_ethernet_ii_frame, encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
     try_parse_ethernet_frame,
 };
 use crate::mac_address::MacAddress;
@@ -460,12 +461,29 @@ fn ieee_8023_custom_padding_is_included_in_snap_length_and_still_meets_minimum_f
 }
 
 #[test]
-fn ieee_8021ad_and_unofficial_qinq_tpids_are_rejected() {
-    // Arrange
+fn ieee_8021ad_service_tag_wrapping_a_customer_tag_is_accepted_and_lone_or_unofficial_tags_are_not()
+{
+    // Arrange: the legal S-TAG/C-TAG pair (IANA EtherType 34984 outside 33024), a lone S-TAG, and
+    // the unofficial vendor TPID 0x9100 that `linux/if_ether.h` marks "NOT AN OFFICIALLY
+    // REGISTERED ID".
     let destination = MacAddress::BROADCAST;
     let source = MacAddress::from_octets([1, 2, 3, 4, 5, 6]);
     let inner = [0x00, 0x01, 0x08, 0x06];
-    let service = encode_ethernet_ii_frame(
+    let service_and_customer = encode_ethernet_ii_frame_with_optional_ieee_8021q_tag(
+        destination,
+        source,
+        Some(Ieee8021qTagStack::ServiceAndCustomer {
+            service: Ieee8021qTagControlInformation::from_vlan_identifier(
+                Ieee8021qVlanIdentifier::new(100).expect("S-VID 100 fits in 12 bits"),
+            ),
+            customer: Ieee8021qTagControlInformation::from_vlan_identifier(
+                Ieee8021qVlanIdentifier::new(10).expect("C-VID 10 fits in 12 bits"),
+            ),
+        }),
+        ETHERNET_PROTOCOL_ARP,
+        &[0x99],
+    );
+    let lone_service = encode_ethernet_ii_frame(
         destination,
         source,
         ETHERNET_PROTOCOL_VLAN_TAG_SERVICE,
@@ -474,19 +492,29 @@ fn ieee_8021ad_and_unofficial_qinq_tpids_are_rejected() {
     let unofficial = encode_ethernet_ii_frame(destination, source, 0x9100, &inner);
 
     // Act
-    let service_outcome = try_parse_ethernet_frame(&service);
+    let accepted = try_parse_ethernet_frame(&service_and_customer);
+    let lone_service_outcome = try_parse_ethernet_frame(&lone_service);
     let unofficial_outcome = try_parse_ethernet_frame(&unofficial);
 
     // Assert
-    assert!(
-        service_outcome
-            .expect_err("IEEE 802.1ad must be rejected")
-            .contains("802.1ad or QinQ")
+    let accepted = accepted.expect("an S-TAG wrapping one C-TAG is IEEE 802.1ad and must parse");
+    assert_eq!(
+        accepted
+            .service_vlan_tag
+            .expect("service tag should be decoded")
+            .vlan_identifier
+            .as_u16(),
+        100
     );
-    assert!(
-        unofficial_outcome
-            .expect_err("unofficial QinQ TPID 0x9100 must be rejected")
-            .contains("802.1ad or QinQ")
+    assert_eq!(accepted.vlan_identifier, Some(10));
+    assert_eq!(accepted.ether_type, ETHERNET_PROTOCOL_ARP);
+    assert_eq!(
+        lone_service_outcome.expect_err("a lone S-TAG must be rejected"),
+        "IEEE 802.1Q service tag is not followed by an IEEE 802.1Q customer tag"
+    );
+    assert_eq!(
+        unofficial_outcome.expect_err("unofficial QinQ TPID 0x9100 must be rejected"),
+        "Ethernet frame uses an unofficial QinQ TPID; only IEEE 802.1Q 0x8100 and 0x88A8 tagging is supported here"
     );
 }
 

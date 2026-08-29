@@ -216,3 +216,42 @@ fn binary_scan_loopback_interface_exits_with_operational_failure_before_raw_sock
         "expected loopback rejection or capability denial, not a silent success, stderr: {stderr}"
     );
 }
+
+#[test]
+fn binary_exits_with_usage_error_code_when_service_vlan_flags_lack_prerequisites() {
+    // Arrange: `--svlan` requires `--vlan` to wrap, and `--spcp` / `--sdei` require `--svlan`.
+    // Each must be a clap usage error (exit 2), never an operational failure or a silent scan.
+    let binary_path = new_arp_scan_binary_path();
+    assert!(
+        binary_path.is_file(),
+        "expected binary at {}, set CARGO_BIN_EXE or run `cargo test` from the crate root",
+        binary_path.display()
+    );
+    let cases: [(&str, &[&str]); 3] = [
+        ("--svlan without --vlan", &["scan", "--svlan", "100"]),
+        (
+            "--spcp without --svlan",
+            &["scan", "--vlan", "10", "--spcp", "5"],
+        ),
+        (
+            "--sdei without --svlan",
+            &["scan", "--vlan", "10", "--sdei"],
+        ),
+    ];
+
+    for (name, arguments) in cases {
+        // Act
+        let output = std::process::Command::new(&binary_path)
+            .args(arguments)
+            .output()
+            .expect("spawning scan with incomplete service VLAN flags should succeed");
+
+        // Assert
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{name} should map to usage exit code 2, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

@@ -1690,4 +1690,184 @@ mod tests {
             "empty --padding should fail parsing, got: {outcome:?}"
         );
     }
+
+    #[test]
+    fn parses_scan_subcommand_with_service_vlan_pcp_and_dei() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--interface",
+            "eth0",
+            "--vlan",
+            "10",
+            "--svlan",
+            "100",
+            "--spcp",
+            "5",
+            "--sdei",
+        ];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        match parsed.subcommand.expect("subcommand should be present") {
+            super::CliSubcommand::Scan(scan) => {
+                assert_eq!(scan.vlan_identifier, Some(10));
+                assert_eq!(scan.service_vlan_identifier, Some(100));
+                assert_eq!(scan.service_vlan_priority_code_point, Some(5));
+                assert!(scan.service_vlan_drop_eligible_indicator);
+            }
+            super::CliSubcommand::Interfaces => panic!("expected scan subcommand, got interfaces"),
+        }
+    }
+
+    #[test]
+    fn omitted_service_vlan_flags_stay_none_and_false() {
+        // Arrange
+        let arguments = ["new-arp-scan", "scan", "--vlan", "10"];
+
+        // Act
+        let parsed = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        let parsed = parsed.expect("parsing should succeed");
+        match parsed.subcommand.expect("subcommand should be present") {
+            super::CliSubcommand::Scan(scan) => {
+                assert!(
+                    scan.service_vlan_identifier.is_none(),
+                    "omitted --svlan should yield None"
+                );
+                assert!(scan.service_vlan_priority_code_point.is_none());
+                assert!(
+                    !scan.service_vlan_drop_eligible_indicator,
+                    "omitted --sdei should stay false"
+                );
+            }
+            super::CliSubcommand::Interfaces => panic!("expected scan subcommand, got interfaces"),
+        }
+    }
+
+    #[test]
+    fn accepts_service_vlan_identifier_zero_and_4095_and_rejects_4096() {
+        // Arrange
+        let zero = ["new-arp-scan", "scan", "--vlan", "1", "--svlan", "0"];
+        let maximum = ["new-arp-scan", "scan", "--vlan", "1", "--svlan", "4095"];
+        let too_large = ["new-arp-scan", "scan", "--vlan", "1", "--svlan", "4096"];
+
+        // Act
+        let zero_outcome = CliRoot::try_parse_from(zero);
+        let maximum_outcome = CliRoot::try_parse_from(maximum);
+        let too_large_outcome = CliRoot::try_parse_from(too_large);
+
+        // Assert
+        for (outcome, expected) in [(zero_outcome, 0u16), (maximum_outcome, 4095)] {
+            let parsed = outcome.expect("in-range service VID should parse");
+            match parsed.subcommand.expect("subcommand should be present") {
+                super::CliSubcommand::Scan(scan) => {
+                    assert_eq!(scan.service_vlan_identifier, Some(expected));
+                }
+                super::CliSubcommand::Interfaces => panic!("expected scan subcommand"),
+            }
+        }
+        assert_eq!(
+            too_large_outcome
+                .expect_err("4096 is outside the 12-bit VID field")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "--svlan 4096 should fail range validation"
+        );
+    }
+
+    #[test]
+    fn returns_usage_error_when_service_vlan_flags_are_missing_their_prerequisites() {
+        // Arrange: --svlan needs --vlan to wrap; --spcp and --sdei need --svlan to fill.
+        let cases: [(&str, Vec<&str>); 4] = [
+            (
+                "--svlan without --vlan",
+                vec!["new-arp-scan", "scan", "--svlan", "100"],
+            ),
+            (
+                "--spcp without --svlan",
+                vec!["new-arp-scan", "scan", "--vlan", "10", "--spcp", "5"],
+            ),
+            (
+                "--sdei without --svlan",
+                vec!["new-arp-scan", "scan", "--vlan", "10", "--sdei"],
+            ),
+            (
+                "--spcp with neither --svlan nor --vlan",
+                vec!["new-arp-scan", "scan", "--spcp", "5"],
+            ),
+        ];
+
+        // Act
+        let outcomes: Vec<(&str, _)> = cases
+            .into_iter()
+            .map(|(name, arguments)| (name, CliRoot::try_parse_from(arguments)))
+            .collect();
+
+        // Assert
+        for (name, outcome) in outcomes {
+            let error = outcome.expect_err("missing prerequisite should be a usage error");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{name} should be a missing-required-argument usage error"
+            );
+            assert_eq!(
+                error.exit_code(),
+                2,
+                "{name} should map to the clap usage exit code"
+            );
+        }
+    }
+
+    #[test]
+    fn returns_error_when_service_priority_code_point_exceeds_three_bits() {
+        // Arrange
+        let arguments = [
+            "new-arp-scan",
+            "scan",
+            "--vlan",
+            "1",
+            "--svlan",
+            "100",
+            "--spcp",
+            "8",
+        ];
+
+        // Act
+        let outcome = CliRoot::try_parse_from(arguments);
+
+        // Assert
+        assert_eq!(
+            outcome
+                .expect_err("PCP 8 is outside the 3-bit field")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "--spcp 8 should fail range validation"
+        );
+    }
+
+    #[test]
+    fn renders_scan_long_help_including_the_service_vlan_flags() {
+        // Arrange
+        let mut command = CliRoot::command();
+
+        // Act
+        let help = command
+            .find_subcommand_mut("scan")
+            .expect("scan subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        // Assert
+        assert!(
+            help.contains("--svlan") && help.contains("--spcp") && help.contains("--sdei"),
+            "scan long help should name the IEEE 802.1ad service tag flags, got:\n{help}"
+        );
+    }
 }

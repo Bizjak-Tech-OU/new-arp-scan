@@ -1234,9 +1234,9 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
     use crate::error::AppError;
     use crate::ethernet_frame::{
         ETHERNET_II_HEADER_LENGTH, ETHERNET_PROTOCOL_ARP, ETHERNET_PROTOCOL_IPV4,
-        ETHERNET_PROTOCOL_VLAN_TAG, Ieee8021qPriorityCodePoint, Ieee8021qTagControlInformation,
-        Ieee8021qTagStack, Ieee8021qVlanIdentifier, encode_ethernet_ii_frame,
-        encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
+        ETHERNET_PROTOCOL_VLAN_TAG, ETHERNET_PROTOCOL_VLAN_TAG_SERVICE, Ieee8021qPriorityCodePoint,
+        Ieee8021qTagControlInformation, Ieee8021qTagStack, Ieee8021qVlanIdentifier,
+        encode_ethernet_ii_frame, encode_ethernet_ii_frame_with_optional_ieee_8021q_tag,
         encode_ieee_8023_rfc_1042_llc_snap_frame,
     };
     use crate::link_layer_backend::LinkLayerEndpoint;
@@ -2378,6 +2378,339 @@ mod collect_scan_over_endpoint_vlan_and_capture_noise_tests {
             endpoint.sent.borrow().len(),
             2,
             "two rounds should send twice"
+        );
+    }
+
+    /// The S-TAG/C-TAG pair used by the `QinQ` scanner tests: service PCP 5, DEI 1, S-VID 100 and
+    /// customer PCP 0, DEI 0, C-VID 10.
+    fn service_and_customer_tag_stack() -> Ieee8021qTagStack {
+        Ieee8021qTagStack::ServiceAndCustomer {
+            service: Ieee8021qTagControlInformation::new(
+                Ieee8021qPriorityCodePoint::new(5).expect("PCP 5 fits in 3 bits"),
+                true,
+                Ieee8021qVlanIdentifier::new(100).expect("S-VID 100 fits in 12 bits"),
+            ),
+            customer: Ieee8021qTagControlInformation::from_vlan_identifier(
+                Ieee8021qVlanIdentifier::new(10).expect("C-VID 10 fits in 12 bits"),
+            ),
+        }
+    }
+
+    /// Wire options that transmit the same S-TAG/C-TAG pair.
+    fn service_and_customer_wire_options() -> ScanWireOptions {
+        ScanWireOptions {
+            vlan_identifier: Ieee8021qVlanIdentifier::new(10),
+            service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+            service_vlan_priority_code_point: Ieee8021qPriorityCodePoint::new(5)
+                .expect("PCP 5 fits in 3 bits"),
+            service_vlan_drop_eligible_indicator: true,
+            ..ScanWireOptions::default()
+        }
+    }
+
+    /// Rebuilds `arp_payload` behind an S-TAG/C-TAG pair in the requested framing.
+    fn service_tagged_frame(sender_mac: MacAddress, arp_payload: &[u8], llc_snap: bool) -> Vec<u8> {
+        let encode = if llc_snap {
+            encode_ieee_8023_rfc_1042_llc_snap_frame
+        } else {
+            encode_ethernet_ii_frame_with_optional_ieee_8021q_tag
+        };
+        encode(
+            MacAddress::BROADCAST,
+            sender_mac,
+            Some(service_and_customer_tag_stack()),
+            ETHERNET_PROTOCOL_ARP,
+            arp_payload,
+        )
+    }
+
+    /// Extracts the 28-octet ARP PDU from an untagged Ethernet II ARP frame.
+    fn arp_payload_of(frame: &[u8]) -> Vec<u8> {
+        frame[ETHERNET_II_HEADER_LENGTH..ETHERNET_II_HEADER_LENGTH + 28].to_vec()
+    }
+
+    #[test]
+    fn sends_service_and_customer_tagged_request_when_service_vlan_identifier_is_set() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let source_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 1]);
+        let source_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let target_ip = Ipv4Addr::new(192, 168, 1, 50);
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: service_and_customer_wire_options(),
+            },
+            &ArpReplyAcceptance::ExactTarget {
+                target_ipv4_address: target_ip,
+            },
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        let sent = endpoint.sent.borrow();
+        assert_eq!(sent.len(), 1, "one target and one round should send once");
+        assert_eq!(
+            &sent[0][12..14],
+            &ETHERNET_PROTOCOL_VLAN_TAG_SERVICE.to_be_bytes(),
+            "the outer TPID is the IEEE 802.1Q service EtherType"
+        );
+        assert_eq!(&sent[0][14..16], &0xB064u16.to_be_bytes(), "service TCI");
+        assert_eq!(
+            &sent[0][16..18],
+            &ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes(),
+            "the inner TPID is the customer EtherType"
+        );
+        assert_eq!(&sent[0][18..20], &0x000Au16.to_be_bytes(), "customer TCI");
+        assert_eq!(&sent[0][20..22], &[0x08, 0x06], "then the ARP EtherType");
+        assert_eq!(
+            sent[0].len(),
+            60,
+            "stacked tags still pad to the IEEE 802.3 60-octet minimum without FCS"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "successful stacked send should not warn, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn records_service_and_customer_tagged_inbound_reply() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 2]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![service_tagged_frame(
+                sender_mac,
+                &arp_payload_of(&untagged),
+                false,
+            )],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(outcome.discovered_hosts[0].ipv4_address, target_ip);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "a well-formed QinQ reply is not a malformed frame, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn records_service_and_customer_tagged_rfc_1042_llc_snap_inbound_reply() {
+        // Arrange
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 3]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![service_tagged_frame(
+                sender_mac,
+                &arp_payload_of(&untagged),
+                true,
+            )],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert_eq!(outcome.discovered_hosts.len(), 1);
+        assert_eq!(
+            outcome.discovered_hosts[0].media_access_control_address,
+            sender_mac
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn ignores_service_and_customer_tagged_inbound_request_without_malformed_warning() {
+        // Arrange: a well-formed QinQ ARP request is ordinary LAN noise, including a copy of our
+        // own broadcast, so it must neither be recorded nor warned about.
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 4]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REQUEST, sender_mac, target_ip);
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![service_tagged_frame(
+                sender_mac,
+                &arp_payload_of(&untagged),
+                false,
+            )],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "an inbound QinQ request must not be recorded as a discovered host"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "a well-formed QinQ request is LAN noise, not a malformed frame, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn ignores_unsupported_tag_arrangements_without_malformed_warning() {
+        // Arrange: a lone S-TAG and a three-tag stack are unparseable Ethernet, which the scanner
+        // treats as capture noise rather than an operator-facing malformation.
+        let sender_mac = MacAddress::from_octets([0x02, 0, 0, 0, 0, 5]);
+        let (_source_mac, _source_ip, target_ip, transmit, acceptance) =
+            default_exact_target_context();
+        let untagged =
+            ipv4_ethernet_arp_frame_with_opcode(ARP_OPERATION_REPLY, sender_mac, target_ip);
+        let arp_payload = arp_payload_of(&untagged);
+
+        let mut lone_service_tag = Vec::new();
+        lone_service_tag.extend_from_slice(&MacAddress::BROADCAST.octets());
+        lone_service_tag.extend_from_slice(&sender_mac.octets());
+        lone_service_tag.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG_SERVICE.to_be_bytes());
+        lone_service_tag.extend_from_slice(&0xB064u16.to_be_bytes());
+        lone_service_tag.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+        lone_service_tag.extend_from_slice(&arp_payload);
+
+        let mut three_tags = Vec::new();
+        three_tags.extend_from_slice(&MacAddress::BROADCAST.octets());
+        three_tags.extend_from_slice(&sender_mac.octets());
+        three_tags.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG_SERVICE.to_be_bytes());
+        three_tags.extend_from_slice(&0xB064u16.to_be_bytes());
+        three_tags.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        three_tags.extend_from_slice(&0x000Au16.to_be_bytes());
+        three_tags.extend_from_slice(&ETHERNET_PROTOCOL_VLAN_TAG.to_be_bytes());
+        three_tags.extend_from_slice(&0x0003u16.to_be_bytes());
+        three_tags.extend_from_slice(&ETHERNET_PROTOCOL_ARP.to_be_bytes());
+        three_tags.extend_from_slice(&arp_payload);
+
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: vec![lone_service_tag, three_tags],
+        };
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &transmit,
+            &acceptance,
+            Duration::from_millis(20),
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        )
+        .expect("scripted endpoint should not fail");
+
+        // Assert
+        assert!(
+            outcome.discovered_hosts.is_empty(),
+            "an unsupported tag arrangement must never yield a discovered host"
+        );
+        assert!(
+            outcome.warnings.is_empty(),
+            "unparseable tagging is capture noise, not a malformed ARP warning, got: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn collect_rejects_a_service_tag_without_a_customer_tag_before_sending_anything() {
+        // Arrange
+        let mut endpoint = ScriptedEndpoint {
+            sent: RefCell::new(Vec::new()),
+            inbound: Vec::new(),
+        };
+        let (source_mac, source_ip, target_ip, _transmit, acceptance) =
+            default_exact_target_context();
+
+        // Act
+        let outcome = collect_scan_over_endpoint(
+            &mut endpoint,
+            &[target_ip],
+            &ScanTransmitContext {
+                source_mac_address: source_mac,
+                interface_ipv4_address: source_ip,
+                wire: ScanWireOptions {
+                    vlan_identifier: None,
+                    service_vlan_identifier: Ieee8021qVlanIdentifier::new(100),
+                    ..ScanWireOptions::default()
+                },
+            },
+            &acceptance,
+            Duration::ZERO,
+            Duration::ZERO,
+            NonZeroU64::MIN,
+        );
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(AppError::ServiceVlanTagRequiresCustomerVlanTag {
+                    service_vlan_identifier: 100
+                })
+            ),
+            "a lone service tag must fail before transmit, got: {outcome:?}"
+        );
+        assert!(
+            endpoint.sent.borrow().is_empty(),
+            "no frame should reach the wire when the tag stack is invalid"
         );
     }
 }
