@@ -3,7 +3,9 @@
 //! A single BPF `read(2)` can return several records, each prefixed by a `bpf_hdr` header and
 //! padded to a 4-byte (`BPF_ALIGNMENT`) boundary. [`MacosBpfEndpoint`] hides that aggregation
 //! behind the portable [`LinkLayerEndpoint`] surface so the shared scanner observes one Ethernet
-//! frame at a time, exactly as it does on Linux. All raw system calls live in
+//! frame at a time, exactly as it does on Linux. The capture filter admits only the framings the
+//! shared parser accepts, including the IEEE 802.1ad service-tag-plus-customer-tag pair. All raw
+//! system calls live in
 //! [`crate::macos_system_call`]; the record-walking here is pure byte-slice arithmetic.
 
 use std::mem::offset_of;
@@ -27,12 +29,25 @@ const BPF_JUMP_IF_EQUAL_CONSTANT: u16 = 0x15;
 const BPF_JUMP_IF_GREATER_THAN_CONSTANT: u16 = 0x25;
 /// `BPF_RET | BPF_K`: return a constant capture length (0 drops the frame).
 const BPF_RETURN_CONSTANT: u16 = 0x06;
-/// Offset of the `EtherType` / IEEE 802.3 length field in an Ethernet header.
+/// Offset of the `EtherType` / IEEE 802.3 length field in an untagged Ethernet header.
 const ETHERNET_TYPE_FIELD_OFFSET: u32 = 12;
+/// Octets one IEEE 802.1Q tag (TPID + TCI) inserts before the inner length/type field.
+const IEEE_8021Q_TAG_OCTETS: u32 = 4;
+/// Offset of the IEEE 802.2 LLC header, which starts right after the 2-octet length field.
+const LLC_SNAP_PREFIX_OFFSET_AFTER_LENGTH: u32 = 2;
+/// Offset of the last 4 SNAP octets (OUI tail plus encapsulated `EtherType`) after the length.
+const SNAP_ETHERTYPE_OFFSET_AFTER_LENGTH: u32 = 6;
+
+/// Frame offset of the length/type field that sits behind `tag_count` IEEE 802.1Q tags.
+const fn length_type_field_offset(tag_count: u32) -> u32 {
+    ETHERNET_TYPE_FIELD_OFFSET + tag_count * IEEE_8021Q_TAG_OCTETS
+}
 /// `EtherType` for ARP (`ETH_P_ARP`).
 const ETHERNET_TYPE_ARP: u32 = 0x0806;
 /// `EtherType` for IEEE 802.1Q VLAN tagging (`ETH_P_8021Q`).
 const ETHERNET_TYPE_VLAN_TAG: u32 = 0x8100;
+/// `EtherType` for IEEE 802.1Q service VLAN tagging / IEEE 802.1ad S-TAG (`ETH_P_8021AD`).
+const ETHERNET_TYPE_VLAN_TAG_SERVICE: u32 = 0x88A8;
 /// IEEE 802.3 maximum MAC client data length; values above this are not length fields.
 const IEEE_8023_MAXIMUM_LENGTH: u32 = 1500;
 /// First four octets of RFC 1042 LLC/SNAP (`AA AA 03 00`).
@@ -42,111 +57,204 @@ const RFC_1042_SNAP_ARP_ETHERTYPE: u32 = 0x0000_0806;
 /// Capture length that accepts the whole frame.
 const BPF_ACCEPT_WHOLE_FRAME: u32 = u32::MAX;
 
-/// Classic Berkeley Packet Filter program accepting ARP in Ethernet II, a single IEEE 802.1Q tag,
-/// and RFC 1042 LLC/SNAP (untagged or behind one 802.1Q tag).
+/// Classic Berkeley Packet Filter program accepting ARP in Ethernet II, behind a single IEEE
+/// 802.1Q customer tag, behind an IEEE 802.1Q service tag wrapping one customer tag (IEEE
+/// 802.1ad), and in RFC 1042 LLC/SNAP under any of those three framings.
 ///
 /// Unlike a Linux `AF_PACKET` socket bound to `ETH_P_ARP`, a BPF device delivers every frame on the
 /// interface by default, so this filter is what scopes reads to ARP and avoids flooding the scanner
 /// with unrelated traffic. VLAN-tagged and IEEE 802.3 SNAP ARP are included so those replies are
-/// not dropped before the shared parser. Stacked VLAN tags are left for the userspace parser to
-/// reject.
-const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 17] = [
+/// not dropped before the shared parser.
+///
+/// The filter admits only the tag arrangements the userspace parser accepts. A service tag is
+/// followed to its customer tag and no further, so a lone `0x88A8` tag, stacked customer tags, a
+/// third tag after a legal pair, and the unofficial TPIDs `0x9100` / `0x9200` / `0x9300` never
+/// reach userspace. Relative jump targets are dense and hand-maintained; the accept/drop matrix in
+/// this module's tests interprets the program to keep them honest.
+const ARP_CAPTURE_FILTER: [BpfProgramInstruction; 27] = [
+    // 0: outermost length/type field
     BpfProgramInstruction {
         code: BPF_LOAD_HALFWORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: ETHERNET_TYPE_FIELD_OFFSET,
+        operand: length_type_field_offset(0),
     },
+    // 1: untagged Ethernet II ARP -> accept
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
-        jump_if_true: 14,
+        jump_if_true: 24,
         jump_if_false: 0,
         operand: ETHERNET_TYPE_ARP,
     },
+    // 2: one IEEE 802.1Q customer tag -> customer branch
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
-        jump_if_true: 5,
+        jump_if_true: 6,
         jump_if_false: 0,
         operand: ETHERNET_TYPE_VLAN_TAG,
     },
+    // 3: IEEE 802.1Q service tag (IEEE 802.1ad) -> service branch
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 12,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_VLAN_TAG_SERVICE,
+    },
+    // 4: neither ARP, a tag, nor a length -> drop
     BpfProgramInstruction {
         code: BPF_JUMP_IF_GREATER_THAN_CONSTANT,
-        jump_if_true: 11,
+        jump_if_true: 20,
         jump_if_false: 0,
         operand: IEEE_8023_MAXIMUM_LENGTH,
     },
+    // 5: untagged IEEE 802.3: LLC and the head of SNAP
     BpfProgramInstruction {
         code: BPF_LOAD_WORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: 14,
+        operand: length_type_field_offset(0) + LLC_SNAP_PREFIX_OFFSET_AFTER_LENGTH,
     },
+    // 6: must be RFC 1042 AA AA 03 00
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
         jump_if_true: 0,
-        jump_if_false: 9,
+        jump_if_false: 18,
         operand: RFC_1042_LLC_SNAP_PREFIX,
     },
+    // 7: SNAP OUI tail and encapsulated EtherType
     BpfProgramInstruction {
         code: BPF_LOAD_WORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: 18,
+        operand: length_type_field_offset(0) + SNAP_ETHERTYPE_OFFSET_AFTER_LENGTH,
     },
+    // 8: untagged RFC 1042 SNAP ARP -> accept
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
-        jump_if_true: 8,
-        jump_if_false: 7,
+        jump_if_true: 17,
+        jump_if_false: 16,
         operand: RFC_1042_SNAP_ARP_ETHERTYPE,
     },
+    // 9: customer branch: inner length/type after one tag
     BpfProgramInstruction {
         code: BPF_LOAD_HALFWORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: ETHERNET_TYPE_FIELD_OFFSET + 4,
+        operand: length_type_field_offset(1),
     },
+    // 10: 0x8100 then ARP -> accept
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 15,
+        jump_if_false: 0,
+        operand: ETHERNET_TYPE_ARP,
+    },
+    // 11: not a length either -> drop
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_GREATER_THAN_CONSTANT,
+        jump_if_true: 13,
+        jump_if_false: 0,
+        operand: IEEE_8023_MAXIMUM_LENGTH,
+    },
+    // 12: tagged IEEE 802.3: LLC and the head of SNAP
+    BpfProgramInstruction {
+        code: BPF_LOAD_WORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: length_type_field_offset(1) + LLC_SNAP_PREFIX_OFFSET_AFTER_LENGTH,
+    },
+    // 13: must be RFC 1042 AA AA 03 00
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 11,
+        operand: RFC_1042_LLC_SNAP_PREFIX,
+    },
+    // 14: SNAP OUI tail and encapsulated EtherType
+    BpfProgramInstruction {
+        code: BPF_LOAD_WORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: length_type_field_offset(1) + SNAP_ETHERTYPE_OFFSET_AFTER_LENGTH,
+    },
+    // 15: 0x8100 then RFC 1042 SNAP ARP -> accept
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 10,
+        jump_if_false: 9,
+        operand: RFC_1042_SNAP_ARP_ETHERTYPE,
+    },
+    // 16: service branch: the TPID that must follow the S-TAG
+    BpfProgramInstruction {
+        code: BPF_LOAD_HALFWORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: length_type_field_offset(1),
+    },
+    // 17: an S-TAG must be followed by a 0x8100 C-TAG, else drop
+    BpfProgramInstruction {
+        code: BPF_JUMP_IF_EQUAL_CONSTANT,
+        jump_if_true: 0,
+        jump_if_false: 7,
+        operand: ETHERNET_TYPE_VLAN_TAG,
+    },
+    // 18: inner length/type after S-TAG + C-TAG
+    BpfProgramInstruction {
+        code: BPF_LOAD_HALFWORD_ABSOLUTE,
+        jump_if_true: 0,
+        jump_if_false: 0,
+        operand: length_type_field_offset(2),
+    },
+    // 19: 0x88A8 + 0x8100 then ARP -> accept
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
         jump_if_true: 6,
         jump_if_false: 0,
         operand: ETHERNET_TYPE_ARP,
     },
+    // 20: not a length either -> drop
     BpfProgramInstruction {
         code: BPF_JUMP_IF_GREATER_THAN_CONSTANT,
         jump_if_true: 4,
         jump_if_false: 0,
         operand: IEEE_8023_MAXIMUM_LENGTH,
     },
+    // 21: stacked IEEE 802.3: LLC and the head of SNAP
     BpfProgramInstruction {
         code: BPF_LOAD_WORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: 18,
+        operand: length_type_field_offset(2) + LLC_SNAP_PREFIX_OFFSET_AFTER_LENGTH,
     },
+    // 22: must be RFC 1042 AA AA 03 00
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
         jump_if_true: 0,
         jump_if_false: 2,
         operand: RFC_1042_LLC_SNAP_PREFIX,
     },
+    // 23: SNAP OUI tail and encapsulated EtherType
     BpfProgramInstruction {
         code: BPF_LOAD_WORD_ABSOLUTE,
         jump_if_true: 0,
         jump_if_false: 0,
-        operand: 22,
+        operand: length_type_field_offset(2) + SNAP_ETHERTYPE_OFFSET_AFTER_LENGTH,
     },
+    // 24: 0x88A8 + 0x8100 then RFC 1042 SNAP ARP -> accept
     BpfProgramInstruction {
         code: BPF_JUMP_IF_EQUAL_CONSTANT,
         jump_if_true: 1,
         jump_if_false: 0,
         operand: RFC_1042_SNAP_ARP_ETHERTYPE,
     },
+    // 25: drop: zero capture length
     BpfProgramInstruction {
         code: BPF_RETURN_CONSTANT,
         jump_if_true: 0,
         jump_if_false: 0,
         operand: 0,
     },
+    // 26: accept: the whole frame
     BpfProgramInstruction {
         code: BPF_RETURN_CONSTANT,
         jump_if_true: 0,
@@ -241,9 +349,10 @@ pub fn open_macos_link_layer_endpoint(interface_name: &str) -> Result<MacosBpfEn
     macos_system_call::set_bpf_interface(&bpf_device, &interface_request)
         .map_err(|source| AppError::SocketBindFailed { source })?;
 
-    // Scope reads to ARP (Ethernet II, one 802.1Q tag, or RFC 1042 SNAP) and stop the device from
-    // echoing back the requests we broadcast, matching the effect of a Linux packet socket plus the
-    // extra framings the shared parser accepts.
+    // Scope reads to ARP (Ethernet II, one 802.1Q customer tag, an 802.1ad service tag wrapping
+    // one customer tag, or RFC 1042 SNAP under any of those) and stop the device from echoing back
+    // the requests we broadcast, matching the effect of a Linux packet socket plus the extra
+    // framings the shared parser accepts.
     macos_system_call::set_bpf_filter(&bpf_device, &ARP_CAPTURE_FILTER)
         .map_err(|source| AppError::RawSocketOpenFailed { source })?;
     macos_system_call::set_bpf_see_sent(&bpf_device, false)
@@ -327,8 +436,8 @@ mod tests {
     use super::{
         ARP_CAPTURE_FILTER, BPF_JUMP_IF_EQUAL_CONSTANT, BPF_JUMP_IF_GREATER_THAN_CONSTANT,
         BPF_LOAD_HALFWORD_ABSOLUTE, BPF_LOAD_WORD_ABSOLUTE, BPF_RECORD_ALIGNMENT,
-        BPF_RETURN_CONSTANT, BpfPacketHeaderLayout, bpf_word_align, next_bpf_record,
-        open_macos_link_layer_endpoint,
+        BPF_RETURN_CONSTANT, BpfPacketHeaderLayout, bpf_word_align, length_type_field_offset,
+        next_bpf_record, open_macos_link_layer_endpoint,
     };
     use crate::error::AppError;
     use crate::macos_system_call::BpfProgramInstruction;
@@ -559,60 +668,211 @@ mod tests {
         panic!("ARP capture filter did not return");
     }
 
-    fn padded_ethernet_fixture(prefix: &[u8]) -> [u8; 60] {
+    /// Builds a 60-octet fixture: broadcast destination, a fixed source, then `fragments`.
+    fn ethernet_fixture(fragments: &[&[u8]]) -> [u8; 60] {
         let mut frame = [0u8; 60];
-        frame[..prefix.len()].copy_from_slice(prefix);
+        let header: [u8; 12] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1];
+        frame[..header.len()].copy_from_slice(&header);
+        let mut cursor = header.len();
+        for fragment in fragments {
+            frame[cursor..cursor + fragment.len()].copy_from_slice(fragment);
+            cursor += fragment.len();
+        }
         frame
     }
 
+    /// IEEE 802.1Q customer tag protocol identifier (C-TAG).
+    const C_TAG: &[u8] = &[0x81, 0x00];
+    /// IEEE 802.1Q service tag protocol identifier (S-TAG, IANA `EtherType` 34984).
+    const S_TAG: &[u8] = &[0x88, 0xa8];
+    /// Unofficial vendor `QinQ` TPID `0x9100`.
+    const QINQ_9100: &[u8] = &[0x91, 0x00];
+    /// `EtherType` for ARP.
+    const ARP: &[u8] = &[0x08, 0x06];
+    /// `EtherType` for IPv4.
+    const IPV4: &[u8] = &[0x08, 0x00];
+    /// RFC 1042 LLC/SNAP prefix `AA AA 03 00 00 00`, without the encapsulated `EtherType`.
+    const SNAP: &[u8] = &[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00];
+    /// An IEEE 802.3 length field of 36: LLC + SNAP + a 28-octet ARP PDU.
+    const SNAP_LENGTH: &[u8] = &[0x00, 0x24];
+    /// Eight octets that are not RFC 1042 LLC/SNAP.
+    const NOT_SNAP: &[u8] = &[0u8; 8];
+    /// TCI for service PCP 5, DEI 1, S-VID 100.
+    const SERVICE_TCI: &[u8] = &[0xb0, 0x64];
+    /// TCI for customer PCP 0, DEI 0, C-VID 10.
+    const CUSTOMER_TCI: &[u8] = &[0x00, 0x0a];
+
+    /// Runs each `(name, fragments, expected)` case through the filter and asserts the verdict.
+    fn assert_filter_verdicts(cases: &[(&str, &[&[u8]], bool)]) {
+        let outcomes: Vec<(&str, bool, bool)> = cases
+            .iter()
+            .map(|(name, fragments, expected)| {
+                let frame = ethernet_fixture(fragments);
+                (
+                    *name,
+                    classic_bpf_accepts_frame(&ARP_CAPTURE_FILTER, &frame),
+                    *expected,
+                )
+            })
+            .collect();
+        for (name, accepted, expected) in outcomes {
+            assert_eq!(
+                accepted, expected,
+                "BPF filter verdict for `{name}` should be accept={expected}"
+            );
+        }
+    }
+
     #[test]
-    fn arp_capture_filter_accepts_ethernet_ii_vlan_and_rfc_1042_snap_arp() {
-        // Arrange
-        let filter = ARP_CAPTURE_FILTER;
-        let ethernet_ii_arp = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x06,
-        ]);
-        let ethernet_ii_ipv4 = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00,
-        ]);
-        let vlan_arp = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x81, 0x00, 0x00, 0x0a, 0x08,
-            0x06,
-        ]);
-        let vlan_ipv4 = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x81, 0x00, 0x00, 0x0a, 0x08,
-            0x00,
-        ]);
-        let snap_arp = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x00, 0x24, 0xaa, 0xaa, 0x03,
-            0x00, 0x00, 0x00, 0x08, 0x06,
-        ]);
-        let snap_ipv4 = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x00, 0x24, 0xaa, 0xaa, 0x03,
-            0x00, 0x00, 0x00, 0x08, 0x00,
-        ]);
-        let vlan_snap_arp = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x81, 0x00, 0x00, 0x0a, 0x00,
-            0x24, 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06,
-        ]);
-        let ieee_8023_without_snap = padded_ethernet_fixture(&[
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 1, 0x00, 0x24, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
-        ]);
+    fn arp_capture_filter_accepts_every_arp_framing_the_parser_accepts() {
+        // Arrange: one fixture per accepting path through the filter.
+        let cases: [(&str, &[&[u8]], bool); 7] = [
+            ("untagged Ethernet II ARP", &[ARP], true),
+            ("customer tag then ARP", &[C_TAG, CUSTOMER_TCI, ARP], true),
+            (
+                "untagged RFC 1042 SNAP ARP",
+                &[SNAP_LENGTH, SNAP, ARP],
+                true,
+            ),
+            (
+                "customer tag then RFC 1042 SNAP ARP",
+                &[C_TAG, CUSTOMER_TCI, SNAP_LENGTH, SNAP, ARP],
+                true,
+            ),
+            (
+                "service tag wrapping a customer tag then ARP",
+                &[S_TAG, SERVICE_TCI, C_TAG, CUSTOMER_TCI, ARP],
+                true,
+            ),
+            (
+                "service tag wrapping a customer tag then RFC 1042 SNAP ARP",
+                &[
+                    S_TAG,
+                    SERVICE_TCI,
+                    C_TAG,
+                    CUSTOMER_TCI,
+                    SNAP_LENGTH,
+                    SNAP,
+                    ARP,
+                ],
+                true,
+            ),
+            (
+                "service tag with the maximum TCI wrapping a customer tag then ARP",
+                &[S_TAG, &[0xff, 0xff], C_TAG, &[0xff, 0xff], ARP],
+                true,
+            ),
+        ];
 
         // Act
-        let accepts_ethernet_ii_arp = classic_bpf_accepts_frame(&filter, &ethernet_ii_arp);
-        let accepts_ethernet_ii_ipv4 = classic_bpf_accepts_frame(&filter, &ethernet_ii_ipv4);
-        let accepts_vlan_arp = classic_bpf_accepts_frame(&filter, &vlan_arp);
-        let accepts_vlan_ipv4 = classic_bpf_accepts_frame(&filter, &vlan_ipv4);
-        let accepts_snap_arp = classic_bpf_accepts_frame(&filter, &snap_arp);
-        let accepts_snap_ipv4 = classic_bpf_accepts_frame(&filter, &snap_ipv4);
-        let accepts_vlan_snap_arp = classic_bpf_accepts_frame(&filter, &vlan_snap_arp);
-        let accepts_ieee_8023_without_snap =
-            classic_bpf_accepts_frame(&filter, &ieee_8023_without_snap);
-
         // Assert
-        assert_eq!(filter.len(), 17, "filter should cover SNAP and VLAN+SNAP");
+        assert_filter_verdicts(&cases);
+    }
+
+    #[test]
+    fn arp_capture_filter_drops_non_arp_and_every_unsupported_tag_arrangement() {
+        // Arrange: non-ARP traffic under each accepted framing, then the tag arrangements the
+        // userspace parser rejects, so the kernel never hands them to the scanner at all.
+        let cases: [(&str, &[&[u8]], bool); 12] = [
+            ("untagged Ethernet II IPv4", &[IPV4], false),
+            (
+                "customer tag then IPv4",
+                &[C_TAG, CUSTOMER_TCI, IPV4],
+                false,
+            ),
+            (
+                "untagged RFC 1042 SNAP IPv4",
+                &[SNAP_LENGTH, SNAP, IPV4],
+                false,
+            ),
+            (
+                "IEEE 802.3 length without RFC 1042 SNAP",
+                &[SNAP_LENGTH, NOT_SNAP],
+                false,
+            ),
+            (
+                "service tag wrapping a customer tag then IPv4",
+                &[S_TAG, SERVICE_TCI, C_TAG, CUSTOMER_TCI, IPV4],
+                false,
+            ),
+            (
+                "service tag wrapping a customer tag then RFC 1042 SNAP IPv4",
+                &[
+                    S_TAG,
+                    SERVICE_TCI,
+                    C_TAG,
+                    CUSTOMER_TCI,
+                    SNAP_LENGTH,
+                    SNAP,
+                    IPV4,
+                ],
+                false,
+            ),
+            (
+                "service tag then ARP with no customer tag",
+                &[S_TAG, SERVICE_TCI, ARP],
+                false,
+            ),
+            (
+                "two stacked service tags",
+                &[S_TAG, SERVICE_TCI, S_TAG, CUSTOMER_TCI, ARP],
+                false,
+            ),
+            (
+                "two stacked customer tags",
+                &[C_TAG, CUSTOMER_TCI, C_TAG, &[0x00, 0x02], ARP],
+                false,
+            ),
+            (
+                "three stacked tags",
+                &[
+                    S_TAG,
+                    SERVICE_TCI,
+                    C_TAG,
+                    CUSTOMER_TCI,
+                    C_TAG,
+                    &[0x00, 0x03],
+                    ARP,
+                ],
+                false,
+            ),
+            (
+                "unofficial QinQ TPID 0x9100",
+                &[QINQ_9100, CUSTOMER_TCI, ARP],
+                false,
+            ),
+            (
+                "stacked tags then a length without RFC 1042 SNAP",
+                &[
+                    S_TAG,
+                    SERVICE_TCI,
+                    C_TAG,
+                    CUSTOMER_TCI,
+                    SNAP_LENGTH,
+                    NOT_SNAP,
+                ],
+                false,
+            ),
+        ];
+
+        // Act
+        // Assert
+        assert_filter_verdicts(&cases);
+    }
+
+    #[test]
+    fn arp_capture_filter_structure_matches_the_documented_branch_layout() {
+        // Arrange
+        let filter = ARP_CAPTURE_FILTER;
+
+        // Act
+        // Assert
+        assert_eq!(
+            filter.len(),
+            27,
+            "filter should cover Ethernet II, one customer tag, a service tag pair, and SNAP \
+             under each"
+        );
         assert_eq!(
             filter[0].operand, 12,
             "first load is the Ethernet length/type field"
@@ -620,33 +880,43 @@ mod tests {
         assert_eq!(filter[1].operand, 0x0806, "first compare is EtherType ARP");
         assert_eq!(
             filter[2].operand, 0x8100,
-            "second compare is IEEE 802.1Q TPID"
+            "second compare is the IEEE 802.1Q customer TPID"
         );
-        assert_eq!(filter[15].operand, 0, "drop returns zero capture length");
         assert_eq!(
-            filter[16].operand,
+            filter[3].operand, 0x88A8,
+            "third compare is the IEEE 802.1Q service TPID (IANA EtherType 34984)"
+        );
+        assert_eq!(
+            filter[17].operand, 0x8100,
+            "the service branch requires a customer TPID at offset 16"
+        );
+        assert_eq!(filter[25].operand, 0, "drop returns zero capture length");
+        assert_eq!(
+            filter[26].operand,
             u32::MAX,
             "accept returns the whole frame"
         );
-        assert!(
-            accepts_ethernet_ii_arp,
-            "untagged Ethernet II ARP must pass"
+    }
+
+    #[test]
+    fn length_type_field_offset_tracks_one_tag_per_four_octets() {
+        // Arrange
+        // Act
+        // Assert
+        assert_eq!(
+            length_type_field_offset(0),
+            12,
+            "untagged length/type field"
         );
-        assert!(
-            !accepts_ethernet_ii_ipv4,
-            "untagged IPv4 must be dropped by the ARP filter"
+        assert_eq!(
+            length_type_field_offset(1),
+            16,
+            "one IEEE 802.1Q tag shifts the inner field by 4 octets"
         );
-        assert!(accepts_vlan_arp, "single 802.1Q tag plus ARP must pass");
-        assert!(!accepts_vlan_ipv4, "VLAN-tagged IPv4 must be dropped");
-        assert!(accepts_snap_arp, "RFC 1042 LLC/SNAP ARP must pass");
-        assert!(!accepts_snap_ipv4, "RFC 1042 SNAP IPv4 must be dropped");
-        assert!(
-            accepts_vlan_snap_arp,
-            "802.1Q plus RFC 1042 SNAP ARP must pass"
-        );
-        assert!(
-            !accepts_ieee_8023_without_snap,
-            "IEEE 802.3 length without RFC 1042 SNAP must be dropped"
+        assert_eq!(
+            length_type_field_offset(2),
+            20,
+            "an S-TAG plus a C-TAG shifts the inner field by 8 octets"
         );
     }
 }
